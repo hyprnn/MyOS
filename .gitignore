@@ -1,8 +1,11 @@
-main.o
-*.o
+# всё собранное - пересоздаётся make
 build/
+BOOTX64.EFI
+esp/
 MyOS.iso
 fat.img
 iso_root/
 MyOS_hdd.img
 MyOS_hdd.vdi
+*.o
+*.d
