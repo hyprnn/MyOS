@@ -26,6 +26,175 @@ void gui_draw_cursor_at(
     );
 }
 
+/*
+ * ------------------------------------------------------------------
+ * Вывод кадра на экран без мигания курсора.
+ *
+ * Что было раньше и почему курсор "моргал и замирал" на ноутбуке:
+ *   1) часы на панели задач раз в ~0.25-1 с помечали ВЕСЬ кадр
+ *      как изменившийся (даже если секунда не сменилась);
+ *   2) полный кадр копировался в видеопамять целиком - на реальном
+ *      железе это ~1-2 млн пикселей в медленную (некэшируемую)
+ *      память, десятки миллисекунд, и всё это время мышь никто не
+ *      опрашивал - отсюда "остановка";
+ *   3) копия затирала курсор, а рисовался он заново только ПОСЛЕ
+ *      копии - отсюда "моргание".
+ *
+ * Теперь:
+ *   * есть "теневой" буфер (shadow) в обычной RAM - точная копия
+ *     того, что сейчас на экране (без курсора). В видеопамять пишутся
+ *     только пиксели, которые действительно отличаются. Смена цифры
+ *     на часах - это пара сотен пикселей, а не два миллиона;
+ *   * курсор "вклеивается" в поток пикселей прямо при записи: каждый
+ *     пиксель экрана пишется один раз и сразу правильным цветом
+ *     (картинка или курсор поверх неё). Момента, когда курсора на
+ *     экране нет, больше не существует.
+ * ------------------------------------------------------------------
+ */
+
+/* Цвет пикселя (px,py) экрана: курсор, если пиксель под курсором
+   с левым верхним углом (cx,cy), иначе картинка из заднего буфера.
+   Форма курсора та же, что в gui_draw_cursor_at: квадрат 12x12,
+   чёрная рамка 2 пикселя, белая середина. */
+static inline UINT32 gui_composite_px(
+    volatile UINT32 *back, UINT32 stride,
+    INTN px, INTN py, INTN cx, INTN cy,
+    UINT32 black, UINT32 white
+)
+{
+    INTN dx = px - cx;
+    INTN dy = py - cy;
+
+    if (dx >= 0 && dy >= 0 && dx < GUI_CURSOR_SIZE && dy < GUI_CURSOR_SIZE) {
+
+        BOOLEAN inner =
+            dx >= 2 && dy >= 2 &&
+            dx < GUI_CURSOR_SIZE - 2 && dy < GUI_CURSOR_SIZE - 2;
+
+        return inner ? white : black;
+    }
+
+    return back[(UINTN)py * stride + (UINTN)px];
+}
+
+/* Переписать в видеопамяти прямоугольник (x,y,w,h) "картинка +
+   курсор в (cx,cy)". Каждый пиксель пишется ровно один раз. */
+static void gui_compose_rect(
+    volatile UINT32 *fb, volatile UINT32 *back,
+    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
+    INTN x, INTN y, INTN w, INTN h,
+    INTN cx, INTN cy, UINT32 black, UINT32 white
+)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (INTN)fb_w) w = (INTN)fb_w - x;
+    if (y + h > (INTN)fb_h) h = (INTN)fb_h - y;
+
+    if (w <= 0 || h <= 0)
+        return;
+
+    for (INTN py = y; py < y + h; py++)
+        for (INTN px = x; px < x + w; px++)
+            fb[(UINTN)py * stride + (UINTN)px] =
+                gui_composite_px(back, stride, px, py, cx, cy, black, white);
+}
+
+/* Сдвинуть курсор со старого места (ox,oy) на новое (nx,ny):
+   переписываем оба квадратика 12x12 составным цветом. Старый
+   квадрат получает картинку (или новый курсор, если перекрываются),
+   новый - курсор. Никаких промежуточных состояний на экране. */
+void gui_present_cursor(
+    volatile UINT32 *fb, volatile UINT32 *back,
+    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
+    EFI_GRAPHICS_PIXEL_FORMAT fmt,
+    INTN ox, INTN oy, INTN nx, INTN ny
+)
+{
+    UINT32 black = gui_pack(fmt, 0, 0, 0);
+    UINT32 white = gui_pack(fmt, 255, 255, 255);
+
+    gui_compose_rect(fb, back, stride, fb_w, fb_h,
+                     ox, oy, GUI_CURSOR_SIZE, GUI_CURSOR_SIZE,
+                     nx, ny, black, white);
+
+    gui_compose_rect(fb, back, stride, fb_w, fb_h,
+                     nx, ny, GUI_CURSOR_SIZE, GUI_CURSOR_SIZE,
+                     nx, ny, black, white);
+}
+
+/*
+ * Вывести готовый кадр из заднего буфера back на экран fb.
+ *
+ * shadow - копия того, что сейчас в видеопамяти (без курсора), или
+ * NULL, если под неё не хватило памяти. full = TRUE - переписать
+ * экран целиком (первый кадр: что там на экране - неизвестно).
+ *
+ * Строки сравниваются по 64 бита (2 пикселя за раз) - это обычная
+ * RAM, быстро. В видеопамять уходят только отличающиеся пиксели,
+ * курсор вклеивается на лету. Старое место курсора (ox,oy) потом
+ * дочищает gui_present_cursor - вызывающий делает это сам.
+ *
+ * Возвращает число записанных в видеопамять пикселей (для отладки).
+ */
+UINTN gui_present_frame(
+    volatile UINT32 *fb, volatile UINT32 *back, UINT32 *shadow,
+    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
+    EFI_GRAPHICS_PIXEL_FORMAT fmt,
+    INTN cx, INTN cy, BOOLEAN full
+)
+{
+    UINT32 black = gui_pack(fmt, 0, 0, 0);
+    UINT32 white = gui_pack(fmt, 255, 255, 255);
+    UINTN written = 0;
+
+    for (UINTN y = 0; y < fb_h; y++) {
+
+        UINTN row = y * stride;
+        BOOLEAN cursor_row =
+            (INTN)y >= cy && (INTN)y < cy + GUI_CURSOR_SIZE;
+
+        UINTN x = 0;
+
+        while (x < fb_w) {
+
+            /* быстро пропускаем совпадающие пары пикселей */
+            if (!full && shadow != NULL) {
+
+                while (
+                    x + 1 < fb_w &&
+                    *(volatile UINT64 *)&back[row + x] ==
+                        *(UINT64 *)&shadow[row + x]
+                )
+                    x += 2;
+
+                if (x >= fb_w)
+                    break;
+
+                if (back[row + x] == shadow[row + x]) {
+                    x++;
+                    continue;
+                }
+            }
+
+            UINT32 v = back[row + x];
+
+            if (shadow != NULL)
+                shadow[row + x] = v;
+
+            if (cursor_row && (INTN)x >= cx && (INTN)x < cx + GUI_CURSOR_SIZE)
+                v = gui_composite_px(back, stride, (INTN)x, (INTN)y,
+                                     cx, cy, black, white);
+
+            fb[row + x] = v;
+            written++;
+            x++;
+        }
+    }
+
+    return written;
+}
+
 /* Скопировать прямоугольник из заднего буфера в видеопамять */
 void gui_blit_rect(
     volatile UINT32 *dst,

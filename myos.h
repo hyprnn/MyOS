@@ -1506,6 +1506,18 @@ void gui_draw_cursor_at(
     EFI_GRAPHICS_PIXEL_FORMAT fmt,
     INTN x, INTN y
 );
+void gui_present_cursor(
+    volatile UINT32 *fb, volatile UINT32 *back,
+    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
+    EFI_GRAPHICS_PIXEL_FORMAT fmt,
+    INTN ox, INTN oy, INTN nx, INTN ny
+);
+UINTN gui_present_frame(
+    volatile UINT32 *fb, volatile UINT32 *back, UINT32 *shadow,
+    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
+    EFI_GRAPHICS_PIXEL_FORMAT fmt,
+    INTN cx, INTN cy, BOOLEAN full
+);
 void gui_blit_rect(
     volatile UINT32 *dst,
     volatile UINT32 *src,

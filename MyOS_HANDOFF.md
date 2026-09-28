@@ -43,7 +43,7 @@ make test       # tools/autotest.py: QEMU без окна, ~10 с
 | `lib/` | `libc.c` (memcpy/memset — их может вставить компилятор), `string.c`, `kprintf.c` (`kprintf(out,fmt,...)`, `ksnprintf`, `klog` — только в COM1), `serial.c` (COM1 115200, loopback-проверка наличия) |
 | `kernel/` | `kcon.c` консоль в framebuffer (Spleen 8x16, отложенная отрисовка `kcon_flush`), `cpu.c` GDT/IDT/ISR/паника/PIC/I/O APIC, `time.c` TSC+PIT+LAPIC timer, `pmm.c` битовая карта страниц + пул, `shim.c` своя EFI_SYSTEM_TABLE `g_kst`, `enter.c` команда `ebs`, `kcmds.c` kinfo/usb/mousetest/mem |
 | `drivers/` | `pci.c`, `xhci_common.c` (сброс, disconnect прошивки, BIOS handoff), `usb.c` (неблокирующий xHCI+HID kernel mode), `hid.c` (разбор Report Descriptor), `keyboard.c` (очередь клавиш, HID Usage→UEFI, накопитель мыши), `ps2.c`, `xhci_demo.c` + `ebs_console.c` (старое демо `ebsdemo`) |
-| `gui/` | `gui.c` цикл `start`, `desktop.c` (курсор отдельно от кадра: `gui_draw_cursor_at`, `gui_blit_rect`, `gui_hover_key`), `draw.c`, `minesweeper*.c`, `terminal.c`, `gstring.c` |
+| `gui/` | `gui.c` цикл `start`, `desktop.c` (вывод кадра без мигания: задний буфер → теневой буфер → только изменённые пиксели на экран, курсор вклеивается: `gui_present_frame`/`gui_present_cursor`; `gui_hover_key`), `draw.c`, `minesweeper*.c`, `terminal.c`, `gstring.c` |
 | `shell/` | `commands.c` (`run_command`), `console.c` (print*, scrollback, дублирование в COM1), `readline.c`, `fs.c` (RAM-диск), `fetch.c`, `editor.c`, `calc.c`, `history.c` |
 | `tools/` | `autotest.py` (свой FAT16-образ, QMP, проверки по логу COM1), `split_main.py` (чем резался старый main.c) |
 
@@ -67,10 +67,16 @@ boot protocol; мышь — boot protocol с проверкой GET_PROTOCOL, и
 
 ## Состояние мыши на реальном ноутбуке
 
-Была проблема: отчёты приходили, курсор стоял (по видео). Сделано:
-boot protocol + проверка GET_PROTOCOL. **Не подтверждено на железе.**
-Если снова не работает — фото вывода `usb` при движении мыши вправо
-(там сырые байты `last report` и строка режима).
+Мышь (донгл Onikuma) **работает на железе** после перехода на boot
+protocol + проверку GET_PROTOCOL. Следом была жалоба: курсор в GUI
+периодически моргал и на миг замирал. Причина: часы панели задач
+помечали весь кадр изменённым несколько раз в секунду, и весь экран
+(~1-2 млн пикселей) копировался в медленную видеопамять, затирая
+курсор. Исправлено (`gui/desktop.c`: `gui_present_frame`,
+`gui_present_cursor`): теневой буфер в RAM + запись на экран только
+изменившихся пикселей, курсор вклеивается в поток записи (каждый
+пиксель пишется один раз); часы перерисовываются только при смене
+цифры. **Ждёт подтверждения на ноутбуке.**
 
 ## Правила работы с кодом
 

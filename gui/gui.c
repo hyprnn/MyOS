@@ -190,6 +190,8 @@ void gui_start(EFI_SYSTEM_TABLE *st)
      * копируется уже готовым, одним проходом.
      */
     volatile UINT32 *back_buf = NULL;
+    UINT32 *shadow_buf = NULL;
+    BOOLEAN first_frame = TRUE;     /* что на экране - пока неизвестно */
 
     {
         GUI_ALLOCATE_POOL AllocatePool =
@@ -209,6 +211,24 @@ void gui_start(EFI_SYSTEM_TABLE *st)
             ) == EFI_SUCCESS
         ) {
             back_buf = (volatile UINT32 *)back_raw;
+        }
+
+        /* Теневой буфер: что сейчас лежит в видеопамяти (без
+           курсора). Нужен, чтобы писать на экран только реально
+           изменившиеся пиксели (см. gui_present_frame в desktop.c).
+           Не хватило памяти - не страшно: будем копировать кадр
+           целиком, как раньше, но курсор всё равно не мигнёт. */
+        VOID *shadow_raw = NULL;
+
+        if (
+            back_buf != NULL &&
+            AllocatePool(
+                GUI_EFI_BOOT_SERVICES_DATA,
+                back_size,
+                &shadow_raw
+            ) == EFI_SUCCESS
+        ) {
+            shadow_buf = (UINT32 *)shadow_raw;
         }
     }
 
@@ -518,11 +538,28 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                 ) == EFI_SUCCESS
             ) {
 
-                gui_uint2_to_str(now.Hour, clock_text);
-                gui_uint2_to_str(now.Minute, clock_text + 3);
-                gui_uint2_to_str(now.Second, clock_text + 6);
+                char new_clock[9];
 
-                if (!in_window)
+                for (UINTN k = 0; k < 9; k++)
+                    new_clock[k] = clock_text[k];
+
+                gui_uint2_to_str(now.Hour, new_clock);
+                gui_uint2_to_str(now.Minute, new_clock + 3);
+                gui_uint2_to_str(now.Second, new_clock + 6);
+
+                /* Перерисовываем, только если на часах РЕАЛЬНО
+                   сменилась цифра. Раньше кадр помечался
+                   изменённым при каждой проверке (несколько раз
+                   в секунду) - и курсор на ноутбуке моргал. */
+                BOOLEAN changed = FALSE;
+
+                for (UINTN k = 0; k < 8; k++) {
+                    if (new_clock[k] != clock_text[k])
+                        changed = TRUE;
+                    clock_text[k] = new_clock[k];
+                }
+
+                if (changed && !in_window)
                     dirty = TRUE;
             }
 
@@ -1213,13 +1250,25 @@ void gui_start(EFI_SYSTEM_TABLE *st)
              */
             if (back_buf != NULL) {
 
-                UINTN total = (UINTN)stride * (UINTN)fb_h;
+                /* Только изменившиеся пиксели, курсор вклеен
+                   прямо в поток записи - без мигания. */
+                gui_present_frame(
+                    fb, back_buf, shadow_buf,
+                    stride, fb_w, fb_h, fmt,
+                    cur_x, cur_y, first_frame
+                );
 
-                for (UINTN i = 0; i < total; i++)
-                    fb[i] = back_buf[i];
+                /* дочистить старое место курсора (если он успел
+                   сдвинуться) и гарантированно нарисовать новый */
+                if (first_frame)
+                    gui_present_cursor(fb, back_buf, stride, fb_w, fb_h,
+                                       fmt, cur_x, cur_y, cur_x, cur_y);
+                else
+                    gui_present_cursor(fb, back_buf, stride, fb_w, fb_h,
+                                       fmt, drawn_cur_x, drawn_cur_y,
+                                       cur_x, cur_y);
 
-                /* курсор - только в видеопамяти, поверх */
-                gui_draw_cursor_at(fb, stride, fb_w, fb_h, fmt, cur_x, cur_y);
+                first_frame = FALSE;
                 drawn_cur_x = cur_x;
                 drawn_cur_y = cur_y;
 
@@ -1241,13 +1290,10 @@ void gui_start(EFI_SYSTEM_TABLE *st)
             /* Быстрый путь: вернуть картинку под старым местом
                курсора из заднего буфера и нарисовать курсор на
                новом. Два квадратика 12x12 вместо всего экрана. */
-            gui_blit_rect(
-                fb, back_buf, stride, fb_w, fb_h,
-                drawn_cur_x, drawn_cur_y,
-                GUI_CURSOR_SIZE, GUI_CURSOR_SIZE
+            gui_present_cursor(
+                fb, back_buf, stride, fb_w, fb_h, fmt,
+                drawn_cur_x, drawn_cur_y, cur_x, cur_y
             );
-
-            gui_draw_cursor_at(fb, stride, fb_w, fb_h, fmt, cur_x, cur_y);
 
             drawn_cur_x = cur_x;
             drawn_cur_y = cur_y;
@@ -1274,6 +1320,9 @@ gui_exit_loop:
 
         if (FreePool != NULL)
             FreePool((VOID *)back_buf);
+
+        if (FreePool != NULL && shadow_buf != NULL)
+            FreePool((VOID *)shadow_buf);
     }
 
     /* Возврат в текстовый режим */
