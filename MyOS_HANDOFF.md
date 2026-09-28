@@ -6,9 +6,13 @@
 ## Что это за проект
 
 `MyOS` — самодельная 64-битная ОС на чистом C, без GNU-EFI и сторонних
-библиотек. Стартует как UEFI-приложение (`BOOTX64.EFI`); команда `ebs`
-вызывает ExitBootServices, и дальше ОС работает на своём коде: консоль,
-прерывания, таймер, память, USB/PS2-ввод, тот же шелл и GUI.
+библиотек. Два файла: загрузчик `BOOTX64.EFI` (UEFI-программа, PE)
+собирает «паспорт загрузки» (`bootinfo.h`), читает `\EFI\BOOT\KERNEL.ELF`,
+строит временные таблицы страниц, вызывает ExitBootServices и прыгает
+в ядро `kernel.elf` (ELF, `0xFFFFFFFF80000000`). Ядро о прошивке не
+знает ничего: свои таблицы страниц, GDT/IDT/TSS, таймер, память,
+USB/PS2-ввод, консоль, шелл и GUI. Команды `ebs` больше нет (печатает
+пояснение).
 
 Пользователь **не программист в этой теме**: код и решения пишет ИИ,
 пользователь собирает, запускает в QEMU и на ноутбуке (HP 250 G7, Arch
@@ -17,66 +21,75 @@ Linux, fish; беспроводная мышь Onikuma через USB-донгл
 по-русски.
 
 Есть документ-план «MyOS: план пути к настоящей ОС» (10 этапов).
-**Этап 0 (порядок в коде) выполнен.** Следующий — этап 1: отдельный
-загрузчик + `kernel.elf`, свои таблицы страниц, kmalloc, TSS/IST.
+**Этапы 0 (порядок в коде) и 1 (загрузчик + ядро, виртуальная память)
+выполнены.** Следующие по плану — этап 2 (ACPI: MADT, MCFG, HPET,
+команда `acpi`) и этап 4 (многозадачность); их можно в любом порядке.
 
 ## Сборка, запуск, тест
 
 ```bash
-make            # BOOTX64.EFI, инкрементально
+make            # BOOTX64.EFI + kernel.elf, инкрементально; оба -> esp/EFI/BOOT/
 make run        # ISO + QEMU, лог COM1 в терминал (-serial stdio)
 make run-tablet # мышь-планшет (без «стенок» в окне QEMU)
-make test       # tools/autotest.py: QEMU без окна, ~10 с
+make test       # tools/autotest.py: 4 запуска QEMU (~1 мин): основной +
+                # crash write / crash stack / crash null (экраны паники)
 ```
+Опции автотеста: `--quick` (без crash-запусков), `--mem 5G`,
+`--extra "-machine q35"` / `"-cpu qemu64,-nx,-pat"` — всё это проверено.
 `./build.sh` вызывает `make`. OVMF по умолчанию
-`/usr/share/edk2/x64/OVMF.4m.fd`. Флаги: `-O2 -fno-strict-aliasing
+`/usr/share/edk2/x64/OVMF.4m.fd`. Два набора флагов (см. Makefile):
+загрузчик — `-fpic -fvisibility=hidden -DMYOS_LOADER`, линковка
+`-m i386pep`; ядро — `-fno-pic -mcmodel=kernel`, линковка по
+`kernel/kernel.ld`. Общие: `-O2 -fno-strict-aliasing
 -fno-tree-loop-distribute-patterns -ffreestanding -fshort-wchar
--mno-red-zone -fpic -fvisibility=hidden ...` — предупреждений быть не
-должно (сейчас ноль).
+-mno-red-zone`. Предупреждений быть не должно (сейчас ноль).
 
 ## Структура
 
 | Где | Что |
 | --- | --- |
-| `main.c` | `efi_main`, главный цикл шелла (берёт таблицу из `g_st` каждую итерацию) |
-| `myos.h` | общий заголовок: #define, типы, `extern`, прототипы по модулям, `static inline` (порты, MMIO, rdtsc) в конце; `#pragma GCC visibility push(hidden)` — иначе -fpic даёт ссылки через GOT, которого в PE нет |
-| `lib/` | `libc.c` (memcpy/memset — их может вставить компилятор), `string.c`, `kprintf.c` (`kprintf(out,fmt,...)`, `ksnprintf`, `klog` — только в COM1), `serial.c` (COM1 115200, loopback-проверка наличия) |
-| `kernel/` | `kcon.c` консоль в framebuffer (Spleen 8x16, отложенная отрисовка `kcon_flush`), `cpu.c` GDT/IDT/ISR/паника/PIC/I/O APIC, `time.c` TSC+PIT+LAPIC timer, `pmm.c` битовая карта страниц + пул, `shim.c` своя EFI_SYSTEM_TABLE `g_kst`, `enter.c` команда `ebs`, `kcmds.c` kinfo/usb/mousetest/mem |
-| `drivers/` | `pci.c`, `xhci_common.c` (сброс, disconnect прошивки, BIOS handoff), `usb.c` (неблокирующий xHCI+HID kernel mode), `hid.c` (разбор Report Descriptor), `keyboard.c` (очередь клавиш, HID Usage→UEFI, накопитель мыши), `ps2.c`, `xhci_demo.c` + `ebs_console.c` (старое демо `ebsdemo`) |
-| `gui/` | `gui.c` цикл `start`, `desktop.c` (вывод кадра без мигания: задний буфер → теневой буфер → только изменённые пиксели на экран, курсор вклеивается: `gui_present_frame`/`gui_present_cursor`; `gui_hover_key`), `draw.c`, `minesweeper*.c`, `terminal.c`, `gstring.c` |
-| `shell/` | `commands.c` (`run_command`), `console.c` (print*, scrollback, дублирование в COM1), `readline.c`, `fs.c` (RAM-диск), `fetch.c`, `editor.c`, `calc.c`, `history.c` |
-| `tools/` | `autotest.py` (свой FAT16-образ, QMP, проверки по логу COM1), `split_main.py` (чем резался старый main.c) |
+| `loader/loader.c` | загрузчик: GOP, время, RSDP, TSC по Stall, чтение ядра, ELF, отъём xHCI у прошивки, временные таблицы (1:1 + HHDM + ядро), EBS, прыжок |
+| `bootinfo.h` | паспорт загрузки `MYOS_BOOT_INFO` + раскладка адресов: HHDM `0xFFFF800000000000`, стеки `0xFFFFFE8000000000`, ядро `0xFFFFFFFF80000000`; свои типы памяти `MYOS_MEM_KERNEL/LOADER_TEMP` |
+| `myos.h` | общий заголовок; `P2V()`/`V2P()` (физ. адрес <-> указатель прямого отображения), `mmio_read32/write32` берут ФИЗИЧЕСКИЙ адрес и сами переводят |
+| `lib/` | `libc.c` (memcpy/memset), `string.c` (+`kstreq`), `kprintf.c` (`kprintf`, `ksnprintf`, `klog` — только COM1; `%S` = CHAR16*), `serial.c` |
+| `kernel/` | `kmain.c` порядок запуска; `kernel.ld`; `vmm.c` таблицы страниц (код RX, rodata R, данные RW+NX, RAM WB, не-RAM ниже 4 ГиБ UC, экран WC через PAT, нижняя половина пуста), стеки с защитными страницами; `pmm.c` страницы (свободны также BootServices*/Loader*); `kmalloc.c` слабы 16..1024 + крупные страницами; `cpu.c` GDT+TSS (IST1 #DF, IST2 NMI, IST3 #MC), IDT, экран паники с разбором #PF/#DF; `power.c` CMOS-часы, reboot (0xCF9/8042), shutdown (FADT + `_S5_` из DSDT, QEMU-порты); `shim.c` таблица `g_kst` для шелла/GUI (свои BootServices/RuntimeServices, без прошивки); `kcon.c`, `time.c`, `kcmds.c` (kinfo/usb/mousetest/mem/boot/vm/crash) |
+| `drivers/` | `pci.c`, `xhci_common.c` (общие с загрузчиком), `usb.c` (xHCI+HID, все DMA-адреса через `P2V`), `hid.c`, `keyboard.c`, `ps2.c` |
+| `gui/` | `gui.c` цикл `start`, `desktop.c` (вывод кадра без мигания: `gui_present_frame`/`gui_present_cursor`), `draw.c`, `minesweeper*.c`, `terminal.c` (+`gui_term_exec`) |
+| `shell/` | `commands.c`, `console.c`, `readline.c`, `fs.c`, `fetch.c`, `editor.c`, `calc.c`, `history.c` |
+| `tools/` | `autotest.py` (свой FAT16-образ с обоими файлами, QMP, проверки по COM1), `split_main.py` |
 
 Новые команды шелла: в `shell/commands.c`, `else if (streq(line,
 "имя"))` + строка в `help`. Новые функции/переменные модуля — объявить
 в `myos.h` в секции своего модуля.
 
-## Kernel mode (после `ebs`) — кратко
+## Ядро — кратко
 
-GDT (0x08/0x10), IDT 256 векторов (asm-заглушки по 16 байт, fxsave),
-экран паники для исключений; PIC перенастроен и замаскирован, I/O APIC
-замаскирован; TSC калибруется по PIT (контроль — Stall до выхода);
-LAPIC timer 1000 Гц, вектор 0x40, `hlt` в ожидании. PMM — только
-EfiConventionalMemory, первый 1 МиБ не выдаётся; DMA для xHCI ниже
-4 ГиБ. xHCI: все корневые порты, кольца с Link TRB, общий диспетчер
-событий, восстановление после ошибок (ошибки «подряд», cc=21 без
-Reset Endpoint, сторож 300 мс), Scratchpad Buffers. HID: клавиатура —
-boot protocol; мышь — boot protocol с проверкой GET_PROTOCOL, иначе
-разбор дескриптора (несколько Report ID, X/Y через Usage Min/Max,
-абсолютные планшеты). `mousetest` — живая диагностика с курсором.
+Порядок запуска (`kernel/kmain.c`): COM1 → копия паспорта → свои
+GDT/IDT (старые — в памяти прошивки, которую сейчас отдадим) → карта
+памяти + pmm → vmm (свои таблицы, CR3, сброс глобальных TLB) → отдать
+таблицы загрузчика → стек 256 КиБ с защитной страницей → TSS/IST →
+консоль → PIC/IOAPIC → TSC по PIT (контроль — замер загрузчика по
+Stall) → LAPIC timer 1 кГц → CMOS → ACPI (для shutdown) → PS/2 → xHCI
+(BAR отображается UC через `vmm_map_mmio`) → `g_kst` → шелл.
 
-## Состояние мыши на реальном ноутбуке
+Правило: **физический адрес никогда не приводить к указателю
+напрямую** — только `P2V()`. Нижняя половина пуста, забытый `P2V` =
+Page Fault с текстом «lower half: nothing is mapped there». Новые
+устройства выше 4 ГиБ — `vmm_map_mmio(phys, size, VMM_UC)`.
 
-Мышь (донгл Onikuma) **работает на железе** после перехода на boot
-protocol + проверку GET_PROTOCOL. Следом была жалоба: курсор в GUI
-периодически моргал и на миг замирал. Причина: часы панели задач
-помечали весь кадр изменённым несколько раз в секунду, и весь экран
-(~1-2 млн пикселей) копировался в медленную видеопамять, затирая
-курсор. Исправлено (`gui/desktop.c`: `gui_present_frame`,
-`gui_present_cursor`): теневой буфер в RAM + запись на экран только
-изменившихся пикселей, курсор вклеивается в поток записи (каждый
-пиксель пишется один раз); часы перерисовываются только при смене
-цифры. **Ждёт подтверждения на ноутбуке.**
+Команды для проверки: `vm` (раскладка, стеки, проверка перевода
+адресов), `mem` (карта, pmm, куча, самотесты), `boot` (что сделал
+загрузчик + его журнал), `crash`/`crash null`/`crash write`/`crash stack`.
+
+## Состояние на реальном ноутбуке
+
+Мышь (донгл Onikuma) работает (boot protocol + GET_PROTOCOL). Курсор в
+GUI больше не моргает (теневой буфер + вклейка курсора) —
+**подтверждено пользователем**. Этап 1 (загрузчик + ядро) проверен
+только в QEMU (OVMF; 256 МиБ и 5 ГиБ; pc и q35; с NX/PAT и без) —
+**на ноутбуке ещё не запускался**. Если не стартует: фото экрана
+загрузчика (он пишет, что делает) или экрана паники (там RIP, CR2 и
+объяснение). На флешке должны быть ОБА файла в `\EFI\BOOT\`.
 
 ## Правила работы с кодом
 
@@ -89,6 +102,9 @@ protocol + проверку GET_PROTOCOL. Следом была жалоба: к
 - Коммиты — с осмысленным сообщением; в конце сообщения строки
   соавторства, если их требует окружение.
 - Если «не работает» после изменений — сначала проверить, что
-  запускается свежий образ (`strings BOOTX64.EFI | grep <строка>`).
+  запускается свежий образ (`strings kernel.elf | grep <строка>`) и
+  что загрузчик и ядро из одной сборки (иначе ядро скажет «bad boot
+  info» в COM1).
+- Меняешь `MYOS_BOOT_INFO` — увеличь `MYOS_BOOT_VERSION`.
 - QEMU с `-bios OVMF.fd` без pflash пишет `NvVars` на загрузочный
   диск; `autotest.py` каждый раз делает свежий образ.

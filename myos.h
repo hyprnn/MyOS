@@ -17,6 +17,7 @@
 #define MYOS_H
 
 #include "efi.h"
+#include "bootinfo.h"
 #include <stdarg.h>   /* va_list для kvsnprintf - заголовок компилятора, не libc */
 
 /*
@@ -283,17 +284,6 @@ typedef EFI_STATUS (EFIAPI *XHCI_FREE_POOL)(VOID *Buffer);
    медленно на конкретном устройстве, поправить это число. */
 #define GUI_MOUSE_PIXELS_PER_MM 8
 
-/*
- * Параметры демо-анимации команды "ebs" (см. run_command):
- * без BootServices->Stall у нас нет откалиброванного таймера,
- * поэтому скорость анимации регулируется только числом итераций
- * пустого busy-wait цикла - грубо, зависит от частоты CPU.
- * Если на конкретной машине анимация слишком быстрая/медленная,
- * поправить EBS_SPIN_PER_STEP.
- */
-#define EBS_BOX_SIZE      24
-#define EBS_STEPS         160
-#define EBS_SPIN_PER_STEP 6000000UL
 #define GUI_TASKBAR_H     22
 #define GUI_MENU_H        14
 
@@ -479,40 +469,6 @@ typedef struct {
 } GUI_MS_LAYOUT;
 
 
-/* ============================================================
- * "Поддельный" ConOut для вывода ПОСЛЕ ExitBootServices
- * ============================================================
- *
- * Весь xHCI-код (xhci_reset_controller, xhci_wait_for_event,
- * xhci_control_transfer, xhci_address_device_and_get_descriptor
- * и часть команды "ebs" ниже) устроен так, что печатает через
- * print()/print16()/print_uint()/print_hex() в параметр
- * "SIMPLE_TEXT_OUTPUT_INTERFACE *out" - а те, в свою очередь,
- * вызывают единственную вещь: out->OutputString(out, buf).
- * Больше никаких других полей структуры out нигде в этом коде
- * не используется (проверено).
- *
- * После ExitBootServices настоящий st->ConOut (он держится на
- * коде прошивки) больше не годится. Вместо переписывания
- * сотен вызовов print()/print_uint()/print_hex() по всему
- * xHCI-коду - подменяем "out" на собственную структуру того же
- * типа, у которой OutputString указывает на функцию ниже,
- * рисующую символы прямо в framebuffer собственным пиксельным
- * шрифтом (gui_draw_char). Весь остальной код xHCI-драйвера
- * остаётся дословно тем же самым, что и раньше, до
- * ExitBootServices - работает и после, без единой строчки
- * изменений в самой логике печати.
- *
- * scrollback_char()/g_scrollback_* (вызываются внутри print()/
- * print16() до OutputString) - чистая работа с обычной памятью,
- * никакого отношения к прошивке не имеют, поэтому тоже спокойно
- * продолжают работать после ExitBootServices.
- */
-
-#define EBS_CONSOLE_SCALE  2
-#define EBS_CONSOLE_CHAR_W (6 * EBS_CONSOLE_SCALE)
-#define EBS_CONSOLE_CHAR_H (9 * EBS_CONSOLE_SCALE)
-#define EBS_CONSOLE_MARGIN 10
 
 
 
@@ -693,60 +649,44 @@ typedef struct {
 /* ################################################################
  * ################################################################
  *
- *   KERNEL MODE: ОС продолжает жить ПОСЛЕ ExitBootServices
+ *   ЯДРО: как MyOS устроена с этапа 1
  *
  * ################################################################
  * ################################################################
  *
- * До этого места вся ОС (шелл, GUI, "Сапёр", терминал) работала
- * как обычное UEFI-приложение: печатала через st->ConOut, читала
- * клавиши через st->ConIn, ждала через BootServices->Stall,
- * брала память через AllocatePool, а мышь - через
- * EFI_SIMPLE_POINTER_PROTOCOL. Всё это - код прошивки, и всё это
- * исчезает в момент ExitBootServices. Старое демо "ebs" поэтому
- * могло только нарисовать что-то и перезагрузиться.
+ * Загрузка: прошивка -> loader/loader.c (BOOTX64.EFI, UEFI-
+ * программа) -> kernel.elf. Загрузчик собирает "паспорт"
+ * (bootinfo.h), выходит из прошивки и прыгает в kmain
+ * (kernel/kmain.c). Ядро о прошивке не знает ничего.
  *
- * Этот блок - собственные замены каждой из этих вещей:
+ * Части ядра:
  *
- *   1. Текстовая консоль (kcon_*) - рисует символы нормальным
- *      шрифтом 8x16 прямо в framebuffer, с цветами, прокруткой и
- *      курсором. Выглядит для остального кода как обычный
- *      SIMPLE_TEXT_OUTPUT_INTERFACE.
+ *   1. Консоль (kcon_*) - шрифт 8x16 прямо в framebuffer, цвета,
+ *      прокрутка, курсор. Для остального кода выглядит как
+ *      обычный SIMPLE_TEXT_OUTPUT_INTERFACE.
  *
- *   2. Процессор (kx_cpu_*) - своя GDT, своя IDT с обработчиками
- *      всех 256 векторов, экран "паники" для исключений процессора
- *      (вместо тихого зависания/перезагрузки).
+ *   2. Процессор (kx_*, cpu.c) - своя GDT с TSS, своя IDT на все
+ *      256 векторов, отдельные стеки (IST) для Double Fault/NMI/
+ *      Machine Check, экран паники с объяснением причины.
  *
- *   3. Время (kx_time_*) - частота TSC калибруется по PIT
- *      (микросхема 8254, порты 0x40-0x43), а настоящий
- *      периодический таймер - Local APIC timer, 1000 прерываний в
- *      секунду. Вместо неоткалиброванного busy_wait_ms.
+ *   3. Время (time.c, power.c) - TSC калибруется по PIT, таймер
+ *      Local APIC 1000 Гц; часы - микросхема CMOS.
  *
- *   4. Физическая память (pmm_*) - битовая карта страниц,
- *      построенная по ИТОГОВОЙ карте памяти от GetMemoryMap
- *      (той самой, с которой вызывался ExitBootServices). Поверх
- *      неё - простейший "пул" (kpool_*) под AllocatePool.
+ *   4. Память: pmm.c - страницы (битовая карта по карте памяти от
+ *      загрузчика, включая бывшую память прошивки); vmm.c - свои
+ *      таблицы страниц (ядро наверху, вся RAM в прямом
+ *      отображении, код только для чтения, NX, WC для экрана,
+ *      стеки с защитными страницами); kmalloc.c - куча.
  *
- *   5. Ввод (kbd_*, kx_*, ps2_*) - неблокирующий xHCI-драйвер,
- *      который перечисляет ВСЕ устройства на корневых портах
- *      (а не одно), поднимает на них HID-клавиатуры (boot
- *      protocol) и HID-мыши (по настоящему Report Descriptor), и
- *      дальше работает "в фоне": опрашивается при каждом чтении
- *      клавиши/состояния мыши. Плюс запасной PS/2-драйвер
- *      клавиатуры (порты 0x60/0x64) - встроенные клавиатуры
- *      ноутбуков почти всегда подключены именно так, а не по USB.
+ *   5. Ввод (kbd_*, kx_*, ps2_*) - неблокирующий xHCI-драйвер
+ *      (HID-клавиатуры и мыши на корневых портах) и PS/2.
  *
- *   6. "Прокладка" (kbs_*, g_kst) - собственная EFI_SYSTEM_TABLE,
- *      в которой ConIn/ConOut/BootServices указывают на наши
- *      функции. Шелл и GUI написаны поверх st->ConOut/
- *      st->BootServices->Stall/LocateProtocol и т.п. - после
- *      подмены таблицы они продолжают работать БЕЗ ЕДИНОЙ правки,
- *      только теперь под ними наши драйверы, а не прошивка. Это
- *      обычный приём настоящих ОС (слой совместимости), а не
- *      обман: ни одна функция таблицы g_kst не вызывает код
- *      прошивки (кроме RuntimeServices - они по спецификации UEFI
- *      обязаны работать и после выхода, и используются только
- *      для часов реального времени и перезагрузки).
+ *   6. Таблица функций ядра (shim.c, g_kst) - собственная таблица
+ *      в формате EFI_SYSTEM_TABLE: шелл и GUI писались как UEFI-
+ *      программы и зовут st->ConOut, st->BootServices->Stall,
+ *      LocateProtocol и т.п. За каждым полем - код ядра, ни одного
+ *      вызова прошивки. На этапе 6 это место займут системные
+ *      вызовы.
  */
 
 
@@ -803,21 +743,9 @@ typedef struct {
  * 4. Физическая память: карта от GetMemoryMap + битовая карта
  * ================================================================
  *
- * GetMemoryMap отдаёт список регионов физической памяти с типом
- * у каждого. После ExitBootServices ОС может свободно
- * пользоваться регионами типа EfiConventionalMemory (7) -
- * это просто свободная RAM. Остальные типы пока НЕ трогаем:
- *   - EfiLoaderCode/Data (1/2) - наш собственный образ и то,
- *     что мы сами выделяли до выхода;
- *   - EfiBootServicesCode/Data (3/4) - формально тоже наши после
- *     выхода, НО там до сих пор лежат таблицы страниц прошивки
- *     (по которым процессор прямо сейчас переводит адреса) и
- *     стек, на котором мы работаем. Забрать их можно будет
- *     только после того, как ОС построит свои таблицы страниц и
- *     свой стек - следующий шаг;
- *   - Runtime Services Code/Data (5/6) - нельзя никогда, это код
- *     часов/перезагрузки, который мы продолжаем вызывать;
- *   - ACPI, MMIO, Reserved - не RAM или чужая.
+ * Карту памяти (список регионов физической памяти с типом у
+ * каждого) собирает загрузчик и передаёт в паспорте загрузки.
+ * Какие типы ядро считает свободными - см. начало kernel/pmm.c.
  *
  * Битовая карта: 1 бит на страницу 4 КиБ, 1 = занята. Сама
  * карта размещается в первом подходящем свободном регионе (и её
@@ -843,17 +771,46 @@ typedef struct {
 #define KMM_DESC_PAGES  24
 
 
-/*
- * "Пул" - то, что прошивка отдавала через AllocatePool
- * (произвольный размер). Самый простой честный вариант поверх
- * страничного аллокатора: каждая аллокация - отдельный кусок
- * целых страниц, в первых 16 байтах - заголовок (метка +
- * число страниц), чтобы FreePool знал, сколько возвращать.
- * Расточительно для мелких кусков, но шелл и GUI просят пул
- * редко и крупно (например, задний буфер кадра GUI - мегабайты).
- * Настоящий heap с мелкими блоками - отдельный будущий шаг.
- */
-#define KPOOL_MAGIC 0x4C4F4F50534F594Dull   /* "MYOSPOOL" */
+/* ================================================================
+ * Виртуальная память (kernel/vmm.c)
+ * ================================================================ */
+
+/* атрибуты для vmm_map_page / vmm_map_mmio */
+#define VMM_W   0x1u    /* можно писать */
+#define VMM_X   0x2u    /* можно исполнять (без него - NX) */
+#define VMM_UC  0x4u    /* некэшируемая (регистры устройств) */
+#define VMM_WC  0x8u    /* write-combining (видеопамять) */
+
+/* Стек ядра: [bottom, top), под ним - защитная страница guard */
+#define KSTACK_MAX 16
+
+typedef struct {
+    UINT64 guard;
+    UINT64 bottom;
+    UINT64 top;
+    const char *name;
+} KSTACK_INFO;
+
+/* TSS (64-битный), см. kernel/cpu.c */
+typedef struct __attribute__((packed)) {
+    UINT32 reserved0;
+    UINT64 rsp0, rsp1, rsp2;
+    UINT64 reserved1;
+    UINT64 ist[7];
+    UINT64 reserved2;
+    UINT16 reserved3;
+    UINT16 iomap_base;
+} KX_TSS;
+
+/* ACPI: то, что нужно для выключения (kernel/power.c) */
+typedef struct {
+    BOOLEAN ok;
+    const char *why;
+    UINT32 pm1a_cnt, pm1b_cnt;
+    UINT32 smi_cmd;
+    UINT8  acpi_enable;
+    UINT8  slp_typa, slp_typb;
+} ACPI_POWER;
 
 
 /* ================================================================
@@ -1062,7 +1019,6 @@ extern UINTN g_color;
 extern UINTN g_current_attr;
 extern EFI_TIME g_boot_time;
 extern BOOLEAN  g_have_boot_time;
-extern EFI_HANDLE g_image_handle;
 extern BOOLEAN g_kernel_mode;
 extern FS_FILE g_fs[FS_MAX_FILES];
 extern CHAR16 g_history[HIST_MAX][LINE_MAX];
@@ -1082,15 +1038,6 @@ extern UINT64 g_tsc_hz;
 extern const GUI_GLYPH gui_font[];
 extern UINT32 g_ms_rng;
 extern BOOLEAN g_gui_draw_cursor;
-extern volatile UINT32 *g_ebsout_fb;
-extern UINT32 g_ebsout_stride;
-extern UINT32 g_ebsout_w;
-extern UINT32 g_ebsout_h;
-extern UINT32 g_ebsout_fg;
-extern UINT32 g_ebsout_bg;
-extern INTN   g_ebsout_col;
-extern INTN   g_ebsout_row;
-extern SIMPLE_TEXT_OUTPUT_INTERFACE g_ebs_pixel_out;
 extern EFI_SYSTEM_TABLE *g_st;
 extern volatile UINT32 *g_kfb;
 extern UINT32 g_kfb_w;
@@ -1119,7 +1066,27 @@ extern SIMPLE_TEXT_OUTPUT_MODE g_kcon_mode;
 extern SIMPLE_TEXT_OUTPUT_INTERFACE g_kcon_out;
 extern BOOLEAN g_kcon_dirty;
 extern UINT64  g_kcon_last_flush;
-extern UINT64 g_kgdt[3] __attribute__((aligned(16)));
+extern UINT64 g_kgdt[5] __attribute__((aligned(16)));
+extern KX_TSS g_ktss;
+extern MYOS_BOOT_INFO g_boot;
+extern UINT64  g_vmm_pml4_phys;
+extern UINT64  g_vmm_table_pages;
+extern UINT64  g_vmm_hhdm_top;
+extern UINT64  g_vmm_pages_2m;
+extern UINT64  g_vmm_pages_4k;
+extern BOOLEAN g_vmm_nx;
+extern BOOLEAN g_vmm_pat;
+extern BOOLEAN g_vmm_ready;
+extern KSTACK_INFO g_kstacks[KSTACK_MAX];
+extern UINTN g_kstack_count;
+extern UINT64 g_kheap_slab_pages;
+extern UINT64 g_kheap_big_pages;
+extern UINT64 g_kheap_live;
+extern UINT64 g_kheap_live_bytes;
+extern UINT64 g_kheap_bad_frees;
+extern UINT64 g_kmm_reclaimed_pages;
+extern ACPI_POWER g_acpi_power;
+extern EFI_RUNTIME_SERVICES g_krt;
 extern KX_IDT_ENTRY g_kidt[256] __attribute__((aligned(16)));
 extern volatile UINT64 g_kticks;
 extern volatile UINT64 g_kspurious;
@@ -1145,7 +1112,6 @@ extern UINT64 g_kmm_total_pages;
 extern UINT64 g_kmm_usable_pages;
 extern UINT64 g_kmm_free_pages;
 extern BOOLEAN g_kmm_ready;
-extern UINT64 g_kpool_allocs;
 extern EFI_INPUT_KEY g_kbd_queue[KBD_QUEUE_SIZE];
 extern UINTN g_kbd_q_head;
 extern UINTN g_kbd_q_tail;
@@ -1294,6 +1260,7 @@ int streq(
     const CHAR16 *a,
     const char *b
 );
+int kstreq(const char *a, const char *b);
 int starts_with(
     const CHAR16 *a,
     const char *prefix
@@ -1576,27 +1543,13 @@ void gui_str_copy8(
     UINTN max
 );
 
-/* --- drivers/ebs_console.c --- */
-EFI_STATUS EFIAPI ebs_console_output_string(
-    SIMPLE_TEXT_OUTPUT_INTERFACE *this_out,
-    CHAR16 *str
-);
-void ebs_console_start(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 w,
-    UINT32 h,
-    UINT32 fg,
-    UINT32 bg
-);
+/* --- gui/terminal.c --- */
 BOOLEAN gui_term_exec(
     EFI_SYSTEM_TABLE *st,
     const char *cmd,
     char lines[][GUI_TERM_LINE_LEN + 1],
     UINTN *count
 );
-
-/* --- gui/terminal.c --- */
 void gui_draw_terminal(
     volatile UINT32 *fb,
     UINT32 stride,
@@ -1643,48 +1596,6 @@ INTN gui_hover_key(
 );
 void gui_start(EFI_SYSTEM_TABLE *st);
 
-/* --- drivers/xhci_demo.c --- */
-UINT64 xhci_event_ring_trb_addr(
-    UINT64 evring_phys,
-    UINTN  ev_slot
-);
-UINT32 xhci_event_ring_expected_cycle(
-    UINTN ev_slot
-);
-UINT64 xhci_xfer_ring_trb_addr(
-    UINT64 ring_phys,
-    UINTN  seq
-);
-UINT32 xhci_xfer_ring_pcs(
-    UINTN seq
-);
-BOOLEAN xhci_wait_for_event(
-    SIMPLE_TEXT_OUTPUT_INTERFACE *out,
-    UINT64 evring_phys,
-    UINT64 intr0,
-    UINTN *io_slot,
-    UINT8 want_trb_type,
-    volatile UINT32 **out_trb
-);
-BOOLEAN xhci_control_transfer(
-    SIMPLE_TEXT_OUTPUT_INTERFACE *out,
-    UINT64 xmmio,
-    XHCI_CAP_INFO *cap,
-    UINT64 evring_phys,
-    UINT64 intr0,
-    UINT64 ep0_ring_phys,
-    UINTN *io_trb_slot,
-    UINT8 slot_id,
-    UINT8 bm_request_type,
-    UINT8 b_request,
-    UINT16 w_value,
-    UINT16 w_index,
-    UINT16 w_length,
-    UINT64 data_buf_phys,
-    UINTN *io_ev_slot,
-    UINT8 *out_compl_code
-);
-
 /* --- drivers/hid.c --- */
 UINT32 hid_extract_bits(
     volatile UINT8 *report,
@@ -1702,41 +1613,6 @@ void hid_parse_report_descriptor(
     volatile UINT8 *desc,
     UINT16 desc_len,
     HID_MOUSE_REPORT_LAYOUT *layout
-);
-
-/* --- drivers/xhci_demo.c --- */
-void xhci_address_device_and_get_descriptor(
-    SIMPLE_TEXT_OUTPUT_INTERFACE *out,
-    UINT64 xmmio,
-    XHCI_CAP_INFO *cap,
-    UINT64 dcbaa_phys,
-    UINT64 cmdring_phys,
-    UINT64 evring_phys,
-    UINT64 intr0,
-    UINT64 port_base,
-    UINTN  root_port,
-    UINT8  slot_id,
-    UINTN  start_ev_slot,
-     
-    UINT64 input_ctx_phys,
-    UINT64 dev_ctx_phys,
-    UINT64 ep0_ring_phys,
-    UINT64 desc_buf_phys,
-    UINT64 int_ring_phys
-);
-void xhci_run_post_ebs(
-    SIMPLE_TEXT_OUTPUT_INTERFACE *out,
-    UINT64 xmmio,
-    XHCI_CAP_INFO *cap,
-    UINT64 dcbaa_phys,
-    UINT64 cmdring_phys,
-    UINT64 evring_phys,
-    UINT64 erst_phys,
-    UINT64 input_ctx_phys,
-    UINT64 dev_ctx_phys,
-    UINT64 ep0_ring_phys,
-    UINT64 desc_buf_phys,
-    UINT64 int_ring_phys
 );
 
 /* --- kernel/kcon.c --- */
@@ -1804,6 +1680,33 @@ void kx_idt_set(UINTN vec, UINT64 handler);
 void kx_load_idt(void);
 void kx_pic_disable(void);
 UINTN kx_ioapic_mask_all(void);
+void kx_load_tss(UINT64 ist_df, UINT64 ist_nmi, UINT64 ist_mc, UINT64 rsp0);
+
+/* --- kernel/vmm.c --- */
+BOOLEAN vmm_init(void);
+BOOLEAN vmm_map_page(UINT64 virt, UINT64 phys, UINT32 attr);
+void vmm_unmap_page(UINT64 virt);
+BOOLEAN vmm_map_mmio(UINT64 phys, UINT64 size, UINT32 cache);
+UINT64 vmm_virt_to_phys(UINT64 virt);
+UINT64 vmm_query(UINT64 virt);
+UINT64 vmm_alloc_stack(UINTN pages, const char *name);
+const char *vmm_describe(UINT64 a);
+
+/* --- kernel/kmalloc.c --- */
+VOID *kmalloc(UINTN size);
+VOID *kzalloc(UINTN size);
+BOOLEAN kfree(VOID *ptr);
+BOOLEAN kmalloc_selftest(char *report, UINTN cap);
+
+/* --- kernel/power.c --- */
+BOOLEAN rtc_read(EFI_TIME *t);
+void kx_reboot(void) __attribute__((noreturn));
+void kx_shutdown(void);
+const UINT8 *acpi_find_table(const char *sig);
+void acpi_power_init(void);
+
+/* --- kernel/kmain.c --- */
+void kmain(MYOS_BOOT_INFO *bi) __attribute__((noreturn));
 
 /* --- kernel/time.c --- */
 UINT64 kx_pit_measure_tsc_hz(void);
@@ -1824,9 +1727,9 @@ BOOLEAN pmm_init(void);
 UINT64 pmm_alloc_pages(UINT64 count, UINT64 limit);
 void pmm_free_pages(UINT64 phys, UINT64 count);
 UINT64 pmm_alloc_zeroed(UINT64 count, UINT64 limit);
-VOID *kpool_alloc(UINTN size);
-BOOLEAN kpool_free(VOID *ptr);
 const char *kmm_type_name(UINT32 t);
+BOOLEAN pmm_free_type(UINT32 t);
+UINT64 pmm_reclaim_type(UINT32 type);
 
 /* --- drivers/keyboard.c --- */
 void kbd_enqueue(UINT16 scan, CHAR16 uc);
@@ -1934,10 +1837,9 @@ EFI_STATUS EFIAPI kptr_get_state(
     EFI_SIMPLE_POINTER_PROTOCOL *this_ptr,
     EFI_SIMPLE_POINTER_STATE *state
 );
-void kx_install_shims(EFI_SYSTEM_TABLE *fw_st);
+void kx_install_shims(void);
+EFI_STATUS EFIAPI krt_get_time(EFI_TIME *t, VOID *caps);
 
-/* --- kernel/enter.c --- */
-void kernel_ebs_and_enter(EFI_SYSTEM_TABLE *st);
 
 /* --- kernel/kcmds.c --- */
 void kernel_cmd_kinfo(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
@@ -1948,6 +1850,9 @@ void kx_print_hid_line(SIMPLE_TEXT_OUTPUT_INTERFACE *out, KX_HID *h);
 void kernel_cmd_mousetest(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void kernel_cmd_usb(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void kernel_cmd_mem(EFI_SYSTEM_TABLE *st, SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kernel_cmd_boot(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kernel_cmd_vm(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kernel_cmd_crash(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *what);
 
 /* --- shell/commands.c --- */
 void run_command(
@@ -1955,11 +1860,6 @@ void run_command(
     CHAR16 *line
 );
 
-/* --- main.c --- */
-EFI_STATUS EFIAPI efi_main(
-    EFI_HANDLE ImageHandle,
-    EFI_SYSTEM_TABLE *SystemTable
-);
 
 /* --- lib/serial.c --- */
 extern BOOLEAN g_serial_ok;
@@ -2007,32 +1907,46 @@ static inline UINT32 io_in32(UINT16 port)
 
 
 /* ============================================================
- * xHCI - Capability Registers (только чтение, шаг 3).
+ * Физические адреса и MMIO.
  *
- * MMIO - это просто обычная память по физическому адресу
- * из BAR0 (см. pci_read_bar_address выше), а не порты и не
- * протокол - значит, ни один UEFI-вызов тут не нужен вообще,
- * читаем/пишем напрямую через volatile-указатель.
+ * Ядро живёт на СВОИХ таблицах страниц (kernel/vmm.c): нижняя
+ * половина адресного пространства пуста, а вся физическая память
+ * и регистры устройств видны по адресу MYOS_HHDM_BASE + X
+ * ("прямое отображение", см. bootinfo.h). Поэтому физический
+ * адрес (из карты памяти, из PCI BAR, из pmm_alloc_pages) НЕЛЬЗЯ
+ * просто привести к указателю - его надо перевести через P2V().
  *
- * ВАЖНО (ограничение этого шага): это работает только пока
- * физический адрес == виртуальному, то есть страничная
- * трансляция остаётся той identity-mapping, которую заранее
- * настроила прошивка UEFI (типично для x86_64 UEFI - она сама
- * держит 1:1 отображение первых десятков/сотен ГБ физической
- * памяти). Мы этим просто пользуемся, но НЕ настраиваем
- * страницы сами. Если понадобится работать с MMIO выше того,
- * что замаппила прошивка, - это будет уже отдельный шаг
- * (собственные таблицы страниц).
+ * Загрузчик собирается с -DMYOS_LOADER: там ещё таблицы
+ * прошивки, память отображена 1:1 и P2V - просто приведение.
+ *
+ * Регистры устройства (MMIO) читаем/пишем через mmio_read32/
+ * mmio_write32 по ФИЗИЧЕСКОМУ адресу - перевод делают они сами.
+ * Участок MMIO должен быть отображён как некэшируемый - см.
+ * vmm_map_mmio (всё ниже 4 ГиБ, что не RAM, уже отображено так).
  * ============================================================ */
+
+#ifdef MYOS_LOADER
+#define MYOS_PHYS_OFFSET 0ull
+#else
+#define MYOS_PHYS_OFFSET MYOS_HHDM_BASE
+#endif
+
+/* физический адрес -> указатель, по которому его видит ядро */
+#define P2V(p)  ((void *)(UINTN)((UINT64)(p) + MYOS_PHYS_OFFSET))
+
+/* указатель из прямого отображения (P2V, kmalloc, pmm) ->
+   физический адрес. Для адресов образа ядра и стеков не годится -
+   для них vmm_virt_to_phys. */
+#define V2P(v)  ((UINT64)(UINTN)(v) - MYOS_PHYS_OFFSET)
 
 static inline UINT32 mmio_read32(UINT64 addr)
 {
-    return *(volatile UINT32 *)(UINTN)addr;
+    return *(volatile UINT32 *)P2V(addr);
 }
 
 static inline void mmio_write32(UINT64 addr, UINT32 value)
 {
-    *(volatile UINT32 *)(UINTN)addr = value;
+    *(volatile UINT32 *)P2V(addr) = value;
 }
 
 static inline UINT64 rdtsc(void)

@@ -9,3 +9,6 @@ MyOS_hdd.img
 MyOS_hdd.vdi
 *.o
 *.d
+kernel.elf
+__pycache__/
+*.su

@@ -16,14 +16,35 @@
  * long mode почти не работает - базы и лимиты игнорируются):
  *   0x08 - код:   L=1 (64-битный), P=1, DPL=0, исполняемый
  *   0x10 - данные: P=1, DPL=0, запись разрешена
- * TSS (нужен для отдельного стека на double fault и для
- * перехода в ring 3) - следующий шаг, пока не заводим.
+ *   0x18 - TSS (занимает две записи по 8 байт), заполняется в
+ *          kx_load_tss: отдельные стеки для тяжёлых исключений.
  */
-UINT64 g_kgdt[3] __attribute__((aligned(16))) = {
+UINT64 g_kgdt[5] __attribute__((aligned(16))) = {
     0x0000000000000000ull,
     0x00AF9A000000FFFFull,
-    0x00CF92000000FFFFull
+    0x00CF92000000FFFFull,
+    0, 0
 };
+
+/*
+ * TSS (Task State Segment). В 64-битном режиме от "задач" в нём
+ * осталось одно полезное: таблица запасных стеков.
+ *   rsp0    - стек, на который процессор переключится при
+ *             прерывании из программы (ring 3) - понадобится на
+ *             этапе 6;
+ *   ist[0..6] - Interrupt Stack Table: если в записи IDT указан
+ *             номер IST, процессор при этом исключении ВСЕГДА
+ *             переходит на этот стек, даже если текущий стек
+ *             сломан или кончился.
+ * Мы даём свой стек Double Fault (IST1), NMI (IST2) и Machine
+ * Check (IST3): Double Fault - это как раз то, что происходит при
+ * переполнении стека ядра (Page Fault на защитной странице, а
+ * положить рамку исключения некуда). Без IST процессор попытался
+ * бы положить рамку на тот же мёртвый стек -> Triple Fault ->
+ * мгновенная перезагрузка без единого слова. С IST - экран
+ * паники "stack overflow".
+ */
+KX_TSS g_ktss __attribute__((aligned(16)));
 
 KX_IDT_ENTRY g_kidt[256] __attribute__((aligned(16)));
 
@@ -59,6 +80,44 @@ void kx_load_gdt(void)
         : "m"(gdtr)
         : "rax", "memory"
     );
+}
+
+
+/*
+ * Записать TSS в GDT (селектор 0x18) и загрузить его (ltr).
+ * ist1..ist3 - вершины стеков для #DF, NMI, #MC (0 - не ставить).
+ */
+void kx_load_tss(UINT64 ist_df, UINT64 ist_nmi, UINT64 ist_mc, UINT64 rsp0)
+{
+    UINT8 *t = (UINT8 *)&g_ktss;
+
+    for (UINTN i = 0; i < sizeof(g_ktss); i++)
+        t[i] = 0;
+
+    g_ktss.rsp0 = rsp0;
+    g_ktss.ist[0] = ist_df;
+    g_ktss.ist[1] = ist_nmi;
+    g_ktss.ist[2] = ist_mc;
+    g_ktss.iomap_base = (UINT16)sizeof(g_ktss);  /* карты портов нет */
+
+    UINT64 base = (UINT64)(UINTN)&g_ktss;
+    UINT64 limit = sizeof(g_ktss) - 1u;
+
+    /* 16-байтный системный дескриптор: тип 0x9 (доступный 64-битный
+       TSS), P=1; база разбросана по кусочкам, как в 1985 году */
+    g_kgdt[3] = (limit & 0xFFFFu) |
+                ((base & 0xFFFFFFull) << 16) |
+                (0x89ull << 40) |
+                (((limit >> 16) & 0xFu) << 48) |
+                (((base >> 24) & 0xFFull) << 56);
+    g_kgdt[4] = base >> 32;
+
+    __asm__ __volatile__("ltr %w0" : : "r"(0x18) : "memory");
+
+    /* номера IST в записях IDT (1..3 = ist[0..2]) */
+    if (ist_df)  g_kidt[8].ist = 1;
+    if (ist_nmi) g_kidt[2].ist = 2;
+    if (ist_mc)  g_kidt[18].ist = 3;
 }
 
 
@@ -450,18 +509,94 @@ const char *kx_exception_name(UINT64 v)
 }
 
 
+/* Человеческое объяснение исключения - две строки для экрана
+   паники и лога. Для Page Fault разбираем код ошибки:
+     бит 0 P   - 0: страницы нет, 1: страница есть, но нельзя так
+     бит 1 W   - это была запись (иначе чтение)
+     бит 2 U   - из программы (ring 3)
+     бит 3 RSVD- испорченная запись таблицы страниц
+     бит 4 I   - это была выборка инструкции (исполнение) */
+static void kx_explain(KX_ISR_FRAME *f, UINT64 cr2, char *l1, char *l2, UINTN cap)
+{
+    l1[0] = '\0';
+    l2[0] = '\0';
+
+    if (f->vector == 14) {
+
+        UINT64 e = f->error;
+        const char *op = (e & 0x10u) ? "EXECUTE" : (e & 0x2u) ? "WRITE" : "READ";
+        const char *why;
+
+        if (!(e & 0x1u))
+            why = "the page is not mapped";
+        else if (e & 0x8u)
+            why = "a page table entry is corrupted (reserved bit set)";
+        else if (e & 0x10u)
+            why = "the page is not executable (NX)";
+        else if (e & 0x2u)
+            why = "the page is READ-ONLY";
+        else
+            why = "access not allowed";
+
+        ksnprintf(l1, cap, "Page Fault: %s of 0x%016llx - %s", op, cr2, why);
+        ksnprintf(l2, cap, "  that address is: %s", vmm_describe(cr2));
+
+    } else if (f->vector == 8) {
+
+        const char *d = vmm_describe(cr2);
+        BOOLEAN overflow = (d[0] == 'G');   /* "GUARD PAGE ..." */
+
+        if (overflow) {
+            ksnprintf(l1, cap, "KERNEL STACK OVERFLOW (hit the guard page at 0x%016llx)", cr2);
+            ksnprintf(l2, cap, "  too deep recursion or a huge local array");
+        } else {
+            ksnprintf(l1, cap, "Double Fault: an exception while handling another one");
+            ksnprintf(l2, cap, "  last page fault address (CR2) is: %s", d);
+        }
+
+    } else if (f->vector == 13) {
+
+        ksnprintf(l1, cap, "General Protection: bad pointer (non-canonical), bad segment");
+        ksnprintf(l2, cap, "  or privileged instruction; error code 0x%llx", f->error);
+
+    } else if (f->vector == 6) {
+
+        ksnprintf(l1, cap, "Invalid Opcode: the CPU does not know this instruction");
+        ksnprintf(l2, cap, "  (the 'crash' command does this on purpose with ud2)");
+
+    } else if (f->vector == 0) {
+
+        ksnprintf(l1, cap, "Division by zero");
+    }
+}
+
+
 /*
  * Экран "паники" - исключение процессора (деление на ноль,
  * обращение по неверному адресу и т.п.) в нашем коде. Раньше в
  * такой ситуации машина либо зависала, либо молча
  * перезагружалась (triple fault) - теперь видно, ЧТО и ГДЕ
  * случилось: номер исключения, адрес инструкции (RIP), для
- * Page Fault - адрес, к которому обращались (CR2), и регистры.
- * Этого достаточно, чтобы по скриншоту найти ошибку.
+ * Page Fault - адрес, к которому обращались (CR2), что именно
+ * пошло не так (запись в память только для чтения? страницы
+ * нет?) и чья это память (код ядра, стек, NULL...), и регистры.
+ * Всё то же уходит в COM1 - в QEMU это текст в терминале.
  */
 void kx_panic(KX_ISR_FRAME *f)
 {
     kx_cli();
+
+    UINT64 cr2 = kx_read_cr2();
+    char ex1[112], ex2[112];
+
+    kx_explain(f, cr2, ex1, ex2, sizeof(ex1));
+
+    klog("*** KERNEL PANIC: vector %llu %s\n", f->vector,
+         kx_exception_name(f->vector));
+    if (ex1[0]) klog("%s\n", ex1);
+    if (ex2[0]) klog("%s\n", ex2);
+    klog("RIP=0x%016llx (%s) ERR=0x%llx CR2=0x%016llx RSP=0x%016llx\n",
+         f->rip, vmm_describe(f->rip), f->error, cr2, f->rsp);
 
     if (g_kfb == NULL) {
         for (;;)
@@ -472,8 +607,8 @@ void kx_panic(KX_ISR_FRAME *f)
     UINT32 fg = gui_pack(g_kfb_fmt, 255, 255, 255);
     UINT32 hl = gui_pack(g_kfb_fmt, 255, 220, 90);
 
-    UINTN bw = 8u * 64u;
-    UINTN bh = 16u * 20u;
+    UINTN bw = 8u * 90u;
+    UINTN bh = 16u * 26u;
 
     if (bw > g_kfb_w)
         bw = g_kfb_w;
@@ -492,25 +627,26 @@ void kx_panic(KX_ISR_FRAME *f)
     kx_raw_text(x, y, "*** MyOS KERNEL PANIC: CPU EXCEPTION ***", hl, bg);
     y += 24;
 
-    char line[80];
-    char num[20];
-    UINTN p;
+    char line[112];
 
-    /* "Vector N: имя" */
-    p = 0;
-    {
-        const char *a = "Vector 0x";
-        for (UINTN i = 0; a[i]; i++) line[p++] = a[i];
-        kx_hex_str(f->vector, 2, num);
-        for (UINTN i = 0; num[i]; i++) line[p++] = num[i];
-        line[p++] = ':';
-        line[p++] = ' ';
-        const char *n = kx_exception_name(f->vector);
-        for (UINTN i = 0; n[i] && p < 78; i++) line[p++] = n[i];
-        line[p] = '\0';
-    }
+    ksnprintf(line, sizeof(line), "Vector 0x%02llx: %s", f->vector,
+              kx_exception_name(f->vector));
     kx_raw_text(x, y, line, fg, bg);
     y += 20;
+
+    if (ex1[0]) {
+        kx_raw_text(x, y, ex1, hl, bg);
+        y += 16;
+    }
+
+    if (ex2[0]) {
+        kx_raw_text(x, y, ex2, hl, bg);
+        y += 16;
+    }
+
+    ksnprintf(line, sizeof(line), "  the instruction is in: %s", vmm_describe(f->rip));
+    kx_raw_text(x, y, line, fg, bg);
+    y += 24;
 
     /* Пары "ИМЯ = значение" */
     const char *names[] = {
@@ -523,7 +659,7 @@ void kx_panic(KX_ISR_FRAME *f)
 
     vals[0] = f->error;
     vals[1] = f->rip;
-    vals[2] = kx_read_cr2();
+    vals[2] = cr2;
     vals[3] = f->rsp;
     vals[4] = f->rflags;
     vals[5] = f->cs;
@@ -537,24 +673,7 @@ void kx_panic(KX_ISR_FRAME *f)
 
     for (UINTN k = 0; k < 13; k++) {
 
-        p = 0;
-
-        for (UINTN i = 0; names[k][i]; i++)
-            line[p++] = names[k][i];
-
-        line[p++] = ' ';
-        line[p++] = '=';
-        line[p++] = ' ';
-        line[p++] = '0';
-        line[p++] = 'x';
-
-        kx_hex_str(vals[k], 16, num);
-
-        for (UINTN i = 0; num[i]; i++)
-            line[p++] = num[i];
-
-        line[p] = '\0';
-
+        ksnprintf(line, sizeof(line), "%s = 0x%016llx", names[k], vals[k]);
         kx_raw_text(x, y, line, fg, bg);
         y += 16;
     }

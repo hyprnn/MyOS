@@ -1,6 +1,16 @@
 /*
- * kernel/shim.c - своя EFI_SYSTEM_TABLE для шелла и GUI после ExitBootServices.
+ * kernel/shim.c - системная таблица ядра для шелла и GUI.
  * Часть MyOS; общие объявления - в myos.h.
+ *
+ * Шелл и GUI писались, когда MyOS была UEFI-программой, и
+ * общаются с миром через таблицу в формате UEFI: ConOut->
+ * OutputString, BootServices->Stall, LocateProtocol(GOP) и т.п.
+ * Прошивки в ядре нет ВООБЩЕ, поэтому здесь - наша собственная
+ * таблица того же формата, где за каждым полем стоит код ядра:
+ * консоль - kcon.c, клавиатура и мышь - драйверы USB/PS2, память -
+ * kmalloc/pmm, время - LAPIC/TSC и микросхема CMOS, перезагрузка
+ * и выключение - power.c. Это внутренний интерфейс ядра; на этапе
+ * 6 (программы в ring 3) его место займут системные вызовы.
  */
 #include "myos.h"
 
@@ -20,6 +30,8 @@ EFI_GRAPHICS_OUTPUT_MODE_INFORMATION g_kgop_info;
 
 EFI_SIMPLE_POINTER_PROTOCOL g_kptr;
 EFI_SIMPLE_POINTER_MODE     g_kptr_mode;
+
+EFI_RUNTIME_SERVICES g_krt;
 
 
 /* Всё, чего у нас нет, честно отвечает "не поддерживается".
@@ -49,14 +61,14 @@ EFI_STATUS EFIAPI kbs_allocate_pool(
     if (buffer == NULL)
         return K_EFI_INVALID_PARAMETER;
 
-    *buffer = kpool_alloc(size);
+    *buffer = kmalloc(size);
 
     return (*buffer != NULL) ? EFI_SUCCESS : K_EFI_OUT_OF_RESOURCES;
 }
 
 EFI_STATUS EFIAPI kbs_free_pool(VOID *buffer)
 {
-    return kpool_free(buffer) ? EFI_SUCCESS : K_EFI_INVALID_PARAMETER;
+    return kfree(buffer) ? EFI_SUCCESS : K_EFI_INVALID_PARAMETER;
 }
 
 /* Type: 0 = AllocateAnyPages, 1 = AllocateMaxAddress,
@@ -264,7 +276,33 @@ EFI_STATUS EFIAPI kptr_get_state(
 }
 
 
-void kx_install_shims(EFI_SYSTEM_TABLE *fw_st)
+/* --- Runtime Services: часы и питание --- */
+
+EFI_STATUS EFIAPI krt_get_time(EFI_TIME *t, VOID *caps)
+{
+    (void)caps;
+
+    if (t == NULL)
+        return K_EFI_INVALID_PARAMETER;
+
+    return rtc_read(t) ? EFI_SUCCESS : K_EFI_UNSUPPORTED;
+}
+
+VOID EFIAPI krt_reset_system(
+    EFI_RESET_TYPE type, EFI_STATUS status, UINTN size, VOID *data
+)
+{
+    (void)status;
+    (void)size;
+    (void)data;
+
+    if (type == EfiResetShutdown)
+        kx_shutdown();   /* если выключиться не вышло - перезагрузка */
+
+    kx_reboot();
+}
+
+void kx_install_shims(void)
 {
     /* Boot Services: сначала ВСЁ = "не поддерживается" (чтобы
        ни одно поле не осталось NULL - вызов по NULL был бы
@@ -317,6 +355,8 @@ void kx_install_shims(EFI_SYSTEM_TABLE *fw_st)
     g_kgop_mode.Mode = 0;
     g_kgop_mode.Info = &g_kgop_info;
     g_kgop_mode.SizeOfInfo = sizeof(g_kgop_info);
+    /* виртуальный адрес (прямое отображение, WC) - GUI просто
+       приводит его к указателю */
     g_kgop_mode.FrameBufferBase = (UINT64)(UINTN)g_kfb;
     g_kgop_mode.FrameBufferSize =
         (UINTN)g_kfb_stride * (UINTN)g_kfb_h * 4u;
@@ -342,21 +382,37 @@ void kx_install_shims(EFI_SYSTEM_TABLE *fw_st)
     /* Сама системная таблица - по полям (не присваиванием
        структуры целиком: компилятор мог бы вставить вызов
        memcpy, которого у нас нет) */
-    g_kst.Hdr.Signature = fw_st->Hdr.Signature;
-    g_kst.Hdr.Revision = fw_st->Hdr.Revision;
-    g_kst.Hdr.HeaderSize = fw_st->Hdr.HeaderSize;
+    /* Runtime Services: всё "не поддерживается", кроме часов и
+       перезагрузки/выключения */
+    VOID **rslots =
+        (VOID **)((UINT8 *)&g_krt + sizeof(EFI_TABLE_HEADER));
+    UINTN nrslots =
+        (sizeof(EFI_RUNTIME_SERVICES) - sizeof(EFI_TABLE_HEADER)) /
+        sizeof(VOID *);
+
+    for (UINTN i = 0; i < nrslots; i++)
+        rslots[i] = (VOID *)kbs_unsupported;
+
+    g_krt.Hdr.Signature = 0x56524553544e5552ull;  /* "RUNTSERV" */
+    g_krt.Hdr.HeaderSize = (UINT32)sizeof(EFI_RUNTIME_SERVICES);
+    g_krt.GetTime = krt_get_time;
+    g_krt.ResetSystem = krt_reset_system;
+
+    g_kst.Hdr.Signature = 0x5453595320494249ull;  /* "IBI SYST" */
+    g_kst.Hdr.Revision = g_boot.uefi_revision;
+    g_kst.Hdr.HeaderSize = (UINT32)sizeof(EFI_SYSTEM_TABLE);
     g_kst.Hdr.CRC32 = 0;
     g_kst.Hdr.Reserved = 0;
-    g_kst.FirmwareVendor = fw_st->FirmwareVendor;
-    g_kst.FirmwareRevision = fw_st->FirmwareRevision;
+    g_kst.FirmwareVendor = g_boot.fw_vendor;
+    g_kst.FirmwareRevision = g_boot.fw_revision;
     g_kst.ConsoleInHandle = NULL;
     g_kst.ConIn = &g_kconin;
     g_kst.ConsoleOutHandle = NULL;
     g_kst.ConOut = &g_kcon_out;
     g_kst.StandardErrorHandle = NULL;
     g_kst.StdErr = &g_kcon_out;
-    g_kst.RuntimeServices = fw_st->RuntimeServices;
+    g_kst.RuntimeServices = &g_krt;
     g_kst.BootServices = &g_kbs;
-    g_kst.NumberOfTableEntries = fw_st->NumberOfTableEntries;
-    g_kst.ConfigurationTable = fw_st->ConfigurationTable;
+    g_kst.NumberOfTableEntries = 0;
+    g_kst.ConfigurationTable = NULL;
 }

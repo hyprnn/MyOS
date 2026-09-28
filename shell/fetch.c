@@ -225,12 +225,12 @@ void cmd_fetch(
 
     print(
         out,
-        "    : efi_main"
+        "    : MyOS kernel.elf"
     );
 
     print(
         out,
-        " (no Linux/Windows underneath)\n"
+        " (higher half, own page tables)\n"
     );
 
 
@@ -268,7 +268,7 @@ void cmd_fetch(
 
     print(
         out,
-        "    : UEFI\n"
+        "    : UEFI -> MyOS loader -> kernel\n"
     );
 
 
@@ -872,81 +872,17 @@ void cmd_fetch(
 
 
     /* --------------------------------------------------------
-     * UEFI services
+     * Прошивка: после загрузчика её нет вообще - всё своё
      * -------------------------------------------------------- */
 
     print_label(
         out,
-        "Boot Services"
+        "Firmware use"
     );
 
     print(
         out,
-        " : "
-    );
-
-
-    /* после "ebs" st->BootServices указывает на НАШУ таблицу-
-       прокладку, а не на прошивку - честно говорим "нет" */
-    print_bool(
-        out,
-        st->BootServices != NULL && !g_kernel_mode
-    );
-
-
-    print(
-        out,
-        "\n"
-    );
-
-
-    print_label(
-        out,
-        "Runtime Services"
-    );
-
-    print(
-        out,
-        " : "
-    );
-
-
-    print_bool(
-        out,
-        st->RuntimeServices != NULL
-    );
-
-
-    print(
-        out,
-        "\n"
-    );
-
-
-    /* --------------------------------------------------------
-     * System table
-     * -------------------------------------------------------- */
-
-    print_label(
-        out,
-        "System Table"
-    );
-
-    print(
-        out,
-        "  : "
-    );
-
-
-    print_uint(
-        out,
-        (UINT64)(UINTN)st
-    );
-
-
-    print(
-        out,
-        "\n"
+        " : none after the loader (own drivers)\n"
     );
 
 
@@ -964,8 +900,14 @@ void cmd_fetch(
 
     print(
         out,
-        g_kernel_mode ? "      : final UEFI memory map (see 'mem')\n"
-                      : "      : UEFI memory map available\n"
+        "      : "
+    );
+
+    kprintf(
+        out,
+        "%llu MiB free of %llu MiB (see 'mem')\n",
+        (g_kmm_free_pages * 4u) / 1024u,
+        (g_kmm_usable_pages * 4u) / 1024u
     );
 
 
@@ -976,8 +918,7 @@ void cmd_fetch(
 
     print(
         out,
-        g_kernel_mode ? "   : MyOS bitmap page allocator\n"
-                      : "   : EFI Boot Services\n"
+        "   : MyOS page bitmap + kmalloc slabs\n"
     );
 
 

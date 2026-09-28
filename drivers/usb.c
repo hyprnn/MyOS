@@ -27,10 +27,10 @@ void kx_ring_init(KX_RING *r, UINT64 phys)
     r->phys = phys;
     r->seq = 0;
 
-    raw_zero_mem((volatile UINT8 *)(UINTN)phys, 4096);
+    raw_zero_mem((volatile UINT8 *)P2V(phys), 4096);
 
     volatile UINT32 *link =
-        (volatile UINT32 *)(UINTN)(phys + (KX_RING_TRBS - 1u) * 16u);
+        (volatile UINT32 *)P2V(phys + (KX_RING_TRBS - 1u) * 16u);
 
     link[0] = (UINT32)(phys & 0xFFFFFFFFu);
     link[1] = (UINT32)(phys >> 32);
@@ -67,14 +67,14 @@ UINT64 kx_ring_push(
     if (slot == 0 && r->seq > 0) {
 
         volatile UINT32 *link =
-            (volatile UINT32 *)(UINTN)
+            (volatile UINT32 *)P2V
                 (r->phys + (KX_RING_TRBS - 1u) * 16u);
 
         link[3] = (6u << 10) | (1u << 1) | (pcs ^ 1u);
     }
 
     UINT64 addr = r->phys + (UINT64)slot * 16u;
-    volatile UINT32 *t = (volatile UINT32 *)(UINTN)addr;
+    volatile UINT32 *t = (volatile UINT32 *)P2V(addr);
 
     t[0] = d0;
     t[1] = d1;
@@ -109,7 +109,7 @@ void kx_erdp_update(void)
 BOOLEAN kx_ev_fetch(UINT32 ev[4])
 {
     volatile UINT32 *t =
-        (volatile UINT32 *)(UINTN)
+        (volatile UINT32 *)P2V
             (g_kx.evring + (UINT64)(g_kx.ev_deq % KX_EV_TRBS) * 16u);
 
     UINT32 cyc = ((g_kx.ev_deq / KX_EV_TRBS) % 2u == 0) ? 1u : 0u;
@@ -194,7 +194,7 @@ void kx_handle_async_event(UINT32 ev[4])
             h->err_streak = 0;
 
             {
-                volatile UINT8 *r = (volatile UINT8 *)(UINTN)h->rep_buf;
+                volatile UINT8 *r = (volatile UINT8 *)P2V(h->rep_buf);
 
                 h->last_len = len;
 
@@ -635,7 +635,7 @@ void kx_mouse_report_layout(KX_HID *h, volatile UINT8 *rep, UINTN len)
 
 void kx_hid_report(KX_HID *h, UINTN len)
 {
-    volatile UINT8 *rep = (volatile UINT8 *)(UINTN)h->rep_buf;
+    volatile UINT8 *rep = (volatile UINT8 *)P2V(h->rep_buf);
 
     if (h->role == KX_ROLE_KBD_BOOT) {
 
@@ -767,7 +767,7 @@ BOOLEAN kx_mouse_switch_to_boot(KX_DEV *d, UINT8 iface, KX_HID *h)
     }
 
     UINT64 buf = d->buf + 512u;
-    volatile UINT8 *b = (volatile UINT8 *)(UINTN)buf;
+    volatile UINT8 *b = (volatile UINT8 *)P2V(buf);
 
     b[0] = 0xEE;   /* заведомо не 0 и не 1 */
 
@@ -893,7 +893,7 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
 
     kx_ring_init(&d->ep0, ep0_ring);
 
-    ((volatile UINT64 *)(UINTN)g_kx.dcbaa)[slot] = d->dev_ctx;
+    ((volatile UINT64 *)P2V(g_kx.dcbaa))[slot] = d->dev_ctx;
 
     /* Стартовый Max Packet Size для EP0. Раньше для Full Speed
        брали 8 - это работает с QEMU, но на настоящем FS-
@@ -911,9 +911,9 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
         mps0 = 512;
 
     UINT32 cs = g_kx.ctx_size;
-    volatile UINT32 *ictl = (volatile UINT32 *)(UINTN)d->in_ctx;
-    volatile UINT32 *islot = (volatile UINT32 *)(UINTN)(d->in_ctx + cs);
-    volatile UINT32 *iep0 = (volatile UINT32 *)(UINTN)(d->in_ctx + 2u * cs);
+    volatile UINT32 *ictl = (volatile UINT32 *)P2V(d->in_ctx);
+    volatile UINT32 *islot = (volatile UINT32 *)P2V(d->in_ctx + cs);
+    volatile UINT32 *iep0 = (volatile UINT32 *)P2V(d->in_ctx + 2u * cs);
 
     ictl[0] = 0;
     ictl[1] = 0x3u;                          /* A0 Slot + A1 EP0 */
@@ -945,7 +945,7 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
 
     busy_wait_ms(5);    /* SET_ADDRESS recovery (2 мс по спеке) */
 
-    volatile UINT8 *b = (volatile UINT8 *)(UINTN)d->buf;
+    volatile UINT8 *b = (volatile UINT8 *)P2V(d->buf);
 
     /* --- первые 8 байт Device Descriptor (ради bMaxPacketSize0) --- */
     cc = kx_control(d, 0x80, 0x06, 0x0100, 0, 8, d->buf);
@@ -966,7 +966,7 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
     if (real_mps0 >= 8 && real_mps0 != mps0) {
 
         /* Evaluate Context: обновить MPS у EP0 на настоящий */
-        raw_zero_mem((volatile UINT8 *)(UINTN)d->in_ctx, 4096);
+        raw_zero_mem((volatile UINT8 *)P2V(d->in_ctx), 4096);
 
         ictl[1] = 0x2u;                      /* только A1 = EP0 */
         iep0[1] = (3u << 1) | (4u << 3) | ((UINT32)real_mps0 << 16);
@@ -1026,7 +1026,7 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
     /* --- Configuration Descriptor: сначала 9 байт (узнать
        полную длину), потом целиком --- */
     UINT64 cfg_phys = d->buf + 1024u;
-    volatile UINT8 *cfg = (volatile UINT8 *)(UINTN)cfg_phys;
+    volatile UINT8 *cfg = (volatile UINT8 *)P2V(cfg_phys);
 
     cc = kx_control(d, 0x80, 0x06, 0x0200, 0, 9, cfg_phys);
 
@@ -1205,7 +1205,7 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
 
         UINT64 rd_phys = d->buf + 2048u;
 
-        raw_zero_mem((volatile UINT8 *)(UINTN)rd_phys, 2048);
+        raw_zero_mem((volatile UINT8 *)P2V(rd_phys), 2048);
 
         UINT8 rcc = kx_control(d, 0x81, 0x06, 0x2200, c->iface, rlen, rd_phys);
 
@@ -1256,7 +1256,7 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
 
                 hid_parse_report_descriptor(
                     out,
-                    (volatile UINT8 *)(UINTN)rd_phys,
+                    (volatile UINT8 *)P2V(rd_phys),
                     rlen,
                     &h->layout
                 );
@@ -1335,9 +1335,9 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
 
     /* --- Configure Endpoint: все найденные конечные точки
        устройства одной командой --- */
-    raw_zero_mem((volatile UINT8 *)(UINTN)d->in_ctx, 4096);
+    raw_zero_mem((volatile UINT8 *)P2V(d->in_ctx), 4096);
 
-    volatile UINT32 *oslot = (volatile UINT32 *)(UINTN)d->dev_ctx;
+    volatile UINT32 *oslot = (volatile UINT32 *)P2V(d->dev_ctx);
 
     ictl[0] = 0;
     ictl[1] = 0x1u;
@@ -1357,7 +1357,7 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
         ictl[1] |= (1u << h->dci);
 
         volatile UINT32 *ep =
-            (volatile UINT32 *)(UINTN)
+            (volatile UINT32 *)P2V
                 (d->in_ctx + (UINT64)(h->dci + 1u) * cs);
 
         UINT32 esit = (UINT32)h->maxpkt * (UINT32)(h->burst + 1u);
@@ -1477,7 +1477,7 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
             return;
         }
 
-        volatile UINT64 *a = (volatile UINT64 *)(UINTN)arr;
+        volatile UINT64 *a = (volatile UINT64 *)P2V(arr);
 
         for (UINT32 i = 0; i < g_kx.scratchpads && i < 512u; i++) {
 
@@ -1491,7 +1491,7 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
             a[i] = pg;
         }
 
-        ((volatile UINT64 *)(UINTN)g_kx.dcbaa)[0] = arr;
+        ((volatile UINT64 *)P2V(g_kx.dcbaa))[0] = arr;
     }
 
     kx_ring_init(&g_kx.cmd, cmd_page);
@@ -1508,7 +1508,7 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
     /* Event Ring: порядок по спеке - ERSTSZ, ERDP, ERSTBA
        (запись ERSTBA заставляет контроллер прочитать таблицу) */
-    volatile UINT32 *erst = (volatile UINT32 *)(UINTN)g_kx.erst;
+    volatile UINT32 *erst = (volatile UINT32 *)P2V(g_kx.erst);
 
     erst[0] = (UINT32)(g_kx.evring & 0xFFFFFFFFu);
     erst[1] = (UINT32)(g_kx.evring >> 32);

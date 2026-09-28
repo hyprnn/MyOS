@@ -7,8 +7,10 @@
 #   Fedora:        sudo dnf install mtools xorriso
 #   Arch:          sudo pacman -S mtools libisoburn
 #
-# Запускать после ./build.sh (BOOTX64.EFI должен
-# уже существовать).
+# Запускать после make (BOOTX64.EFI - загрузчик - и
+# kernel.elf - ядро - должны уже существовать). В образ
+# они кладутся рядом: /EFI/BOOT/BOOTX64.EFI и
+# /EFI/BOOT/KERNEL.ELF - загрузчик ищет ядро там.
 #
 # Схема ниже — стандартный, проверенный вариант
 # (см. OSDev Wiki "UEFI Bare Bones"): FAT-образ
@@ -22,8 +24,8 @@
 
 set -e
 
-if [ ! -f BOOTX64.EFI ]; then
-    echo "Сначала соберите проект: ./build.sh"
+if [ ! -f BOOTX64.EFI ] || [ ! -f kernel.elf ]; then
+    echo "Сначала соберите проект: make"
     exit 1
 fi
 
@@ -34,15 +36,18 @@ OUT_ISO=MyOS.iso
 rm -rf "$FAT_IMG" "$ISO_DIR" "$OUT_ISO"
 
 # ------------------------------------------------------------
-# 1. FAT-образ размером 1.44 МБ с EFI/BOOT/BOOTX64.EFI внутри.
+# 1. FAT-образ размером 2.88 МБ (стандартная "большая"
+#    дискета - с запасом под растущее ядро) с загрузчиком
+#    и ядром внутри.
 # ------------------------------------------------------------
-dd if=/dev/zero of="$FAT_IMG" bs=1024 count=1440
+dd if=/dev/zero of="$FAT_IMG" bs=1024 count=2880
 
-mformat -i "$FAT_IMG" -f 1440 ::
+mformat -i "$FAT_IMG" -f 2880 ::
 
 mmd -i "$FAT_IMG" ::/EFI
 mmd -i "$FAT_IMG" ::/EFI/BOOT
 mcopy -i "$FAT_IMG" BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$FAT_IMG" kernel.elf ::/EFI/BOOT/KERNEL.ELF
 
 # ------------------------------------------------------------
 # 2. Кладём образ в дерево ISO.
@@ -60,6 +65,7 @@ mcopy -i "$FAT_IMG" BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
 mkdir -p "$ISO_DIR/EFI/BOOT"
 cp "$FAT_IMG" "$ISO_DIR/"
 cp BOOTX64.EFI "$ISO_DIR/EFI/BOOT/BOOTX64.EFI"
+cp kernel.elf "$ISO_DIR/EFI/BOOT/KERNEL.ELF"
 
 # ------------------------------------------------------------
 # 3. Собираем чисто UEFI-загрузочный ISO.

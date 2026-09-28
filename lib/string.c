@@ -156,3 +156,14 @@ CHAR16 *take_word(
 
     return s;
 }
+
+/* Сравнение двух обычных (char) строк: 1 - одинаковые */
+int kstreq(const char *a, const char *b)
+{
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+
+    return *a == *b;
+}

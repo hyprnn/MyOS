@@ -4,4 +4,4 @@
 set -e
 cd "$(dirname "$0")"
 make
-echo "Готово: BOOTX64.EFI собран и разложен в esp/EFI/BOOT/BOOTX64.EFI"
+echo "Готово: BOOTX64.EFI (загрузчик) и kernel.elf (ядро) разложены в esp/EFI/BOOT/"

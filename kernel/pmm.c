@@ -1,6 +1,24 @@
 /*
- * kernel/pmm.c - карта памяти, страничный аллокатор, пул.
+ * kernel/pmm.c - карта памяти и страничный аллокатор (pmm =
+ * physical memory manager).
  * Часть MyOS; общие объявления - в myos.h.
+ *
+ * Учёт - битовая карта: один бит на каждую 4-КиБ страницу
+ * физической памяти (1 = занята). Выдаются ФИЗИЧЕСКИЕ адреса;
+ * чтобы что-то туда записать, адрес переводят в указатель через
+ * P2V() (прямое отображение, см. vmm.c).
+ *
+ * Что считается свободным (раньше - только EfiConventionalMemory):
+ *   * Conventional - свободная RAM;
+ *   * BootServicesCode/Data - память прошивки, которая после
+ *     ExitBootServices по правилам UEFI принадлежит ОС (раньше её
+ *     трогать было нельзя: там жили наш стек и таблицы страниц
+ *     прошивки - теперь у ядра всё своё);
+ *   * LoaderCode/Data - загрузчик своё дело сделал;
+ *   * MYOS_MEM_LOADER_TEMP - временные таблицы страниц загрузчика,
+ *     отдаются отдельно (pmm_reclaim_type), когда ядро включит свои.
+ * Не трогаем: образ ядра и паспорт (MYOS_MEM_KERNEL), Runtime-
+ * память прошивки, таблицы ACPI (понадобятся на этапе 2), MMIO.
  */
 #include "myos.h"
 
@@ -16,11 +34,21 @@ UINT64 g_kmm_total_pages = 0;   /* сколько страниц покрыва�
 UINT64 g_kmm_usable_pages = 0;  /* сколько из них было
                                            свободной RAM */
 UINT64 g_kmm_free_pages = 0;
+UINT64 g_kmm_reclaimed_pages = 0;  /* из них - бывшая память
+                                           прошивки и загрузчика */
 BOOLEAN g_kmm_ready = FALSE;
 
+/* Эти типы памяти ядро отдаёт в аллокатор сразу */
+BOOLEAN pmm_free_type(UINT32 t)
+{
+    return t == 7 ||            /* Conventional */
+           t == 1 || t == 2 ||  /* LoaderCode / LoaderData */
+           t == 3 || t == 4;    /* BootServicesCode / Data */
+}
 
-/* Скопировать итоговую карту памяти из буфера прошивки в наш
-   статический массив (сразу после ExitBootServices) */
+
+/* Скопировать итоговую карту памяти (её собрал загрузчик) в наш
+   статический массив */
 void pmm_save_map(
     VOID *map_buf,
     UINTN map_size,
@@ -62,7 +90,8 @@ BOOLEAN pmm_init(void)
 
     for (UINTN i = 0; i < g_kmm_map_count; i++) {
 
-        if (g_kmm_map[i].type != 7)
+        if (!pmm_free_type(g_kmm_map[i].type) &&
+            g_kmm_map[i].type != MYOS_MEM_LOADER_TEMP)
             continue;
 
         UINT64 end =
@@ -83,7 +112,7 @@ BOOLEAN pmm_init(void)
     g_kmm_bitmap_pages = (bytes + KMM_PAGE - 1u) / KMM_PAGE;
 
     /* Где разместить саму битовую карту: первый свободный
-       регион выше 1 МиБ, в который она целиком влезает */
+       (Conventional) регион выше 1 МиБ, в который она влезает */
     g_kmm_bitmap_phys = 0;
 
     for (UINTN i = 0; i < g_kmm_map_count; i++) {
@@ -109,18 +138,19 @@ BOOLEAN pmm_init(void)
     if (g_kmm_bitmap_phys == 0)
         return FALSE;
 
-    g_kmm_bitmap = (UINT64 *)(UINTN)g_kmm_bitmap_phys;
+    g_kmm_bitmap = (UINT64 *)P2V(g_kmm_bitmap_phys);
 
     /* всё занято... */
     for (UINT64 w = 0; w < words; w++)
         g_kmm_bitmap[w] = ~0ull;
 
-    /* ...кроме свободной RAM (EfiConventionalMemory) */
+    /* ...кроме свободной RAM и памяти прошивки/загрузчика */
     g_kmm_usable_pages = 0;
+    g_kmm_reclaimed_pages = 0;
 
     for (UINTN i = 0; i < g_kmm_map_count; i++) {
 
-        if (g_kmm_map[i].type != 7)
+        if (!pmm_free_type(g_kmm_map[i].type))
             continue;
 
         UINT64 first = g_kmm_map[i].phys / KMM_PAGE;
@@ -137,6 +167,8 @@ BOOLEAN pmm_init(void)
             if (pmm_test(p)) {
                 pmm_clear(p);
                 g_kmm_usable_pages++;
+                if (g_kmm_map[i].type != 7)
+                    g_kmm_reclaimed_pages++;
             }
         }
     }
@@ -240,7 +272,7 @@ UINT64 pmm_alloc_zeroed(UINT64 count, UINT64 limit)
     if (phys == 0)
         return 0;
 
-    volatile UINT64 *q = (volatile UINT64 *)(UINTN)phys;
+    volatile UINT64 *q = (volatile UINT64 *)P2V(phys);
     UINT64 n = count * KMM_PAGE / 8u;
 
     for (UINT64 i = 0; i < n; i++)
@@ -249,46 +281,36 @@ UINT64 pmm_alloc_zeroed(UINT64 count, UINT64 limit)
     return phys;
 }
 
-UINT64 g_kpool_allocs = 0;
-
-VOID *kpool_alloc(UINTN size)
+/*
+ * Отдать аллокатору все страницы указанного типа из карты памяти.
+ * Нужно для временных таблиц страниц загрузчика: пока ядро не
+ * включило свои таблицы, эти страницы - живые таблицы CR3.
+ */
+UINT64 pmm_reclaim_type(UINT32 type)
 {
-    UINT64 pages = ((UINT64)size + 16u + KMM_PAGE - 1u) / KMM_PAGE;
-    UINT64 phys = pmm_alloc_pages(pages, 0);
+    UINT64 n = 0;
 
-    if (phys == 0)
-        return NULL;
+    for (UINTN i = 0; i < g_kmm_map_count; i++) {
 
-    UINT64 *hdr = (UINT64 *)(UINTN)phys;
+        if (g_kmm_map[i].type != type)
+            continue;
 
-    hdr[0] = KPOOL_MAGIC;
-    hdr[1] = pages;
+        UINT64 first = g_kmm_map[i].phys / KMM_PAGE;
 
-    g_kpool_allocs++;
+        for (UINT64 p = first; p < first + g_kmm_map[i].pages; p++) {
 
-    return (VOID *)(UINTN)(phys + 16u);
-}
+            if (p < 256u || p >= g_kmm_total_pages || !pmm_test(p))
+                continue;
 
-BOOLEAN kpool_free(VOID *ptr)
-{
-    if (ptr == NULL)
-        return FALSE;
+            pmm_clear(p);
+            g_kmm_free_pages++;
+            g_kmm_usable_pages++;
+            g_kmm_reclaimed_pages++;
+            n++;
+        }
+    }
 
-    UINT64 *hdr = (UINT64 *)((UINT8 *)ptr - 16);
-
-    if (hdr[0] != KPOOL_MAGIC)
-        return FALSE;
-
-    UINT64 pages = hdr[1];
-
-    hdr[0] = 0;
-
-    pmm_free_pages((UINT64)(UINTN)hdr, pages);
-
-    if (g_kpool_allocs > 0)
-        g_kpool_allocs--;
-
-    return TRUE;
+    return n;
 }
 
 
@@ -310,6 +332,8 @@ const char *kmm_type_name(UINT32 t)
     case 12: return "MMIOPortSpace";
     case 13: return "PalCode";
     case 14: return "Persistent";
+    case MYOS_MEM_KERNEL:      return "MyOS kernel";
+    case MYOS_MEM_LOADER_TEMP: return "MyOS loader (temp)";
     default: return "Other";
     }
 }

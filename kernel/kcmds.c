@@ -11,19 +11,13 @@
 
 void kernel_cmd_kinfo(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
-    if (!g_kernel_mode) {
-        print(out, "Mode: firmware (UEFI Boot Services active).\n");
-        print(out, "Run 'ebs' to switch to MyOS's own kernel mode.\n");
-        return;
-    }
-
     /* Пример kprintf (lib/kprintf.c): одна строка формата вместо
        цепочки print + print_uint + print_hex. Числа 64-битные -
        поэтому %llu / %llx. */
     UINT64 us = kx_uptime_us();
 
-    kprintf(out, "Mode: kernel (no Boot Services)\n");
-    kprintf(out, "Uptime in kernel mode: %llu.%03llu s\n",
+    kprintf(out, "Mode: MyOS kernel (started by the MyOS loader, no firmware)\n");
+    kprintf(out, "Uptime: %llu.%03llu s\n",
             us / 1000000u, (us / 1000u) % 1000u);
     kprintf(out, "TSC: %llu MHz (%s)\n", g_tsc_hz / 1000000u, g_tsc_source);
     kprintf(out, "LAPIC timer: %s%llu ticks\n",
@@ -38,8 +32,8 @@ void kernel_cmd_kinfo(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
     kprintf(out, " breakpoints=%llu\n", (UINT64)g_kbreakpoints);
 
-    kprintf(out, "Memory: %llu MiB free, pool blocks in use: %llu\n",
-            (g_kmm_free_pages * 4u) / 1024u, g_kpool_allocs);
+    kprintf(out, "Memory: %llu MiB free, heap blocks in use: %llu\n",
+            (g_kmm_free_pages * 4u) / 1024u, g_kheap_live);
 
     kprintf(out, "Keyboard: %llu keys, PS/2 ", g_kbd_keys_total);
 
@@ -71,8 +65,7 @@ const char *kx_ep_hw_state(KX_HID *h)
         return "?";
 
     volatile UINT32 *ep =
-        (volatile UINT32 *)(UINTN)
-            (d->dev_ctx + (UINT64)h->dci * g_kx.ctx_size);
+        (volatile UINT32 *)P2V(d->dev_ctx + (UINT64)h->dci * g_kx.ctx_size);
 
     switch (ep[0] & 0x7u) {
     case 0:  return "Disabled";
@@ -451,43 +444,25 @@ void kernel_cmd_usb(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 }
 
 
+static void kx_print_size(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINT64 pages)
+{
+    UINT64 kib = pages * 4u;
+
+    if (kib >= 10240u)
+        kprintf(out, "%llu MiB", kib / 1024u);
+    else
+        kprintf(out, "%llu KiB", kib);
+}
+
 void kernel_cmd_mem(EFI_SYSTEM_TABLE *st, SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
-    UINT64 by_type[16];
+    (void)st;
 
-    for (UINTN i = 0; i < 16; i++)
+    /* типы 0..15 из UEFI + два наших (MYOS_MEM_*) */
+    UINT64 by_type[18];
+
+    for (UINTN i = 0; i < 18; i++)
         by_type[i] = 0;
-
-    if (!g_kernel_mode) {
-
-        /* В режиме прошивки - просто показать её карту памяти */
-        GUI_GET_MEMORY_MAP get_map =
-            (GUI_GET_MEMORY_MAP)st->BootServices->GetMemoryMap;
-        GUI_ALLOCATE_POOL alloc_pool =
-            (GUI_ALLOCATE_POOL)st->BootServices->AllocatePool;
-        GUI_FREE_POOL free_pool =
-            (GUI_FREE_POOL)st->BootServices->FreePool;
-
-        UINTN size = 0, key = 0, dsize = 0;
-        UINT32 dver = 0;
-
-        get_map(&size, NULL, &key, &dsize, &dver);
-        size += dsize * 8u;
-
-        VOID *buf = NULL;
-
-        if (alloc_pool(GUI_EFI_BOOT_SERVICES_DATA, size, &buf) != EFI_SUCCESS)
-            return;
-
-        if (get_map(&size, buf, &key, &dsize, &dver) == EFI_SUCCESS)
-            pmm_save_map(buf, size, dsize);
-
-        free_pool(buf);
-
-        print(out, "Firmware memory map (Boot Services still active):\n");
-    } else {
-        print(out, "Final memory map (as handed over at ExitBootServices):\n");
-    }
 
     for (UINTN i = 0; i < g_kmm_map_count; i++) {
 
@@ -495,63 +470,243 @@ void kernel_cmd_mem(EFI_SYSTEM_TABLE *st, SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
         if (t < 16)
             by_type[t] += g_kmm_map[i].pages;
+        else if (t == MYOS_MEM_KERNEL)
+            by_type[16] += g_kmm_map[i].pages;
+        else if (t == MYOS_MEM_LOADER_TEMP)
+            by_type[17] += g_kmm_map[i].pages;
     }
 
-    for (UINT32 t = 0; t < 16; t++) {
+    print(out, "Memory map from the loader (what the firmware left us):\n");
+
+    for (UINT32 t = 0; t < 18; t++) {
 
         if (by_type[t] == 0)
             continue;
 
-        print(out, "  ");
-        print(out, kmm_type_name(t));
-        print(out, ": ");
+        UINT32 real = (t == 16) ? MYOS_MEM_KERNEL :
+                      (t == 17) ? MYOS_MEM_LOADER_TEMP : t;
 
-        UINT64 kib = by_type[t] * 4u;
-
-        if (kib >= 10240u) {
-            print_uint(out, kib / 1024u);
-            print(out, " MiB\n");
-        } else {
-            print_uint(out, kib);
-            print(out, " KiB\n");
-        }
+        kprintf(out, "  %-24s ", kmm_type_name(real));
+        kx_print_size(out, by_type[t]);
+        print(out, (real == MYOS_MEM_LOADER_TEMP) ? "  -> free now\n" :
+                   pmm_free_type(real) ? "  -> free RAM for MyOS\n" : "\n");
     }
 
-    print(out, "  (");
-    print_uint(out, g_kmm_map_count);
-    print(out, " regions)\n");
+    kprintf(out, "  (%llu regions)\n", (UINT64)g_kmm_map_count);
 
-    if (g_kernel_mode && g_kmm_ready) {
+    if (!g_kmm_ready)
+        return;
 
-        print(out, "\nMyOS page allocator (bitmap, 4 KiB pages):\n  free ");
-        print_uint(out, g_kmm_free_pages);
-        print(out, " pages (");
-        print_uint(out, (g_kmm_free_pages * 4u) / 1024u);
-        print(out, " MiB), in use ");
-        print_uint(out, g_kmm_usable_pages - g_kmm_free_pages);
-        print(out, " pages, bitmap covers ");
-        print_uint(out, (g_kmm_total_pages * 4u) / 1024u);
-        print(out, " MiB\n  pool blocks in use: ");
-        print_uint(out, g_kpool_allocs);
-        print(out, "\n");
+    print(out, "\nPage allocator (bitmap, 4 KiB pages):\n  free ");
+    kx_print_size(out, g_kmm_free_pages);
+    print(out, " of ");
+    kx_print_size(out, g_kmm_usable_pages);
+    print(out, " usable, in use ");
+    kx_print_size(out, g_kmm_usable_pages - g_kmm_free_pages);
+    print(out, "\n  taken back from the firmware and the loader: ");
+    kx_print_size(out, g_kmm_reclaimed_pages);
+    print(out, "\n");
 
-        /* живая проверка: выделить, записать, освободить */
-        UINT64 a = pmm_alloc_pages(4, 0);
+    /* живая проверка: выделить, записать, освободить */
+    UINT64 a = pmm_alloc_pages(4, 0);
 
-        if (a != 0) {
+    if (a != 0) {
 
-            volatile UINT64 *q = (volatile UINT64 *)(UINTN)a;
-            q[0] = 0x1122334455667788ull;
-            BOOLEAN ok = (q[0] == 0x1122334455667788ull);
+        volatile UINT64 *q = (volatile UINT64 *)P2V(a);
+        q[0] = 0x1122334455667788ull;
+        BOOLEAN ok = (q[0] == 0x1122334455667788ull);
 
-            pmm_free_pages(a, 4);
+        pmm_free_pages(a, 4);
 
-            print(out, "  self-test: 4 pages at 0x");
-            print_hex(out, a, 8);
-            print(out, ok ? " - allocated, written, freed: OK\n" :
-                            " - WRITE CHECK FAILED\n");
-        } else {
-            print(out, "  self-test: allocation FAILED\n");
-        }
+        kprintf(out, "  self-test: 4 pages at 0x%08llx - %s\n", a,
+                ok ? "allocated, written, freed: OK" : "WRITE CHECK FAILED");
+    } else {
+        print(out, "  self-test: allocation FAILED\n");
     }
+
+    print(out, "\nKernel heap (kmalloc: slabs 16..1024 bytes + whole pages):\n");
+    kprintf(out, "  blocks in use: %llu (~%llu bytes), slab pages %llu, big-block pages %llu\n",
+            g_kheap_live, g_kheap_live_bytes, g_kheap_slab_pages, g_kheap_big_pages);
+
+    if (g_kheap_bad_frees)
+        kprintf(out, "  WARNING: %llu bad kfree() calls (see COM1 log)\n", g_kheap_bad_frees);
+
+    char rep[96];
+    kmalloc_selftest(rep, sizeof(rep));
+    kprintf(out, "  self-test: %s\n", rep);
+}
+
+
+/* ================================================================
+ * boot - что сделал загрузчик
+ * ================================================================ */
+
+void kernel_cmd_boot(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    kprintf(out, "Loaded by: MyOS loader (BOOTX64.EFI)\n");
+    kprintf(out, "Kernel file: %S, %llu KiB\n",
+            g_boot.kernel_path, g_boot.kernel_file_size / 1024u);
+    kprintf(out, "Kernel image: %llu KiB at phys 0x%llx, virt 0x%llx\n",
+            g_boot.kernel_size / 1024u, g_boot.kernel_phys, g_boot.kernel_virt);
+    kprintf(out, "Firmware: %S rev 0x%x, UEFI %u.%u\n",
+            g_boot.fw_vendor, g_boot.fw_revision,
+            g_boot.uefi_revision >> 16, (g_boot.uefi_revision & 0xFFFFu) / 10u);
+    kprintf(out, "Screen: %ux%u (stride %u), framebuffer 0x%llx, %llu KiB\n",
+            g_boot.fb_width, g_boot.fb_height, g_boot.fb_stride,
+            g_boot.fb_phys, g_boot.fb_size / 1024u);
+    kprintf(out, "ACPI RSDP: 0x%llx (ACPI %u)\n", g_boot.rsdp_phys, g_boot.acpi_version);
+    kprintf(out, "USB (xHCI): %s, firmware driver %s, BIOS handoff %s\n",
+            g_boot.xhci_found ? "found" : "not found",
+            g_boot.xhci_disconnected ? "disconnected" : "-",
+            g_boot.xhci_handoff_ok ? "OK" : "not confirmed");
+
+    if (g_boot.have_boot_time)
+        kprintf(out, "Boot time: %04u-%02u-%02u %02u:%02u:%02u\n",
+                g_boot.boot_time.Year, g_boot.boot_time.Month,
+                g_boot.boot_time.Day, g_boot.boot_time.Hour,
+                g_boot.boot_time.Minute, g_boot.boot_time.Second);
+
+    print(out, "\nLoader log:\n");
+
+    /* журнал - построчно, с отступом */
+    char line[128];
+    UINTN n = 0;
+
+    for (UINTN i = 0; i < g_boot.log_len && i < sizeof(g_boot.log); i++) {
+
+        char c = g_boot.log[i];
+
+        if (c == '\n' || n + 1 >= sizeof(line)) {
+            line[n] = '\0';
+            kprintf(out, "  | %s\n", line);
+            n = 0;
+            if (c == '\n')
+                continue;
+        }
+
+        line[n++] = c;
+    }
+
+    if (n > 0) {
+        line[n] = '\0';
+        kprintf(out, "  | %s\n", line);
+    }
+}
+
+
+/* ================================================================
+ * vm - виртуальная память
+ * ================================================================ */
+
+void kernel_cmd_vm(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    extern char __kernel_start[], __kernel_text_end[];
+    extern char __kernel_rodata_end[], __kernel_end[];
+
+    kprintf(out, "Page tables: PML4 at phys 0x%llx, %llu pages of tables\n",
+            g_vmm_pml4_phys, g_vmm_table_pages);
+    kprintf(out, "CPU: NX %s, PAT %s (framebuffer is %s)\n",
+            g_vmm_nx ? "on" : "NOT SUPPORTED",
+            g_vmm_pat ? "reprogrammed" : "not available",
+            g_vmm_pat ? "write-combining" : "uncached");
+
+    print(out, "\nAddress space:\n");
+    kprintf(out, "  0x0000000000000000  lower half - empty (future programs)\n");
+    kprintf(out, "  0xFFFF800000000000  all physical memory up to %llu GiB\n",
+            g_vmm_hhdm_top >> 30);
+    kprintf(out, "                      (%llu x 2 MiB + %llu x 4 KiB pages)\n",
+            g_vmm_pages_2m, g_vmm_pages_4k);
+    kprintf(out, "  0xFFFFFE8000000000  kernel stacks with guard pages\n");
+    kprintf(out, "  0xFFFFFFFF80000000  kernel image:\n");
+    kprintf(out, "      code     %p .. %p  read + execute\n",
+            __kernel_start, __kernel_text_end);
+    kprintf(out, "      rodata   %p .. %p  read only\n",
+            __kernel_text_end, __kernel_rodata_end);
+    kprintf(out, "      data/bss %p .. %p  read + write, no execute\n",
+            __kernel_rodata_end, __kernel_end);
+
+    print(out, "\nKernel stacks:\n");
+
+    for (UINTN i = 0; i < g_kstack_count; i++) {
+        kprintf(out, "  %-28s %3llu KiB, guard page at %p\n",
+                g_kstacks[i].name,
+                (g_kstacks[i].top - g_kstacks[i].bottom) / 1024u,
+                (VOID *)(UINTN)g_kstacks[i].guard);
+    }
+
+    UINT64 rsp;
+    __asm__ __volatile__("mov %%rsp, %0" : "=r"(rsp));
+    kprintf(out, "  (this command runs with RSP = %p)\n", (VOID *)(UINTN)rsp);
+
+    /* проверка перевода адресов туда и обратно */
+    UINT64 pk = vmm_virt_to_phys((UINT64)(UINTN)&g_boot);
+    kprintf(out, "\nTranslation check: &g_boot = %p -> phys 0x%llx (%s)\n",
+            &g_boot, pk,
+            (pk >= g_boot.kernel_phys &&
+             pk < g_boot.kernel_phys + g_boot.kernel_size) ? "inside the kernel image: OK" : "WRONG");
+}
+
+
+/* ================================================================
+ * crash - нарочно уронить ядро, чтобы увидеть экран паники
+ * ================================================================ */
+
+/* рекурсия без дна - для "crash stack". noinline и volatile-
+   массив, чтобы компилятор не превратил её в цикл */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winfinite-recursion"
+__attribute__((noinline))
+static UINT64 kx_recurse(UINT64 n)
+{
+    volatile UINT8 pad[256];
+
+    pad[0] = (UINT8)n;
+    pad[255] = (UINT8)(n >> 8);
+
+    return kx_recurse(n + 1) + pad[0] + pad[255];
+}
+#pragma GCC diagnostic pop
+
+void kernel_cmd_crash(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *what)
+{
+    if (what[0] == '\0') {
+
+        print(out, "Executing an invalid instruction (ud2) on purpose...\n");
+        kcon_flush();
+        __asm__ __volatile__("ud2");
+
+    } else if (kstreq(what, "null")) {
+
+        print(out, "Reading from a NULL pointer on purpose...\n");
+        kcon_flush();
+        volatile UINT64 *p = (volatile UINT64 *)(UINTN)0;
+        (void)*p;
+
+    } else if (kstreq(what, "write")) {
+
+        print(out, "Writing into the kernel's own CODE on purpose\n");
+        print(out, "(it is mapped read-only - the CPU must refuse)...\n");
+        kcon_flush();
+        volatile UINT8 *code = (volatile UINT8 *)(UINTN)&kernel_cmd_crash;
+        code[0] = 0x90;
+
+    } else if (kstreq(what, "stack")) {
+
+        print(out, "Infinite recursion on purpose - the stack will hit its\n");
+        print(out, "guard page, and the Double Fault handler (own IST stack)\n");
+        print(out, "must still show the panic screen...\n");
+        kcon_flush();
+        kx_recurse(0);
+
+    } else {
+
+        print(out, "Usage: crash [null|write|stack]\n");
+        print(out, "  crash        - invalid instruction (#UD)\n");
+        print(out, "  crash null   - read a NULL pointer (Page Fault)\n");
+        print(out, "  crash write  - write into kernel code (Page Fault, read-only)\n");
+        print(out, "  crash stack  - kernel stack overflow (Double Fault)\n");
+        return;
+    }
+
+    print(out, "...and nothing happened?! Protection is NOT working.\n");
 }

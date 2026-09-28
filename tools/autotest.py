@@ -4,16 +4,20 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
 и проверить, что ОС ответила как надо.
 
     make test
-    python3 tools/autotest.py --efi BOOTX64.EFI --ovmf /usr/share/edk2/x64/OVMF.4m.fd
+    python3 tools/autotest.py --efi BOOTX64.EFI --kernel kernel.elf \
+        --ovmf /usr/share/edk2/x64/OVMF.4m.fd
 
 Как это устроено:
-  * загрузочный диск (FAT16 с /EFI/BOOT/BOOTX64.EFI) собирается прямо
-    здесь, на Python - mtools/xorriso не нужны;
+  * загрузочный диск (FAT16 с /EFI/BOOT/BOOTX64.EFI - загрузчик - и
+    /EFI/BOOT/KERNEL.ELF - ядро) собирается прямо здесь, на Python -
+    mtools/xorriso не нужны;
   * QEMU запускается с -display none, управляется через QMP (JSON-
     протокол QEMU): через него "нажимаются" клавиши;
   * всё, что ОС пишет в COM1, попадает в файл serial.log - по нему
     и проверяется результат. В режиме прошивки туда же пишет сама
-    OVMF (её консоль), после `ebs` - наша ОС (lib/serial.c).
+    OVMF (её консоль), потом - ядро MyOS (lib/serial.c);
+  * в конце - отдельные короткие запуски с нарочными падениями
+    (crash write / crash stack): экран паники тоже должен работать.
 
 Выход: 0 - все проверки прошли, 1 - что-то не так (лог сохранён).
 """
@@ -22,8 +26,9 @@ import argparse, json, os, socket, struct, subprocess, sys, tempfile, time
 # ------------------------------------------------------------ FAT16 image
 
 
-def make_fat_image(efi_path, out_path, total_sectors=65536):
+def make_fat_image(efi_path, kernel_path, out_path, total_sectors=65536):
     efi = open(efi_path, 'rb').read()
+    kern = open(kernel_path, 'rb').read()
     bps, spc, reserved, nfats, root_entries, fat_secs = 512, 4, 1, 2, 512, 64
     root_secs = root_entries * 32 // bps
     data_start = reserved + nfats * fat_secs + root_secs
@@ -61,16 +66,19 @@ def make_fat_image(efi_path, out_path, total_sectors=65536):
         return e
 
     d_efi, d_boot, f_cl = alloc(csize), alloc(csize), alloc(len(efi))
+    k_cl = alloc(len(kern))
     root = (reserved + nfats * fat_secs) * bps
     img[root:root + 32] = ent(b'EFI        ', 0x10, d_efi, 0)
     o = off(d_efi)
     img[o:o + 96] = ent(b'.          ', 0x10, d_efi, 0) + ent(b'..         ', 0x10, 0, 0) + \
         ent(b'BOOT       ', 0x10, d_boot, 0)
     o = off(d_boot)
-    img[o:o + 96] = ent(b'.          ', 0x10, d_boot, 0) + ent(b'..         ', 0x10, d_efi, 0) + \
-        ent(b'BOOTX64 EFI', 0x20, f_cl, len(efi))
+    img[o:o + 128] = ent(b'.          ', 0x10, d_boot, 0) + ent(b'..         ', 0x10, d_efi, 0) + \
+        ent(b'BOOTX64 EFI', 0x20, f_cl, len(efi)) + ent(b'KERNEL  ELF', 0x20, k_cl, len(kern))
     o = off(f_cl)
     img[o:o + len(efi)] = efi
+    o = off(k_cl)
+    img[o:o + len(kern)] = kern
     fatb = struct.pack('<%dH' % len(fat), *fat)
     for i in range(nfats):
         p = (reserved + i * fat_secs) * bps
@@ -81,16 +89,17 @@ def make_fat_image(efi_path, out_path, total_sectors=65536):
 
 
 class VM:
-    def __init__(self, qemu, ovmf, disk, workdir, devices):
+    def __init__(self, qemu, ovmf, disk, workdir, devices, mem='256M', extra=()):
         self.serial = os.path.join(workdir, 'serial.log')
         self.sock = os.path.join(workdir, 'qmp.sock')
-        args = [qemu, '-bios', ovmf, '-m', '256M', '-display', 'none',
+        args = [qemu, '-bios', ovmf, '-m', mem, '-display', 'none',
                 '-drive', 'format=raw,file=%s,if=ide' % disk,
                 '-serial', 'file:' + self.serial,
                 '-qmp', 'unix:%s,server=on,wait=off' % self.sock,
                 '-no-reboot']
         for d in devices:
             args += ['-device', d]
+        args += list(extra)
         self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE)
         for _ in range(100):
@@ -154,32 +163,15 @@ class VM:
 # ------------------------------------------------------------ the test
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--efi', default='BOOTX64.EFI')
-    ap.add_argument('--ovmf', default='/usr/share/edk2/x64/OVMF.4m.fd')
-    ap.add_argument('--qemu', default='qemu-system-x86_64')
-    ap.add_argument('--keep', action='store_true', help='keep the work dir')
-    a = ap.parse_args()
+def run_steps(a, work, steps, name):
+    """Один запуск ВМ: пройти шаги, вернуть (ok, текст лога)."""
+    disk = os.path.join(work, name + '.img')
+    make_fat_image(a.efi, a.kernel, disk)
 
-    work = tempfile.mkdtemp(prefix='myos-test-')
-    disk = os.path.join(work, 'disk.img')
-    make_fat_image(a.efi, disk)
-
-    vm = VM(a.qemu, a.ovmf, disk, work,
-            ['qemu-xhci', 'usb-mouse', 'usb-kbd'])
-
-    # (что набрать, чего ждать в логе, таймаут в секундах)
-    steps = [
-        (None, "Type 'help'", 60),
-        ('ebs\n', 'Back to the shell', 90),
-        ('kinfo\n', 'LAPIC timer: running', 15),
-        ('usb\n', 'keyboard (boot protocol)', 15),
-        ('', 'mouse (boot protocol)', 5),
-        ('mem\n', 'freed: OK', 15),
-        ('int3\n', 'handler ran and returned', 15),
-        ('calc 6 * 7\n', '42', 15),
-    ]
+    vmdir = os.path.join(work, name)
+    os.makedirs(vmdir, exist_ok=True)
+    vm = VM(a.qemu, a.ovmf, disk, vmdir, ['qemu-xhci', 'usb-mouse', 'usb-kbd'],
+            mem=a.mem, extra=a.extra.split() if a.extra else ())
 
     ok = True
     for keys, expect, timeout in steps:
@@ -194,20 +186,78 @@ def main():
             ok = False
             break
 
+    log = vm.log()
     vm.quit()
+    return ok, log
 
-    log_copy = os.path.join(work, 'serial.log')
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--efi', default='BOOTX64.EFI')
+    ap.add_argument('--kernel', default='kernel.elf')
+    ap.add_argument('--ovmf', default='/usr/share/edk2/x64/OVMF.4m.fd')
+    ap.add_argument('--qemu', default='qemu-system-x86_64')
+    ap.add_argument('--keep', action='store_true', help='keep the work dir')
+    ap.add_argument('--quick', action='store_true', help='skip the crash runs')
+    ap.add_argument('--mem', default='256M', help='RAM for the VM, e.g. 8G')
+    ap.add_argument('--extra', default='', help='extra QEMU args, e.g. "-machine q35"')
+    a = ap.parse_args()
+
+    work = tempfile.mkdtemp(prefix='myos-test-')
+
+    # (что набрать, чего ждать в логе, таймаут в секундах)
+    main_steps = [
+        (None, 'entered kmain', 60),
+        ('', 'own page tables on', 10),
+        ('', "Type 'help'", 30),
+        ('kinfo\n', 'LAPIC timer: running', 15),
+        ('usb\n', 'keyboard (boot protocol)', 15),
+        ('', 'mouse (boot protocol)', 5),
+        ('mem\n', 'freed: OK', 15),
+        ('', 'verified, freed: OK', 5),
+        ('vm\n', 'inside the kernel image: OK', 15),
+        ('boot\n', 'Loader log', 15),
+        ('int3\n', 'handler ran and returned', 15),
+        ('calc 6 * 7\n', '42', 15),
+        ('time\n', ':', 15),
+    ]
+
+    runs = [('main', main_steps)]
+
+    if not a.quick:
+        runs.append(('crash-write', [
+            (None, "Type 'help'", 90),
+            ('crash write\n', 'Page Fault: WRITE', 15),
+            ('', 'READ-ONLY', 5),
+            ('', 'kernel CODE', 5),
+        ]))
+        runs.append(('crash-stack', [
+            (None, "Type 'help'", 90),
+            ('crash stack\n', 'KERNEL STACK OVERFLOW', 20),
+        ]))
+        runs.append(('crash-null', [
+            (None, "Type 'help'", 90),
+            ('crash null\n', 'NULL pointer', 15),
+        ]))
+
+    ok = True
+    last_log = ''
+    for name, steps in runs:
+        print('--- run: %s' % name)
+        r, last_log = run_steps(a, work, steps, name)
+        if not r:
+            ok = False
+            break
+
     if ok:
         print('\nALL TESTS PASSED')
         if not a.keep:
-            for f in os.listdir(work):
-                os.unlink(os.path.join(work, f))
-            os.rmdir(work)
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
     else:
-        print('\nFAILED - serial log: %s' % log_copy)
-        tail = vm.log()[-2000:]
+        print('\nFAILED - work dir: %s' % work)
         print('--- last part of the log ---')
-        print(tail)
+        print(last_log[-2500:])
     sys.exit(0 if ok else 1)
 
 

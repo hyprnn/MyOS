@@ -12,13 +12,12 @@
 #
 #   Debian/Ubuntu: sudo apt install mtools
 #
-# Запускать после ./build.sh (BOOTX64.EFI должен
-# уже существовать).
+# Запускать после make (нужны BOOTX64.EFI и kernel.elf).
 
 set -e
 
-if [ ! -f BOOTX64.EFI ]; then
-    echo "Сначала соберите проект: ./build.sh"
+if [ ! -f BOOTX64.EFI ] || [ ! -f kernel.elf ]; then
+    echo "Сначала соберите проект: make"
     exit 1
 fi
 
@@ -39,6 +38,7 @@ mformat -i "$RAW_IMG" -F ::
 mmd -i "$RAW_IMG" ::/EFI
 mmd -i "$RAW_IMG" ::/EFI/BOOT
 mcopy -i "$RAW_IMG" BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$RAW_IMG" kernel.elf ::/EFI/BOOT/KERNEL.ELF
 
 # ------------------------------------------------------------
 # 2. Конвертируем raw -> VDI, чтобы VirtualBox мог
