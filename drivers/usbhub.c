@@ -24,7 +24,7 @@
 #include "myos.h"
 
 KX_HUB g_kx_hubs[KX_MAX_HUBS];
-static volatile BOOLEAN g_kx_hub_pending = FALSE;
+volatile BOOLEAN g_kx_hub_pending = FALSE;   /* поток usb: есть работа */
 
 /* Запросы к портам хаба */
 #define HUB_PORT_RESET        4

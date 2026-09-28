@@ -509,6 +509,19 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
     BOOLEAN dirty = TRUE;
     UINTN clock_tick = 0;
+
+    /* фоновое задание терминала (SLEEP/SPIN в своём потоке):
+       какую его версию строк мы уже нарисовали, и сообщили ли в
+       лог, что мышь двигалась, пока оно работало */
+    UINT32 job_seen_version = g_term_job.version;
+    BOOLEAN job_was_running = g_term_job.running;
+    BOOLEAN job_mouse_logged = FALSE;
+
+    klog("gui: started\n");
+
+    /* этот поток (шелл) теперь рисует рабочий стол - так его и
+       назовём в ps */
+    kthread_rename(g_kcur, "gui");
     /* "ЧЧ:ММ:СС MSK" + '\0'; пояс переключается кликом по часам */
     char clock_text[13];
 
@@ -581,6 +594,12 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
                 if (changed && !in_window)
                     dirty = TRUE;
+
+                /* для автотеста: часы идут, пока в фоне работает
+                   команда терминала */
+                if (changed && g_term_job.running)
+                    klog("gui: clock %s while '%s' runs\n",
+                         clock_text, g_term_job.name);
             }
 
             /* Таймер Сапёра тикает раз в секунду тем же
@@ -597,6 +616,22 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
         if (clock_tick >= 250)
             clock_tick = 0;
+
+        /* Задание терминала дописало строку или закончилось -
+           перерисовать окно (это делает поток задания, GUI узнаёт
+           по номеру версии) */
+        if (g_term_job.version != job_seen_version ||
+            g_term_job.running != job_was_running) {
+
+            job_seen_version = g_term_job.version;
+            job_was_running = g_term_job.running;
+
+            if (!job_was_running)
+                job_mouse_logged = FALSE;
+
+            if (in_terminal)
+                dirty = TRUE;
+        }
 
         /* Опрос мыши - каждый кадр, независимо от клавиатуры.
            GetState неблокирующий: если новых данных с донгла/
@@ -644,6 +679,11 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                 mouse_rem_y = (INTN)(dy_num - (INT64)dy * res_y);
 
                 if (dx != 0 || dy != 0) {
+
+                    if (g_term_job.running && !job_mouse_logged) {
+                        klog("gui: mouse moved while '%s' runs\n", g_term_job.name);
+                        job_mouse_logged = TRUE;
+                    }
 
                     cur_x += dx;
                     cur_y += dy;
@@ -948,6 +988,24 @@ void gui_start(EFI_SYSTEM_TABLE *st)
             if (cur_y > (INTN)fb_h - GUI_CURSOR_SIZE)
                 cur_y = (INTN)fb_h - GUI_CURSOR_SIZE;
 
+            /* C на рабочем столе - открыть терминал (быстрее, чем
+               через меню Start; и автотест так попадает в него) */
+            if (!in_window && !in_minesweeper && !in_terminal &&
+                (key.UnicodeChar == L'c' || key.UnicodeChar == L'C')) {
+
+                if (!term_started) {
+                    term_started = TRUE;
+                    gui_term_push(term_lines, &term_line_count,
+                                  "MYOS TERMINAL. TYPE HELP.");
+                }
+
+                in_terminal = TRUE;
+                menu_open = FALSE;
+                dirty = TRUE;
+                klog("gui: terminal opened\n");
+                continue;
+            }
+
             /* T на рабочем столе - тоже сменить часовой пояс
                (для тех, кто без мыши) */
             if (!in_window && !in_minesweeper && !in_terminal &&
@@ -1247,6 +1305,24 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
             if (in_terminal) {
 
+                /* "RUNNING: SLEEP 10" в заголовке, пока идёт задание */
+                char status[GUI_TERM_LINE_LEN + 1];
+                UINTN sn = 0;
+
+                status[0] = '\0';
+
+                if (g_term_job.running) {
+                    const char *a = "RUNNING: ";
+                    while (*a) status[sn++] = *a++;
+                    for (UINTN k = 0; g_term_job.name[k] != '\0' && sn < 24; k++)
+                        status[sn++] = g_term_job.name[k];
+                    status[sn] = '\0';
+                }
+
+                /* строки может дописывать поток задания - рисуем
+                   под тем же мьютексом, под которым он пишет */
+                kmutex_lock(&g_term_mutex);
+
                 gui_draw_terminal(
                     draw_buf, stride, fb_w, fb_h, fmt,
                     win_x, win_y, win_w, win_h,
@@ -1254,8 +1330,12 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                     (const char (*)[GUI_TERM_LINE_LEN + 1])
                         term_lines,
                     term_line_count,
-                    term_input
+                    term_input,
+                    clock_text,
+                    status
                 );
+
+                kmutex_unlock(&g_term_mutex);
 
             } else if (in_minesweeper) {
 
@@ -1355,6 +1435,14 @@ void gui_start(EFI_SYSTEM_TABLE *st)
     }
 
 gui_exit_loop:
+
+    /* фоновое задание терминала пишет в term_lines - а они живут в
+       стеке этой функции: остановить его до выхода */
+    gui_term_job_stop();
+
+    klog("gui: left\n");
+
+    kthread_rename(g_kcur, "shell");
 
     g_gui_draw_cursor = TRUE;
 

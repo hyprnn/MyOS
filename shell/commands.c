@@ -55,6 +55,35 @@ void run_command(
 
         kernel_cmd_cpu(out);
 
+    } else if (streq(line, "ps")) {
+
+        kernel_cmd_ps(out);
+
+    } else if (streq(line, "threadtest")) {
+
+        kernel_cmd_threadtest(out);
+
+    } else if (starts_with(line, "spin ")) {
+
+        /* Занять процессор на N секунд, НЕ отдавая его: ни сна, ни
+           ожидания клавиш. Раньше это "вешало" машину целиком; с
+           вытеснением поток usb по-прежнему подключает устройства,
+           а поток idle честно получает 0%. */
+        UINTN secs = parse_uint(line + 5);
+        UINT64 end = rdtsc() + g_tsc_hz * (UINT64)secs;
+        UINT64 loops = 0;
+        UINT64 sw0 = g_sched_switches;
+
+        kprintf(out, "Spinning for %u s without giving the CPU away...\n", (UINT32)secs);
+        kcon_flush();
+
+        while (rdtsc() < end)
+            loops++;
+
+        kprintf(out, "Done: %llu million loops; meanwhile the scheduler switched "
+                     "threads %llu times.\n",
+                loops / 1000000u, g_sched_switches - sw0);
+
     } else if (streq(line, "disk") || starts_with(line, "disk ")) {
 
         char arg[32];
@@ -203,6 +232,9 @@ void run_command(
             out,
             "  acpi          - ACPI tables: CPU cores, I/O APIC, HPET, PCIe, power\n"
             "  cpu           - CPU load and interrupt counters\n"
+            "  ps            - threads: state, CPU share, stack, what they wait for\n"
+            "  threadtest    - live test: preemption, fair sharing, mutex\n"
+            "  spin <sec>    - keep the CPU 100% busy (other threads still run)\n"
             "  disk [read N] - USB flash drives: list, show a sector\n"
         );
 

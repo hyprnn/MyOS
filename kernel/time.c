@@ -278,6 +278,14 @@ void kx_sleep_us(UINT64 us)
         return;
     }
 
+    /* Потоки работают: поток засыпает, а процессор достаётся
+       другим (или idle). Точность - миллисекунда (тик таймера),
+       поэтому так - только для пауз от 1 мс. */
+    if (us >= 1000u && sched_can_block()) {
+        sched_sleep_ms((us + 999u) / 1000u);
+        return;
+    }
+
     UINT64 start = rdtsc();
     UINT64 cycles = (us * g_tsc_hz) / 1000000ull;
 

@@ -13,20 +13,30 @@
  * Отдельно: usbhid.c (клавиатуры и мыши), usbhub.c (хабы),
  * usbmsd.c (флешки).
  *
- * ДВА "ПОТОКА" И ЗАМОК.
- * Процессор один, но код драйвера выполняется в двух местах:
+ * ДВА КОНТЕКСТА, ПОТОК "usb" И ЗАМКИ.
+ * Код драйвера выполняется в двух местах:
  *   1. в обработчике прерывания (kx_usb_irq) - контроллер сообщил о
- *      событиях: пришёл отчёт мыши, изменился порт;
- *   2. в "основном" коде - шелл/GUI спрашивают ввод, и тут же
- *      (kx_service) выполняется всё, что требует ожидания: настройка
- *      нового устройства, отключение, светодиоды клавиатуры.
- * Обработчик прерывания никогда ничего не ждёт. А основной код, пока
- * трогает общие структуры (кольца, списки устройств), держит "замок"
- * kx_lock - то есть просто запрещает прерывания. Во время долгих
- * ожиданий (сброс порта, ответ устройства) замок ненадолго
- * отпускается (kx_relax), чтобы таймер и клавиатура не простаивали;
- * если событие, которого ждёт основной код, заберёт обработчик
- * прерывания - он положит его в "ящик" g_kx.wait_*.
+ *      событиях: пришёл отчёт мыши, изменился порт. Обработчик
+ *      никогда ничего не ждёт: только разбирает события и, если
+ *      нужна долгая работа (подключили устройство), будит поток usb;
+ *   2. в потоке ядра "usb" (этап 4, kernel/sched.c): kx_service -
+ *      всё, что требует ожидания: настройка нового устройства,
+ *      отключение, хабы, светодиоды клавиатуры. Пока он ждёт
+ *      устройство, процессор достаётся шеллу, GUI и остальным.
+ *      (Если потоков нет - нет таймера, - kx_service по-старому
+ *      зовётся из kernel_poll_input.)
+ * Два замка:
+ *   * g_usb_mutex (мьютекс) - "синхронными" операциями с
+ *     контроллером (команда, control-запрос, чтение флешки) в
+ *     каждый момент занимается только один поток: ответ на них
+ *     приходит в один общий "ящик" g_kx.wait_*. Команда disk в
+ *     шелле и поток usb по очереди берут этот мьютекс;
+ *   * kx_lock (запрет прерываний) - пока код трогает общие с
+ *     обработчиком структуры (кольца, списки устройств). Во время
+ *     долгих ожиданий он ненадолго отпускается (kx_relax), а
+ *     паузы в миллисекундах (kx_msleep) - это настоящий сон потока.
+ *     Если событие, которого ждёт поток, заберёт обработчик
+ *     прерывания - он положит его в "ящик" g_kx.wait_*.
  */
 #include "myos.h"
 
@@ -35,46 +45,42 @@ KX_DEV g_kx_devs[KX_MAX_DEVS];
 KX_HID g_kx_hid[KX_MAX_HID];
 
 /* ================================================================
- * Замок
+ * Замки и паузы
+ * (kx_lock/kx_unlock теперь в kernel/sched.c: счётчик вложенности у
+ * каждого потока свой)
  * ================================================================ */
 
-static UINTN   g_kx_lock_depth = 0;
-static BOOLEAN g_kx_lock_if = FALSE;    /* были ли прерывания включены
-                                           до первого захвата */
 static volatile BOOLEAN g_kx_in_irq = FALSE;
 
-void kx_lock(void)
-{
-    UINT64 fl;
+/* Мьютекс синхронных операций с контроллером (см. в начале файла) */
+KMUTEX g_usb_mutex = KMUTEX_INIT("usb controller");
 
-    __asm__ __volatile__("pushfq; popq %0; cli" : "=r"(fl) : : "memory");
+/* Поток usb и флаг "есть работа" (его ждёт поток) */
+static KTHREAD *g_usb_thread = NULL;
+static volatile BOOLEAN g_usb_work = FALSE;
+UINT64 g_usb_thread_wakeups = 0;
 
-    if (g_kx_lock_depth++ == 0)
-        g_kx_lock_if = (fl & (1u << 9)) != 0;
-}
-
-void kx_unlock(void)
-{
-    if (g_kx_lock_depth == 0)
-        return;
-
-    if (--g_kx_lock_depth == 0 && g_kx_lock_if)
-        __asm__ __volatile__("sti" ::: "memory");
-}
-
-/* Посреди долгого ожидания: на мгновение пустить прерывания */
+/* Посреди долгого ожидания: на мгновение пустить прерывания (и
+   таймер - а с ним, может быть, и другой поток) */
 static void kx_relax(void)
 {
-    if (g_kx_lock_depth > 0 && g_kx_lock_if && !g_kx_in_irq) {
+    if (kx_lock_relaxable() && !g_kx_in_irq) {
         __asm__ __volatile__("sti; nop; nop; nop; nop; cli" ::: "memory");
     } else {
         cpu_pause();
     }
 }
 
-/* Пауза в миллисекундах, во время которой прерывания работают */
+/* Пауза в миллисекундах. С потоками - настоящий сон: процессор на
+   это время достаётся другим (поток может спать даже внутри
+   kx_lock: запрет прерываний у каждого потока свой). */
 void kx_msleep(UINTN ms)
 {
+    if (!g_kx_in_irq && sched_can_block()) {
+        sched_sleep_ms(ms);
+        return;
+    }
+
     UINT64 start = rdtsc();
     UINT64 cycles = (g_tsc_hz / 1000u) * (UINT64)ms;
 
@@ -752,6 +758,14 @@ void kx_usb_irq(void)
     g_kx_in_irq = TRUE;
     kx_pump();
     g_kx_in_irq = FALSE;
+
+    /* есть долгая работа (порт изменился, хаб что-то сообщил,
+       переключили CapsLock) - разбудить поток usb */
+    if (g_usb_thread != NULL &&
+        (g_kx.any_change || g_kx_hub_pending || g_kbd_leds_dirty)) {
+        g_usb_work = TRUE;
+        sched_wake_all((const void *)&g_usb_work);
+    }
 }
 
 /* ================================================================
@@ -1379,6 +1393,7 @@ void kx_service(void)
     if (!g_kx.running)
         return;
 
+    kmutex_lock(&g_usb_mutex);
     kx_lock();
 
     kx_pump();
@@ -1430,6 +1445,50 @@ void kx_service(void)
     kx_hid_service_leds();
 
     kx_unlock();
+    kmutex_unlock(&g_usb_mutex);
+}
+
+/*
+ * Поток "usb": обслуживание в фоне. Просыпается, когда обработчик
+ * прерывания сообщил о работе, - и на всякий случай раз в 50 мс
+ * (сторож конечных точек, светодиоды PS/2-клавиатуры, режим без
+ * прерываний). В ps он почти всё время "waiting: usb events".
+ */
+static void kx_usb_thread(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+
+        kx_service();
+
+        UINT64 fl = kx_irq_save();
+
+        if (!g_usb_work)
+            sched_block((const void *)&g_usb_work, "usb events", 50);
+
+        g_usb_work = FALSE;
+        g_usb_thread_wakeups++;
+
+        kx_irq_restore(fl);
+    }
+}
+
+/* Запустить поток usb (kmain, после первого сканирования портов) */
+void kx_usb_start_thread(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    if (!g_kx.running || !g_sched_on)
+        return;
+
+    g_usb_thread = kthread_create("usb", kx_usb_thread, NULL, 32);
+
+    if (g_usb_thread != NULL)
+        print(out, "  USB hot-plug and hubs are served by the background thread 'usb'.\n");
+}
+
+BOOLEAN kx_usb_threaded(void)
+{
+    return g_usb_thread != NULL;
 }
 
 /* ================================================================
@@ -1635,7 +1694,9 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
    только то, что требует ожидания (подключения, светодиоды). */
 void kernel_poll_input(void)
 {
-    kx_service();
+    /* с потоком usb это его работа; без потоков - по-старому */
+    if (g_usb_thread == NULL)
+        kx_service();
 
     kx_lock();
     ps2_poll();

@@ -309,7 +309,7 @@ static KX_MSD *kx_msd_nth(UINTN n)
  * Прочитать count секторов, начиная с lba, в dst (обычная память
  * ядра). Для этапа 5: файловая система будет читать через это.
  */
-BOOLEAN usb_disk_read(UINTN disk, UINT64 lba, UINT32 count, VOID *dst)
+static BOOLEAN usb_disk_read_locked(UINTN disk, UINT64 lba, UINT32 count, VOID *dst)
 {
     KX_MSD *m = kx_msd_nth(disk);
 
@@ -375,7 +375,28 @@ static void disk_hexdump(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const UINT8 *p, UINT
     }
 }
 
+/* Снаружи - под мьютексом контроллера: пока читаем флешку, поток
+   usb не начнёт настраивать новое устройство (ответы контроллера
+   пришли бы в один и тот же "ящик") */
+BOOLEAN usb_disk_read(UINTN disk, UINT64 lba, UINT32 count, VOID *dst)
+{
+    kmutex_lock(&g_usb_mutex);
+    BOOLEAN ok = usb_disk_read_locked(disk, lba, count, dst);
+    kmutex_unlock(&g_usb_mutex);
+
+    return ok;
+}
+
+static void kernel_cmd_disk_locked(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
+
 void kernel_cmd_disk(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
+{
+    kmutex_lock(&g_usb_mutex);
+    kernel_cmd_disk_locked(out, arg);
+    kmutex_unlock(&g_usb_mutex);
+}
+
+static void kernel_cmd_disk_locked(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
 {
     kernel_poll_input();       /* подобрать свежие подключения */
 

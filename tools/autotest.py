@@ -210,6 +210,10 @@ def run_steps(a, work, steps, name, extra=(), devices=None):
                 name, args = keys['qmp']
                 vm.cmd(name, **args)
                 label = '[qmp %s]' % name
+            if 'key' in keys:
+                vm.cmd('human-monitor-command',
+                       **{'command-line': 'sendkey %s 40' % keys['key']})
+                label = '[key %s]' % keys['key']
             if 'mouse' in keys:
                 for _ in range(keys['mouse']):
                     vm.mouse_move(5, 3)
@@ -270,6 +274,13 @@ def main():
         ('time\n', ':', 15),
         ('cpu\n', 're:CPU load \\(last second[^)]*\\): [0-9]\\.[0-9]%', 15),
         ('', 'USB controller (xHCI)', 5),
+        # этап 4: потоки
+        ('ps\n', 're:idle +(ready|running)', 15),
+        ('', 're:usb +waiting .*usb events', 5),
+        ('threadtest\n', 'threadtest: OK', 40),
+        ('', 'the timer shared the CPU fairly', 5),
+        ('sleep 1\n', 'Woke up.', 15),
+        ('spin 1\n', 're:switched threads [1-9]', 15),
     ]
 
     runs = [('main', main_steps, ['-smp', '2'])]
@@ -305,6 +316,26 @@ def main():
             ('cpu\n', 're:PS/2 keyboard \\(IRQ 1\\) +[1-9]', 15),
             ('', 're:PS/2 mouse / touchpad \\(IRQ 12\\) +[1-9]', 5),
         ], [], ['qemu-xhci']))
+        # GUI + потоки: долгая команда терминала работает в своём
+        # потоке, а GUI живёт (часы идут, мышь двигается)
+        runs.append(('gui-threads', [
+            (None, "Type 'help'", 90),
+            ('start\n', 'Press any key', 15),
+            (' ', 'gui: started', 10),
+            ('c', 'gui: terminal opened', 10),
+            ('sleep 4\n', "gui: job 'SLEEP 4' started", 10),
+            ({'mouse': 20}, "gui: mouse moved while 'SLEEP 4' runs", 5),
+            ('ps\n', 're:gui: ps: .*TERM-JOB +SLEEPING', 10),
+            ('', "re:gui: clock [0-9:]+ [A-Z]+ while 'SLEEP 4' runs", 5),
+            ('', 'gui: term: WOKE UP - 4 S', 10),
+            ('spin 2\n', "gui: job 'SPIN 2' started", 10),
+            ({'mouse': 20}, "gui: mouse moved while 'SPIN 2' runs", 5),
+            ('', 're:gui: term: SPUN 2 S', 10),
+            ('sleep 30\n', "gui: job 'SLEEP 30' started", 10),
+            ({'key': 'esc'}, '', 0.5),
+            ({'key': 'esc'}, 'gui: left', 10),
+            ('', 'SLEEP CANCELLED', 1),
+        ]))
         # чипсет q35: PCIe через ECAM (MCFG), перезагрузка через FADT
         runs.append(('q35', [
             (None, "Type 'help'", 90),

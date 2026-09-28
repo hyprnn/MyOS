@@ -305,6 +305,9 @@ void kx_load_tick(void)
 
     g_load_last_tsc = now;
     g_load_last_idle = idle;
+
+    /* доля каждого потока - для ps */
+    sched_account_load();
 }
 
 /* ================================================================
@@ -318,6 +321,15 @@ void kernel_cmd_cpu(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
                 g_cpu_load_permille / 10u, g_cpu_load_permille % 10u);
     else
         print(out, "CPU load: not measured yet (needs the 1 kHz timer)\n");
+
+    if (g_sched_on) {
+        UINTN n = 0;
+        for (UINTN i = 0; i < KT_MAX; i++)
+            if (g_kthreads[i].state != KT_UNUSED && g_kthreads[i].state != KT_DEAD)
+                n++;
+        kprintf(out, "Threads: %u, context switches: %llu (%llu by the timer) - details: 'ps'\n",
+                (UINT32)n, g_sched_switches, g_sched_preempts);
+    }
 
     print(out, "Interrupts delivered:\n");
 

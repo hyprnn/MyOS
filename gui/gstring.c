@@ -10,12 +10,20 @@
  * уже заполнен, самая старая строка "уезжает" вверх -
  * обычное поведение прокрутки в любом терминале.
  */
+/* Строки терминала GUI пишут два потока: сам GUI (ответы команд)
+   и поток долгого задания (SLEEP/SPIN, gui/terminal.c), а читает
+   GUI, когда рисует окно. Мьютекс - чтобы рисование не застало
+   список посреди сдвига строк. */
+KMUTEX g_term_mutex = KMUTEX_INIT("gui terminal");
+
 void gui_term_push(
     char lines[][GUI_TERM_LINE_LEN + 1],
     UINTN *count,
     const char *text
 )
 {
+    kmutex_lock(&g_term_mutex);
+
     UINTN n = *count;
 
     if (n >= GUI_TERM_MAX_LINES) {
@@ -39,6 +47,16 @@ void gui_term_push(
     lines[n][i] = '\0';
 
     *count = n + 1;
+
+    kmutex_unlock(&g_term_mutex);
+}
+
+/* Очистить терминал (CLEAR) - тоже под мьютексом */
+void gui_term_clear(UINTN *count)
+{
+    kmutex_lock(&g_term_mutex);
+    *count = 0;
+    kmutex_unlock(&g_term_mutex);
 }
 
 

@@ -56,6 +56,10 @@ void kernel_cmd_kinfo(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         kprintf(out, "CPU load: %u.%u%% over the last second (see 'cpu')\n",
                 g_cpu_load_permille / 10u, g_cpu_load_permille % 10u);
 
+    kprintf(out, "Threads: %s\n",
+            g_sched_on ? "on - preemptive round-robin, 10 ms quantum (see 'ps')"
+                       : "off (no timer) - one flow of execution");
+
     kprintf(out, "Console: %llux%llu chars on %ux%u framebuffer\n",
             (UINT64)g_kcon_cols, (UINT64)g_kcon_rows, g_kfb_w, g_kfb_h);
 
@@ -448,7 +452,19 @@ static void kx_print_dev_tree(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di, UINTN
     }
 }
 
+static void kernel_cmd_usb_locked(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
+/* Под мьютексом контроллера: если поток usb прямо сейчас
+   настраивает новое устройство - дождаться, а не печатать дерево
+   на середине перестройки */
 void kernel_cmd_usb(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    kmutex_lock(&g_usb_mutex);
+    kernel_cmd_usb_locked(out);
+    kmutex_unlock(&g_usb_mutex);
+}
+
+static void kernel_cmd_usb_locked(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
     kernel_poll_input();       /* подобрать свежие подключения */
 

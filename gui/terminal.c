@@ -24,7 +24,9 @@ void gui_draw_terminal(
     UINTN btn_size,
     const char lines[][GUI_TERM_LINE_LEN + 1],
     UINTN line_count,
-    const char *input
+    const char *input,
+    const char *clock_text,
+    const char *status
 )
 {
     UINT32 col_bg      = gui_pack(fmt, 0, 128, 128);
@@ -81,6 +83,31 @@ void gui_draw_terminal(
         1, col_ttext,
         "TERMINAL"
     );
+
+    /* Что сейчас работает в фоне ("RUNNING: SLEEP 10") - жёлтым */
+    if (status != NULL && status[0] != '\0') {
+
+        gui_draw_text(
+            fb, stride, fb_w, fb_h,
+            win_x + 9 + (INTN)gui_text_width("TERMINAL  ", 1), win_y + 9,
+            1, gui_pack(fmt, 255, 220, 0),
+            status
+        );
+    }
+
+    /* Часы в заголовке: окно закрывает панель задач, а увидеть,
+       что время идёт, пока в фоне работает команда, - хочется */
+    if (clock_text != NULL && clock_text[0] != '\0') {
+
+        UINTN cw = gui_text_width(clock_text, 1);
+
+        gui_draw_text(
+            fb, stride, fb_w, fb_h,
+            btn_x - 8 - (INTN)cw, win_y + 9,
+            1, col_ttext,
+            clock_text
+        );
+    }
 
     /* Чёрный viewport вместо белой "бумаги" - без
        декоративного меню FILE/EDIT/VIEW, которое
@@ -549,6 +576,273 @@ void gui_draw_minesweeper(
 }
 
 
+/* ================================================================
+ * Фоновые задания терминала (этап 4: многозадачность)
+ *
+ * Раньше команда терминала выполнялась прямо в цикле GUI: пока
+ * она работала (например, ждала), GUI стоял - часы не шли, курсор
+ * не двигался. Теперь долгие команды (SLEEP, SPIN) получают свой
+ * поток ядра "term-job", а цикл GUI крутится дальше. Строки
+ * результата задание дописывает в тот же список строк терминала
+ * (под мьютексом g_term_mutex) и увеличивает version - GUI видит,
+ * что пора перерисовать окно.
+ *
+ * Одновременно - одно задание (второе получит ответ BUSY), но
+ * обычные команды (PS, TIME, LS...) можно набирать и пока оно
+ * идёт. Окно терминала можно закрыть - задание доработает в фоне.
+ * ================================================================ */
+
+GUI_TERM_JOB g_term_job;
+
+/* Строка от задания (если GUI ещё не забрал у нас список строк) */
+static void gui_term_job_line(GUI_TERM_JOB *j, const char *text)
+{
+    kmutex_lock(&g_term_mutex);
+
+    if (j->lines != NULL && j->count != NULL) {
+        gui_term_push(j->lines, j->count, text);
+        j->version++;
+    }
+
+    kmutex_unlock(&g_term_mutex);
+
+    klog("gui: term: %s\n", text);
+}
+
+static void gui_term_job_main(void *arg)
+{
+    GUI_TERM_JOB *j = (GUI_TERM_JOB *)arg;
+    char buf[GUI_TERM_LINE_LEN + 1];
+    UINTN n = 0;
+
+    if (j->kind == GUI_JOB_SLEEP) {
+
+        /* Спим кусочками по 50 мс - чтобы вовремя заметить
+           просьбу остановиться (выход из GUI). Каждый кусочек -
+           настоящий сон: процессор в это время у GUI или idle. */
+        UINT64 end = g_kticks + j->arg * 1000u;
+
+        while (g_kticks < end && !j->cancel)
+            sched_sleep_ms(50);
+
+        if (j->cancel) {
+            gui_term_job_line(j, "SLEEP CANCELLED");
+        } else {
+            buf[n++] = 'W'; buf[n++] = 'O'; buf[n++] = 'K'; buf[n++] = 'E';
+            buf[n++] = ' '; buf[n++] = 'U'; buf[n++] = 'P'; buf[n++] = ' ';
+            buf[n++] = '-'; buf[n++] = ' ';
+            n += gui_uint_to_str(j->arg, buf + n);
+            buf[n++] = ' '; buf[n++] = 'S'; buf[n] = '\0';
+            gui_term_job_line(j, buf);
+        }
+
+    } else if (j->kind == GUI_JOB_SPIN) {
+
+        /* Крутим процессор, НИКОГДА не отдавая его сами. Если GUI
+           при этом живой - значит, его возвращает ему таймер
+           (вытеснение). */
+        UINT64 end = rdtsc() + g_tsc_hz * j->arg;
+        UINT64 loops = 0;
+
+        while (rdtsc() < end && !j->cancel)
+            loops++;
+
+        if (j->cancel) {
+            gui_term_job_line(j, "SPIN CANCELLED");
+        } else {
+            const char *a = "SPUN ";
+            while (*a) buf[n++] = *a++;
+            n += gui_uint_to_str(j->arg, buf + n);
+            a = " S, ";
+            while (*a) buf[n++] = *a++;
+            n += gui_uint_to_str(loops / 1000000u, buf + n);
+            a = " MLN LOOPS";
+            while (*a) buf[n++] = *a++;
+            buf[n] = '\0';
+            gui_term_job_line(j, buf);
+        }
+    }
+
+    klog("gui: job '%s' finished\n", j->name);
+
+    j->running = FALSE;
+    j->version++;
+}
+
+/* Запустить задание (или объяснить, почему нельзя) */
+static void gui_term_job_start(
+    EFI_SYSTEM_TABLE *st,
+    const char *cmd,
+    GUI_JOB_KIND kind,
+    UINT64 secs,
+    char lines[][GUI_TERM_LINE_LEN + 1],
+    UINTN *count
+)
+{
+    GUI_TERM_JOB *j = &g_term_job;
+
+    if (j->running) {
+
+        char buf[GUI_TERM_LINE_LEN + 1];
+        UINTN n = 0;
+        const char *a = "BUSY: ";
+
+        while (*a) buf[n++] = *a++;
+        for (UINTN i = 0; j->name[i] != '\0' && n < GUI_TERM_LINE_LEN - 12; i++)
+            buf[n++] = j->name[i];
+        a = " IS RUNNING";
+        while (*a && n < GUI_TERM_LINE_LEN) buf[n++] = *a++;
+        buf[n] = '\0';
+
+        gui_term_push(lines, count, buf);
+        return;
+    }
+
+    UINTN i = 0;
+
+    while (cmd[i] != '\0' && i < GUI_TERM_LINE_LEN) {
+        j->name[i] = cmd[i];
+        i++;
+    }
+
+    j->name[i] = '\0';
+    j->kind = kind;
+    j->arg = secs;
+    j->cancel = FALSE;
+    j->lines = lines;
+    j->count = count;
+    j->started_ms = g_kticks;
+    j->running = TRUE;
+
+    j->thread = kthread_create("term-job", gui_term_job_main, j, 16);
+
+    if (j->thread == NULL) {
+
+        /* потоков нет (не работает таймер) - по-старому, на месте:
+           GUI на это время замрёт */
+        j->running = FALSE;
+        gui_term_push(lines, count, "NO THREADS - GUI WAITS FOR IT");
+
+        if (kind == GUI_JOB_SLEEP) {
+            for (UINT64 k = 0; k < secs * 10u; k++)
+                st->BootServices->Stall(100000);
+            gui_term_push(lines, count, "WOKE UP");
+        } else {
+            UINT64 end = rdtsc() + g_tsc_hz * secs;
+            while (rdtsc() < end) { }
+            gui_term_push(lines, count, "DONE");
+        }
+
+        return;
+    }
+
+    j->tid = j->thread->tid;
+
+    char buf[GUI_TERM_LINE_LEN + 1];
+    UINTN n = 0;
+    const char *a = "STARTED IN THREAD TERM-JOB, TID ";
+
+    while (*a) buf[n++] = *a++;
+    n += gui_uint_to_str(j->tid, buf + n);
+    buf[n] = '\0';
+
+    gui_term_push(lines, count, buf);
+
+    klog("gui: job '%s' started in thread %u\n", j->name, j->tid);
+}
+
+/*
+ * Выход из GUI: список строк терминала живёт в стеке gui_start и
+ * сейчас исчезнет. Попросить задание остановиться и дождаться (оно
+ * проверяет cancel каждые 50 мс); на крайний случай - отобрать у
+ * него список строк.
+ */
+void gui_term_job_stop(void)
+{
+    GUI_TERM_JOB *j = &g_term_job;
+
+    if (!j->running)
+        return;
+
+    j->cancel = TRUE;
+
+    for (UINTN k = 0; k < 300 && j->running; k++) {
+        if (sched_can_block())
+            sched_sleep_ms(10);
+        else
+            kx_sleep_us(10000);
+    }
+
+    kmutex_lock(&g_term_mutex);
+    j->lines = NULL;
+    j->count = NULL;
+    kmutex_unlock(&g_term_mutex);
+}
+
+/* PS в терминале GUI: шрифт без строчных букв и без знака
+   процента, строка до 46 символов */
+static void gui_term_ps(char lines[][GUI_TERM_LINE_LEN + 1], UINTN *count)
+{
+    if (!g_sched_on) {
+        gui_term_push(lines, count, "NO THREADS (TIMER IS NOT RUNNING)");
+        return;
+    }
+
+    KT_INFO info[KT_MAX];
+    UINTN n = sched_snapshot(info, KT_MAX);
+
+    gui_term_push(lines, count, "TID NAME        STATE     CPU(PCT)");
+
+    for (UINTN i = 0; i < n; i++) {
+
+        char row[GUI_TERM_LINE_LEN + 1];
+        UINTN k = 0;
+
+        /* TID - в 3 знака */
+        char num[24];
+        UINTN nl = gui_uint_to_str(info[i].tid, num);
+
+        for (UINTN p = nl; p < 3; p++)
+            row[k++] = ' ';
+        for (UINTN p = 0; p < nl; p++)
+            row[k++] = num[p];
+        row[k++] = ' ';
+
+        /* имя - 11 знаков, заглавными */
+        UINTN p = 0;
+        for (; info[i].name[p] != '\0' && p < 11; p++) {
+            char c = info[i].name[p];
+            if (c >= 'a' && c <= 'z')
+                c = (char)(c - 'a' + 'A');
+            row[k++] = c;
+        }
+        for (; p < 12; p++)
+            row[k++] = ' ';
+
+        /* состояние - 9 знаков */
+        const char *st = kthread_state_name(info[i].state);
+        p = 0;
+        for (; st[p] != '\0' && p < 9; p++) {
+            char c = st[p];
+            if (c >= 'a' && c <= 'z')
+                c = (char)(c - 'a' + 'A');
+            row[k++] = c;
+        }
+        for (; p < 10; p++)
+            row[k++] = ' ';
+
+        /* доля процессора: 12.3 */
+        k += gui_uint_to_str(info[i].load_permille / 10u, row + k);
+        row[k++] = '.';
+        k += gui_uint_to_str(info[i].load_permille % 10u, row + k);
+        row[k] = '\0';
+
+        gui_term_push(lines, count, row);
+        klog("gui: ps: %s\n", row);
+    }
+}
+
+
 /*
  * Небольшой набор встроенных команд для терминала
  * внутри GUI. Это отдельная, упрощённая реализация:
@@ -599,6 +893,7 @@ BOOLEAN gui_term_exec(
     } else if (gui_streq(cmd, "HELP")) {
 
         gui_term_push(lines, count, "HELP ABOUT VER TIME DATE UPTIME");
+        gui_term_push(lines, count, "PS  SLEEP N  SPIN N (IN A THREAD)");
         gui_term_push(lines, count, "WHOAMI CLEAR ECHO TEXT");
         gui_term_push(lines, count, "CALC A OP B");
         gui_term_push(lines, count, "LS TOUCH N CAT N SIZE N RM N");
@@ -628,7 +923,39 @@ BOOLEAN gui_term_exec(
         gui_streq(cmd, "CLS")
     ) {
 
-        *count = 0;
+        gui_term_clear(count);
+
+    } else if (gui_streq(cmd, "PS")) {
+
+        gui_term_ps(lines, count);
+
+    } else if (
+        gui_starts_with(cmd, "SLEEP ") ||
+        gui_starts_with(cmd, "SPIN ")
+    ) {
+
+        BOOLEAN spin = gui_starts_with(cmd, "SPIN ");
+        const char *p = cmd + (spin ? 5 : 6);
+        UINT64 secs = 0;
+
+        while (*p == ' ')
+            p++;
+
+        while (*p >= '0' && *p <= '9') {
+            secs = secs * 10u + (UINT64)(*p - '0');
+            p++;
+        }
+
+        if (secs == 0 || secs > 3600) {
+
+            gui_term_push(lines, count,
+                          spin ? "USAGE: SPIN SECONDS" : "USAGE: SLEEP SECONDS");
+
+        } else {
+
+            gui_term_job_start(st, cmd, spin ? GUI_JOB_SPIN : GUI_JOB_SLEEP,
+                               secs, lines, count);
+        }
 
     } else if (gui_streq(cmd, "TIME")) {
 

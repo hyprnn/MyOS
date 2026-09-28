@@ -236,12 +236,13 @@ void klog(const char *fmt, ...)
     va_list ap;
     UINT64 us = kx_uptime_us();
 
-    ksnprintf(buf, sizeof(buf), "[%5llu.%03llu] ",
-              us / 1000000u, (us / 1000u) % 1000u);
-    serial_puts(buf);
+    /* метка времени и текст - одной строкой, одним serial_puts:
+       так строки разных потоков не перемешиваются */
+    UINTN n = ksnprintf(buf, sizeof(buf), "[%5llu.%03llu] ",
+                        us / 1000000u, (us / 1000u) % 1000u);
 
     va_start(ap, fmt);
-    kvsnprintf(buf, sizeof(buf), fmt, ap);
+    kvsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
     va_end(ap);
 
     serial_puts(buf);

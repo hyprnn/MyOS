@@ -399,6 +399,14 @@ void kmain_stage2(void)
             print(out, "  CMOS clock: not responding\n");
     }
 
+    /* --- потоки (этап 4) --- */
+    kmain_section(out, "[threads]");
+
+    /* С этого момента kmain - уже поток "shell", а паузы (Stall,
+       sleep) - настоящий сон: процессор отдаётся другим потокам
+       или idle. */
+    sched_start(out);
+
     /* --- ввод --- */
     kmain_section(out, "[input]");
 
@@ -441,6 +449,9 @@ void kmain_stage2(void)
     kcon_flush();
     kx_usb_start(out);
 
+    /* дальше горячее подключение и хабы обслуживает поток usb */
+    kx_usb_start_thread(out);
+
     /* --- таблица функций ядра для шелла и GUI --- */
     kx_install_shims();
 
@@ -457,7 +468,7 @@ void kmain_stage2(void)
     print(out, "\nMyOS is running on its own kernel - no firmware underneath.\n");
     set_color(out, 0x07);
     print(out, "Type 'help' for the list of commands, or 'fetch' for a system summary.\n");
-    print(out, "New: acpi (what the ACPI tables say), boot, vm, crash null|write|stack.\n\n");
+    print(out, "New: ps (threads and who uses the CPU), threadtest; cpu, usb, disk.\n\n");
 
     CHAR16 line[LINE_MAX];
 

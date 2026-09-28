@@ -342,7 +342,7 @@ typedef EFI_STATUS (EFIAPI *XHCI_FREE_POOL)(VOID *Buffer);
    и живым вводом, а не выход из GUI в текстовый режим -
    как отдельное приложение (наподобие kitty), а не
    отдельный режим ОС. */
-#define GUI_TERM_MAX_LINES   11
+#define GUI_TERM_MAX_LINES   40
 #define GUI_TERM_LINE_LEN    46
 
 /*
@@ -786,8 +786,10 @@ typedef struct {
 #define VMM_UC  0x4u    /* некэшируемая (регистры устройств) */
 #define VMM_WC  0x8u    /* write-combining (видеопамять) */
 
-/* Стек ядра: [bottom, top), под ним - защитная страница guard */
-#define KSTACK_MAX 16
+/* Стек ядра: [bottom, top), под ним - защитная страница guard.
+   Каждому потоку (kernel/sched.c) - свой стек, поэтому запас с
+   избытком; стеки завершившихся потоков используются повторно. */
+#define KSTACK_MAX 64
 
 typedef struct {
     UINT64 guard;
@@ -795,6 +797,112 @@ typedef struct {
     UINT64 top;
     const char *name;
 } KSTACK_INFO;
+
+
+/* ================================================================
+ * Потоки и планировщик (kernel/sched.c)
+ * ================================================================ */
+
+/* Сколько потоков может существовать одновременно. Таблица
+   маленькая и обходится целиком - так проще и нагляднее списков. */
+#define KT_MAX          32
+#define KT_NAME_LEN     16
+/* Квант времени: столько миллисекунд (тиков таймера) поток
+   работает подряд, если другие тоже хотят процессор */
+#define KT_QUANTUM_MS   10
+
+typedef enum {
+    KT_UNUSED = 0,   /* слот свободен */
+    KT_READY,        /* готов работать, ждёт своей очереди */
+    KT_RUNNING,      /* работает прямо сейчас */
+    KT_SLEEPING,     /* спит до момента wake_tick */
+    KT_BLOCKED,      /* ждёт события (wait_on), возможно с таймаутом */
+    KT_DEAD          /* завершился; слот и стек можно отдать новому */
+} KT_STATE;
+
+typedef struct KTHREAD {
+    /* ВАЖНО: rsp - первое поле, его адрес передаётся в kx_switch */
+    UINT64      rsp;             /* сохранённый указатель стека, пока
+                                    поток не работает */
+    UINT32      tid;             /* номер потока (растёт, не повторяется) */
+    UINT32      slot;            /* индекс в таблице g_kthreads */
+    KT_STATE    state;
+    char        name[KT_NAME_LEN];
+
+    UINT64      stack_bottom;    /* [bottom, top) - стек потока */
+    UINT64      stack_top;
+    UINTN       stack_pages;
+
+    void      (*entry)(void *);  /* что запустить в новом потоке */
+    void       *arg;
+
+    UINT64      wake_tick;       /* SLEEPING: когда разбудить;
+                                    BLOCKED: таймаут (0 - без таймаута) */
+    const void *wait_on;         /* BLOCKED: чего ждём (адрес объекта) */
+    const char *wait_what;       /* ...и как это назвать в ps */
+    BOOLEAN     timed_out;       /* ожидание закончилось таймаутом */
+
+    /* место в очереди готовых: меньше - раньше встал в очередь */
+    UINT64      ready_seq;
+    /* только что проснулся (дождался сна/события) - пропустить
+       вперёд тех, кто просто крутит процессор: так шелл и GUI
+       отзываются сразу, даже если рядом кто-то считает без
+       остановки */
+    BOOLEAN     boost;
+    /* сколько миллисекунд кванта осталось (если его вытеснили
+       раньше срока - доработает остаток, а не начнёт заново) */
+    UINT32      quantum_left;
+
+    /* kx_lock (запрет прерываний) у каждого потока свой: поток,
+       уснувший внутри kx_lock, не должен "передать" запрет
+       следующему */
+    UINTN       lock_depth;
+    BOOLEAN     lock_if;
+
+    /* учёт процессорного времени */
+    UINT64      cpu_tsc;         /* всего тактов на процессоре */
+    UINT64      cpu_tsc_prev;    /* ...на момент прошлого пересчёта */
+    UINT32      load_permille;   /* доля процессора за последнюю
+                                    секунду, 0..1000 */
+    UINT64      switches;        /* сколько раз получал процессор */
+    UINT64      started_ms;      /* когда создан (мс от старта таймера) */
+} KTHREAD;
+
+/* Замок-"мьютекс": пока его держит один поток, другой, пришедший
+   за ним, СПИТ (не крутится). Рекурсивный: владелец может взять
+   его ещё раз (например, disk -> usb_disk_read). */
+typedef struct {
+    KTHREAD    *owner;
+    UINTN       count;
+    const char *name;
+    UINT64      waits;           /* сколько раз кому-то пришлось ждать */
+} KMUTEX;
+
+/* Спин-замок: для очень коротких участков, в том числе в
+   обработчиках прерываний. Запрещает прерывания на этом ядре и
+   (когда появятся другие ядра, SMP) крутится, пока замок занят. */
+typedef struct {
+    volatile UINT32 locked;
+} KSPINLOCK;
+
+/* Снимок одного потока для ps (sched_snapshot) */
+typedef struct {
+    UINT32      tid;
+    char        name[KT_NAME_LEN];
+    KT_STATE    state;
+    BOOLEAN     current;
+    UINT32      load_permille;
+    UINT64      cpu_ms;
+    UINT64      switches;
+    UINT32      stack_kib;
+    UINT32      stack_used_kib;
+    const char *wait_what;
+    UINT64      wake_in_ms;
+    void       *stack_ptr;       /* служебное: сам KTHREAD */
+} KT_INFO;
+
+#define KMUTEX_INIT(n)   { NULL, 0, (n), 0 }
+#define KSPINLOCK_INIT   { 0 }
 
 /* TSS (64-битный), см. kernel/cpu.c */
 typedef struct __attribute__((packed)) {
@@ -1759,6 +1867,35 @@ void gui_str_copy8(
 );
 
 /* --- gui/terminal.c --- */
+/* Долгая команда терминала GUI (SLEEP, SPIN) выполняется в своём
+   потоке, а GUI тем временем живёт: часы идут, мышь двигается
+   (этап 4, gui/terminal.c) */
+typedef enum {
+    GUI_JOB_NONE = 0,
+    GUI_JOB_SLEEP,
+    GUI_JOB_SPIN
+} GUI_JOB_KIND;
+
+typedef struct {
+    volatile BOOLEAN running;    /* поток задания ещё работает */
+    volatile BOOLEAN cancel;     /* попросили остановиться (выход из GUI) */
+    volatile UINT32  version;    /* +1 на каждую новую строку от задания:
+                                    GUI знает, что пора перерисовать */
+    GUI_JOB_KIND     kind;
+    UINT64           arg;        /* секунды */
+    char             name[GUI_TERM_LINE_LEN + 1];   /* "SLEEP 10" */
+    char           (*lines)[GUI_TERM_LINE_LEN + 1]; /* куда писать */
+    UINTN           *count;
+    UINT64           started_ms;
+    KTHREAD         *thread;
+    UINT32           tid;
+} GUI_TERM_JOB;
+
+extern GUI_TERM_JOB g_term_job;
+extern KMUTEX g_term_mutex;
+void gui_term_job_stop(void);
+void gui_term_clear(UINTN *count);
+
 BOOLEAN gui_term_exec(
     EFI_SYSTEM_TABLE *st,
     const char *cmd,
@@ -1777,7 +1914,9 @@ void gui_draw_terminal(
     UINTN btn_size,
     const char lines[][GUI_TERM_LINE_LEN + 1],
     UINTN line_count,
-    const char *input
+    const char *input,
+    const char *clock_text,
+    const char *status
 );
 void gui_draw_minesweeper(
     volatile UINT32 *fb,
@@ -1957,6 +2096,45 @@ void kx_idle_hlt(void);
 void kx_load_tick(void);
 void kernel_cmd_cpu(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 
+/* --- kernel/sched.c --- */
+extern KTHREAD g_kthreads[KT_MAX];
+extern KTHREAD *g_kcur;
+extern KTHREAD *g_kidle;
+extern volatile BOOLEAN g_sched_on;
+extern volatile BOOLEAN g_need_resched;
+extern volatile UINT32 g_kx_isr_depth;
+extern UINT64 g_sched_switches;
+extern UINT64 g_sched_preempts;
+void kx_lock(void);
+void kx_unlock(void);
+BOOLEAN kx_lock_relaxable(void);
+UINT64 kx_irq_save(void);
+void kx_irq_restore(UINT64 fl);
+void sched_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+KTHREAD *kthread_create(const char *name, void (*fn)(void *), void *arg, UINTN stack_pages);
+void kthread_exit(void) __attribute__((noreturn));
+void kthread_rename(KTHREAD *t, const char *name);
+BOOLEAN kthread_alive(KTHREAD *t, UINT32 tid);
+void sched_yield(void);
+void schedule(void);
+void sched_tick(void);
+void sched_isr_exit(void);
+BOOLEAN sched_can_block(void);
+void sched_sleep_ms(UINT64 ms);
+BOOLEAN sched_block(const void *obj, const char *what, UINT64 timeout_ms);
+UINTN sched_wake_all(const void *obj);
+BOOLEAN sched_wake_one(const void *obj);
+void sched_account_load(void);
+void kmutex_lock(KMUTEX *m);
+void kmutex_unlock(KMUTEX *m);
+UINT64 kspin_lock(KSPINLOCK *l);
+void kspin_unlock(KSPINLOCK *l, UINT64 fl);
+const char *kthread_state_name(KT_STATE s);
+UINTN kthread_stack_used(KTHREAD *t);
+UINTN sched_snapshot(KT_INFO *out, UINTN cap);
+void kernel_cmd_ps(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kernel_cmd_threadtest(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
 /* --- kernel/kmain.c --- */
 void kmain(MYOS_BOOT_INFO *bi) __attribute__((noreturn));
 
@@ -2016,9 +2194,12 @@ extern UINT64  g_ps2_aux_packets;
 /* --- drivers/usb.c --- */
 #define KX_LOG_LINES 12
 #define KX_LOG_LEN   96
-void kx_lock(void);
-void kx_unlock(void);
 void kx_msleep(UINTN ms);
+extern KMUTEX g_usb_mutex;
+extern volatile BOOLEAN g_kx_hub_pending;
+extern UINT64 g_usb_thread_wakeups;
+void kx_usb_start_thread(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+BOOLEAN kx_usb_threaded(void);
 void kx_out(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void kx_event_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

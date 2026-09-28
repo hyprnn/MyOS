@@ -64,21 +64,34 @@ void serial_putc(char c)
     io_out8(COM1, (UINT8)c);
 }
 
+/* Строка выводится целиком под спин-замком: иначе строки разных
+   потоков (шелл, usb) перемешивались бы по буквам */
+static KSPINLOCK g_serial_lock = KSPINLOCK_INIT;
+
 void serial_puts(const char *s)
 {
+    if (!g_serial_ok)
+        return;
+
+    UINT64 fl = kspin_lock(&g_serial_lock);
+
     while (*s) {
         if (*s == '\n')
             serial_putc('\r');
         serial_putc(*s);
         s++;
     }
+
+    kspin_unlock(&g_serial_lock, fl);
 }
 
 /* CHAR16-строка: всё, что вне ASCII, - как '?' */
 void serial_puts16(const CHAR16 *s)
 {
-    if (s == NULL)
+    if (s == NULL || !g_serial_ok)
         return;
+
+    UINT64 fl = kspin_lock(&g_serial_lock);
 
     while (*s) {
         CHAR16 c = *s;
@@ -89,4 +102,6 @@ void serial_puts16(const CHAR16 *s)
         serial_putc((c < 128) ? (char)c : '?');
         s++;
     }
+
+    kspin_unlock(&g_serial_lock, fl);
 }
