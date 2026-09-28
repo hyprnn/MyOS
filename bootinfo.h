@@ -22,7 +22,8 @@
 /* "MYOSBOOT" в ASCII - ядро проверяет, что ему дали именно
    паспорт, а не мусор */
 #define MYOS_BOOT_MAGIC    0x544F4F42534F594Dull
-#define MYOS_BOOT_VERSION  2   /* 2: EFI_TIME по спецификации (16 байт) */
+#define MYOS_BOOT_VERSION  3   /* 2: EFI_TIME по спецификации (16 байт);
+                                  3: явный список занятой памяти */
 
 /*
  * Раскладка виртуальной памяти (одинаковая для загрузчика и ядра).
@@ -43,18 +44,32 @@
 #define MYOS_KERNEL_VIRT     0xFFFFFFFF80000000ull
 
 /*
- * Свои типы памяти в карте UEFI. Спецификация отдаёт диапазон
- * 0x80000000..0xFFFFFFFF загрузчикам ОС - прошивка просто хранит
- * наш номер. По нему ядро понимает, что за участок:
- *   KERNEL - образ ядра, паспорт, копия карты памяти, стартовый
- *            стек: не отдавать никогда;
- *   LOADER_TEMP - временные таблицы страниц загрузчика: ядро
- *            забирает их себе, как только включит свои.
+ * Какую память загрузчик выделил для ядра. Раньше для этого были
+ * свои типы памяти UEFI (0x80000001...): спецификация их разрешает,
+ * но не каждая прошивка честно хранит чужой номер типа. Теперь
+ * всё выделяется как обычная EfiLoaderData, а список "это не
+ * трогать" загрузчик передаёт здесь явно:
+ *   KEEP - образ ядра, паспорт, копия карты памяти, стартовый стек;
+ *   TEMP - временные таблицы страниц загрузчика: ядро забирает их
+ *          себе, как только включит свои.
+ * Остальную EfiLoaderData ядро считает свободной.
  */
-#define MYOS_MEM_KERNEL       0x80000001u
-#define MYOS_MEM_LOADER_TEMP  0x80000002u
+#define MYOS_RES_KEEP        1u
+#define MYOS_RES_TEMP        2u
+#define MYOS_MAX_RESERVED    8
 
 typedef struct {
+    UINT64 phys;
+    UINT64 pages;
+    UINT32 kind;                 /* MYOS_RES_KEEP / MYOS_RES_TEMP */
+    UINT32 _pad;
+} MYOS_RESERVED;
+
+typedef struct {
+    /* ВНИМАНИЕ: magic, version и поля экрана ниже - первыми и
+       НИКОГДА не переставляются. Если загрузчик и ядро оказались из
+       разных сборок, ядро по ним всё равно найдёт экран и честно
+       скажет об этом, а не зависнет молча. */
     UINT64 magic;                /* MYOS_BOOT_MAGIC */
     UINT64 version;              /* MYOS_BOOT_VERSION */
 
@@ -67,7 +82,7 @@ typedef struct {
     UINT32 fb_format;            /* EFI_GRAPHICS_PIXEL_FORMAT */
 
     /* --- карта памяти (итоговая, после ExitBootServices она уже
-       не меняется). Лежит в памяти типа MYOS_MEM_KERNEL. --- */
+       не меняется). Её страницы - в списке reserved (KEEP). --- */
     UINT64 mmap_phys;
     UINT64 mmap_size;            /* байт */
     UINT64 mmap_desc_size;       /* размер одной записи */
@@ -113,6 +128,11 @@ typedef struct {
     /* --- откуда взяли ядро --- */
     CHAR16 kernel_path[64];
     UINT64 kernel_file_size;
+
+    /* --- память, которую ядру нельзя считать свободной --- */
+    MYOS_RESERVED reserved[MYOS_MAX_RESERVED];
+    UINT32 nreserved;
+    UINT32 _pad5;
 
     /* --- короткий журнал загрузчика (ASCII, для команды boot) --- */
     char   log[2048];

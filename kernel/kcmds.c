@@ -458,10 +458,9 @@ void kernel_cmd_mem(EFI_SYSTEM_TABLE *st, SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
     (void)st;
 
-    /* типы 0..15 из UEFI + два наших (MYOS_MEM_*) */
-    UINT64 by_type[18];
+    UINT64 by_type[16];
 
-    for (UINTN i = 0; i < 18; i++)
+    for (UINTN i = 0; i < 16; i++)
         by_type[i] = 0;
 
     for (UINTN i = 0; i < g_kmm_map_count; i++) {
@@ -470,27 +469,34 @@ void kernel_cmd_mem(EFI_SYSTEM_TABLE *st, SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
         if (t < 16)
             by_type[t] += g_kmm_map[i].pages;
-        else if (t == MYOS_MEM_KERNEL)
-            by_type[16] += g_kmm_map[i].pages;
-        else if (t == MYOS_MEM_LOADER_TEMP)
-            by_type[17] += g_kmm_map[i].pages;
     }
 
     print(out, "Memory map from the loader (what the firmware left us):\n");
 
-    for (UINT32 t = 0; t < 18; t++) {
+    for (UINT32 t = 0; t < 16; t++) {
 
         if (by_type[t] == 0)
             continue;
 
-        UINT32 real = (t == 16) ? MYOS_MEM_KERNEL :
-                      (t == 17) ? MYOS_MEM_LOADER_TEMP : t;
-
-        kprintf(out, "  %-24s ", kmm_type_name(real));
+        kprintf(out, "  %-24s ", kmm_type_name(t));
         kx_print_size(out, by_type[t]);
-        print(out, (real == MYOS_MEM_LOADER_TEMP) ? "  -> free now\n" :
-                   pmm_free_type(real) ? "  -> free RAM for MyOS\n" : "\n");
+        print(out, pmm_free_type(t) ? "  -> free RAM for MyOS\n" : "\n");
     }
+
+    UINT64 keep = 0, temp = 0;
+
+    for (UINT32 r = 0; r < g_boot.nreserved && r < MYOS_MAX_RESERVED; r++) {
+        if (g_boot.reserved[r].kind == MYOS_RES_KEEP)
+            keep += g_boot.reserved[r].pages;
+        else
+            temp += g_boot.reserved[r].pages;
+    }
+
+    print(out, "  of LoaderData: kernel image + boot info + stack ");
+    kx_print_size(out, keep);
+    print(out, " kept, loader page tables ");
+    kx_print_size(out, temp);
+    print(out, " freed\n");
 
     kprintf(out, "  (%llu regions)\n", (UINT64)g_kmm_map_count);
 

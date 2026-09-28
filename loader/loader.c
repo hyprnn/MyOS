@@ -264,16 +264,26 @@ static BOOLEAN l_guid_eq(const EFI_GUID *a, const EFI_GUID *b)
     return TRUE;
 }
 
-/* Выделить страницы нужного типа и обнулить их. 0 - не вышло. */
-static UINT64 l_pages(UINTN count, UINT32 type)
+/* Выделить страницы (EfiLoaderData), обнулить и записать в список
+   занятой памяти паспорта с пометкой kind (KEEP/TEMP). 0 - не вышло. */
+static UINT64 l_pages(UINTN count, UINT32 kind)
 {
     UINT64 addr = 0;
 
-    if (l_alloc_pages(0 /* AllocateAnyPages */, type, count, &addr)
-            != EFI_SUCCESS)
+    if (l_alloc_pages(0 /* AllocateAnyPages */, 2 /* EfiLoaderData */,
+                      count, &addr) != EFI_SUCCESS)
         return 0;
 
     l_zero((VOID *)(UINTN)addr, count * 4096u);
+
+    /* сам паспорт выделяется первым, когда lbi ещё нет - его
+       запишем в список сразу после */
+    if (lbi != NULL && lbi->nreserved < MYOS_MAX_RESERVED) {
+        lbi->reserved[lbi->nreserved].phys = addr;
+        lbi->reserved[lbi->nreserved].pages = count;
+        lbi->reserved[lbi->nreserved].kind = kind;
+        lbi->nreserved++;
+    }
 
     return addr;
 }
@@ -448,7 +458,7 @@ static BOOLEAN l_load_elf(UINT8 *file, UINT64 size)
     }
 
     UINT64 span = (hi - lo + 4095u) & ~4095ull;
-    UINT64 phys = l_pages((UINTN)(span / 4096u), MYOS_MEM_KERNEL);
+    UINT64 phys = l_pages((UINTN)(span / 4096u), MYOS_RES_KEEP);
 
     if (phys == 0) {
         print(lout, "  no memory for the kernel image\n");
@@ -513,7 +523,7 @@ static BOOLEAN l_build_page_tables(UINT64 top)
 
     /* PML4 + PDPT(низ) + gib*PD + PDPT(ядро) + PD(ядро) + kpts*PT */
     UINTN total = (UINTN)(1u + 1u + gib + 1u + 1u + kpts);
-    UINT64 base = l_pages(total, MYOS_MEM_LOADER_TEMP);
+    UINT64 base = l_pages(total, MYOS_RES_TEMP);
 
     if (base == 0)
         return FALSE;
@@ -654,8 +664,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
     }
 
     /* --- паспорт: 2 страницы памяти ядра --- */
-    UINT64 bi_phys = l_pages((sizeof(MYOS_BOOT_INFO) + 4095u) / 4096u,
-                             MYOS_MEM_KERNEL);
+    UINTN bi_pages = (sizeof(MYOS_BOOT_INFO) + 4095u) / 4096u;
+    UINT64 bi_phys = l_pages(bi_pages, MYOS_RES_KEEP);
 
     if (bi_phys == 0)
         return l_fail("out of memory (boot info)");
@@ -663,6 +673,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
     lbi = (MYOS_BOOT_INFO *)(UINTN)bi_phys;
     lbi->magic = MYOS_BOOT_MAGIC;
     lbi->version = MYOS_BOOT_VERSION;
+
+    /* паспорт - первая запись списка занятой памяти */
+    lbi->reserved[0].phys = bi_phys;
+    lbi->reserved[0].pages = bi_pages;
+    lbi->reserved[0].kind = MYOS_RES_KEEP;
+    lbi->nreserved = 1;
 
     /* то, что успели напечатать до паспорта */
     for (UINTN i = 0; i < l_early_len; i++)
@@ -803,7 +819,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
 
     /* --- 7. стартовый стек ядра: 64 КиБ --- */
     lbi->stack_size = 64u * 1024u;
-    lbi->stack_phys = l_pages((UINTN)(lbi->stack_size / 4096u), MYOS_MEM_KERNEL);
+    lbi->stack_phys = l_pages((UINTN)(lbi->stack_size / 4096u), MYOS_RES_KEEP);
 
     if (lbi->stack_phys == 0)
         return l_fail("out of memory (kernel stack)");
@@ -827,7 +843,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
     l_get_map(&map_size, NULL, &map_key, &desc_size, &desc_ver);
 
     UINTN map_cap = map_size + 64u * desc_size;
-    UINT64 map_phys = l_pages((map_cap + 4095u) / 4096u, MYOS_MEM_KERNEL);
+    UINT64 map_phys = l_pages((map_cap + 4095u) / 4096u, MYOS_RES_KEEP);
 
     if (map_phys == 0)
         return l_fail("out of memory (memory map)");
@@ -862,6 +878,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
         return l_fail("ExitBootServices failed");
 
     /* ======== прошивки больше нет ======== */
+
+    /* Знак "загрузчик вышел из прошивки": серая полоса 6 пикселей
+       по верху экрана (серый одинаков в RGB и BGR). Печатать уже
+       нечем, а по фото так видно, дошли ли мы досюда. Дальше ядро
+       нарисует внизу строку "MyOS kernel: step N/7". */
+    {
+        volatile UINT32 *fb = (volatile UINT32 *)(UINTN)lbi->fb_phys;
+        UINT32 w = lbi->fb_width / 2u;
+
+        for (UINT32 y = 0; y < 6u && y < lbi->fb_height; y++)
+            for (UINT32 x = 0; x < w; x++)
+                fb[(UINTN)y * lbi->fb_stride + x] = 0x00909090u;
+    }
 
     lbi->mmap_phys = map_phys;
     lbi->mmap_size = map_size;

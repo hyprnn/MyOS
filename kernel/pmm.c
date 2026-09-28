@@ -15,10 +15,13 @@
  *     трогать было нельзя: там жили наш стек и таблицы страниц
  *     прошивки - теперь у ядра всё своё);
  *   * LoaderCode/Data - загрузчик своё дело сделал;
- *   * MYOS_MEM_LOADER_TEMP - временные таблицы страниц загрузчика,
- *     отдаются отдельно (pmm_reclaim_type), когда ядро включит свои.
- * Не трогаем: образ ядра и паспорт (MYOS_MEM_KERNEL), Runtime-
- * память прошивки, таблицы ACPI (понадобятся на этапе 2), MMIO.
+ * НО: внутри LoaderData лежит то, что загрузчик выделил для ядра, -
+ * образ ядра, паспорт, карта памяти, стартовый стек, временные
+ * таблицы страниц. Их список загрузчик передаёт явно
+ * (g_boot.reserved): KEEP не отдаём никогда, TEMP (таблицы
+ * загрузчика) - отдаём, когда ядро включит свои
+ * (pmm_release_loader_temp).
+ * Не трогаем: Runtime-память прошивки, таблицы ACPI, MMIO.
  */
 #include "myos.h"
 
@@ -90,8 +93,7 @@ BOOLEAN pmm_init(void)
 
     for (UINTN i = 0; i < g_kmm_map_count; i++) {
 
-        if (!pmm_free_type(g_kmm_map[i].type) &&
-            g_kmm_map[i].type != MYOS_MEM_LOADER_TEMP)
+        if (!pmm_free_type(g_kmm_map[i].type))
             continue;
 
         UINT64 end =
@@ -127,6 +129,21 @@ BOOLEAN pmm_init(void)
             start = 0x100000ull;
 
         if (start >= end)
+            continue;
+
+        /* не поверх того, что загрузчик выделил ядру (обычно это
+           другой тип памяти, но проверим - дёшево) */
+        BOOLEAN clash = FALSE;
+        UINT64 bm_end = start + g_kmm_bitmap_pages * KMM_PAGE;
+
+        for (UINT32 r = 0; r < g_boot.nreserved && r < MYOS_MAX_RESERVED; r++) {
+            UINT64 rs = g_boot.reserved[r].phys;
+            UINT64 re = rs + g_boot.reserved[r].pages * KMM_PAGE;
+            if (rs < bm_end && re > start)
+                clash = TRUE;
+        }
+
+        if (clash)
             continue;
 
         if ((end - start) / KMM_PAGE >= g_kmm_bitmap_pages) {
@@ -173,13 +190,34 @@ BOOLEAN pmm_init(void)
         }
     }
 
+    g_kmm_free_pages = g_kmm_usable_pages;
+
     /* страницы самой битовой карты - заняты */
     UINT64 bm_first = g_kmm_bitmap_phys / KMM_PAGE;
 
-    for (UINT64 p = bm_first; p < bm_first + g_kmm_bitmap_pages; p++)
-        pmm_set(p);
+    for (UINT64 p = bm_first; p < bm_first + g_kmm_bitmap_pages; p++) {
+        if (p < g_kmm_total_pages && !pmm_test(p)) {
+            pmm_set(p);
+            g_kmm_free_pages--;
+        }
+    }
 
-    g_kmm_free_pages = g_kmm_usable_pages - g_kmm_bitmap_pages;
+    /* всё, что загрузчик выделил для ядра (образ, паспорт, карта,
+       стек, таблицы загрузчика), - тоже занято */
+    for (UINT32 r = 0; r < g_boot.nreserved && r < MYOS_MAX_RESERVED; r++) {
+
+        UINT64 first = g_boot.reserved[r].phys / KMM_PAGE;
+
+        for (UINT64 p = first; p < first + g_boot.reserved[r].pages; p++) {
+            if (p < g_kmm_total_pages && !pmm_test(p)) {
+                pmm_set(p);
+                g_kmm_free_pages--;
+                g_kmm_usable_pages--;
+                if (g_kmm_reclaimed_pages > 0)
+                    g_kmm_reclaimed_pages--;
+            }
+        }
+    }
     g_kmm_ready = TRUE;
 
     return TRUE;
@@ -282,22 +320,22 @@ UINT64 pmm_alloc_zeroed(UINT64 count, UINT64 limit)
 }
 
 /*
- * Отдать аллокатору все страницы указанного типа из карты памяти.
- * Нужно для временных таблиц страниц загрузчика: пока ядро не
- * включило свои таблицы, эти страницы - живые таблицы CR3.
+ * Отдать аллокатору временные таблицы страниц загрузчика (TEMP из
+ * списка паспорта). Вызывать ТОЛЬКО после того, как ядро включило
+ * свои таблицы: до этого по ним работает процессор.
  */
-UINT64 pmm_reclaim_type(UINT32 type)
+UINT64 pmm_release_loader_temp(void)
 {
     UINT64 n = 0;
 
-    for (UINTN i = 0; i < g_kmm_map_count; i++) {
+    for (UINT32 r = 0; r < g_boot.nreserved && r < MYOS_MAX_RESERVED; r++) {
 
-        if (g_kmm_map[i].type != type)
+        if (g_boot.reserved[r].kind != MYOS_RES_TEMP)
             continue;
 
-        UINT64 first = g_kmm_map[i].phys / KMM_PAGE;
+        UINT64 first = g_boot.reserved[r].phys / KMM_PAGE;
 
-        for (UINT64 p = first; p < first + g_kmm_map[i].pages; p++) {
+        for (UINT64 p = first; p < first + g_boot.reserved[r].pages; p++) {
 
             if (p < 256u || p >= g_kmm_total_pages || !pmm_test(p))
                 continue;
@@ -332,8 +370,6 @@ const char *kmm_type_name(UINT32 t)
     case 12: return "MMIOPortSpace";
     case 13: return "PalCode";
     case 14: return "Persistent";
-    case MYOS_MEM_KERNEL:      return "MyOS kernel";
-    case MYOS_MEM_LOADER_TEMP: return "MyOS loader (temp)";
     default: return "Other";
     }
 }

@@ -43,7 +43,7 @@ static void kmain_halt(const char *why)
         UINT32 bg = gui_pack(g_kfb_fmt, 120, 0, 0);
         UINT32 fg = gui_pack(g_kfb_fmt, 255, 255, 255);
         gui_fill_rect(g_kfb, g_kfb_stride, g_kfb_w, g_kfb_h, 0, 0,
-                      g_kfb_w < 640 ? g_kfb_w : 640, 48, bg);
+                      g_kfb_w, 48, bg);
         kx_raw_text(16, 16, why, fg, bg);
     }
 
@@ -53,6 +53,36 @@ static void kmain_halt(const char *why)
     }
 }
 
+/*
+ * Шаги раннего запуска - прямо на экран, внизу, одной строкой.
+ *
+ * До того как поднимется консоль, ядру некуда писать: COM-порта у
+ * ноутбука нет. Если что-то пойдёт не так именно здесь, раньше
+ * экран просто оставался с последними строками загрузчика - и было
+ * непонятно, где встало. Теперь каждый шаг перерисовывает строку
+ * "MyOS kernel: step N/7 ..." внизу экрана: если зависнет - на фото
+ * будет видно, на каком шаге. Рисуем пикселями через kx_raw_text -
+ * ему нужен только адрес видеопамяти, больше ничего.
+ */
+static void kmain_step(UINT32 n, const char *what)
+{
+    klog("early step %u: %s\n", n, what);
+
+    if (g_kfb == NULL || g_kfb_h < 40)
+        return;
+
+    UINT32 bg = gui_pack(g_kfb_fmt, 0, 0, 90);
+    UINT32 fg = gui_pack(g_kfb_fmt, 255, 255, 255);
+    UINTN y = g_kfb_h - 24;
+    char line[112];
+
+    ksnprintf(line, sizeof(line), "MyOS kernel: step %u/7 - %s", n, what);
+
+    gui_fill_rect(g_kfb, g_kfb_stride, g_kfb_w, g_kfb_h, 0, (INTN)y,
+                  g_kfb_w, 24, bg);
+    kx_raw_text(8, y + 4, line, fg, bg);
+}
+
 /* Точка входа. Отдельная секция .text.kmain - чтобы в kernel.elf
    она шла первой (так удобнее смотреть дизассемблером). */
 __attribute__((section(".text.kmain"), noreturn))
@@ -60,17 +90,35 @@ void kmain(MYOS_BOOT_INFO *bi)
 {
     kx_cli();
 
-    /* --- 1. лог --- */
+    /* --- 1. СРАЗУ свои GDT и IDT: они лежат в самом ядре и ни от
+       чего не зависят. Если дальше что-то сломается, сработает НАШ
+       обработчик исключений (экран паники), а не обработчик
+       прошивки: тот после ExitBootServices ничего не показывает и
+       просто висит. --- */
+    kx_load_gdt();
+    kx_load_idt();
+
+    /* экран - по первым полям паспорта (они никогда не двигаются,
+       см. bootinfo.h), даже если в остальном паспорт чужой */
+    if (bi != NULL && bi->magic == MYOS_BOOT_MAGIC && bi->fb_phys != 0) {
+        g_kfb = (volatile UINT32 *)P2V(bi->fb_phys);
+        g_kfb_w = bi->fb_width;
+        g_kfb_h = bi->fb_height;
+        g_kfb_stride = bi->fb_stride;
+        g_kfb_fmt = (EFI_GRAPHICS_PIXEL_FORMAT)bi->fb_format;
+    }
+
     serial_init();
     klog("MyOS kernel: entered kmain, boot info at %p\n", bi);
 
-    /* --- паспорт --- */
-    if (bi == NULL || bi->magic != MYOS_BOOT_MAGIC ||
-        bi->version != MYOS_BOOT_VERSION) {
-        klog("FATAL: bad boot info (loader and kernel from different builds?)\n");
-        for (;;)
-            kx_hlt();
-    }
+    kmain_step(1, "kernel entered, own GDT and IDT loaded");
+
+    /* --- 2. паспорт --- */
+    if (bi == NULL || bi->magic != MYOS_BOOT_MAGIC)
+        kmain_halt("boot info is missing - was the kernel started by the MyOS loader?");
+
+    if (bi->version != MYOS_BOOT_VERSION)
+        kmain_halt("BOOTX64.EFI and KERNEL.ELF are from different builds - copy BOTH files from esp/EFI/BOOT/");
 
     {
         const UINT8 *src = (const UINT8 *)bi;
@@ -79,17 +127,7 @@ void kmain(MYOS_BOOT_INFO *bi)
             dst[i] = src[i];
     }
 
-    /* --- 2. GDT и IDT --- */
-    kx_load_gdt();
-    kx_load_idt();
-
-    /* экран - уже сейчас (он отображён и в таблицах загрузчика,
-       через прямое отображение), чтобы экран паники работал */
-    g_kfb = (volatile UINT32 *)P2V(g_boot.fb_phys);
-    g_kfb_w = g_boot.fb_width;
-    g_kfb_h = g_boot.fb_height;
-    g_kfb_stride = g_boot.fb_stride;
-    g_kfb_fmt = (EFI_GRAPHICS_PIXEL_FORMAT)g_boot.fb_format;
+    kmain_step(2, "boot info OK, reading the memory map");
 
     /* --- 3. память --- */
     pmm_save_map(P2V(g_boot.mmap_phys), (UINTN)g_boot.mmap_size,
@@ -100,11 +138,15 @@ void kmain(MYOS_BOOT_INFO *bi)
 
     klog("pmm: %llu MiB free\n", (g_kmm_free_pages * 4u) / 1024u);
 
+    kmain_step(3, "page allocator ready, building page tables");
+
     /* --- 4. свои таблицы страниц --- */
     if (!vmm_init())
         kmain_halt("could not build kernel page tables");
 
-    pmm_reclaim_type(MYOS_MEM_LOADER_TEMP);
+    kmain_step(4, "own page tables ON");
+
+    pmm_release_loader_temp();
 
     klog("vmm: own page tables on, CR3=0x%llx\n", g_vmm_pml4_phys);
 
@@ -113,6 +155,8 @@ void kmain(MYOS_BOOT_INFO *bi)
 
     if (top == 0)
         kmain_halt("could not allocate the kernel stack");
+
+    kmain_step(5, "switching to the kernel stack");
 
     /* переход на новый стек: дальше - kmain_stage2, назад дороги
        нет (старый стек загрузчика больше не нужен) */
@@ -131,6 +175,10 @@ void kmain(MYOS_BOOT_INFO *bi)
 
 static void kmain_section(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *name)
 {
+    /* всё напечатанное до этого - на экран сейчас же: если
+       следующий раздел зависнет, последняя строка будет видна */
+    kcon_flush();
+
     set_color(out, 0x0E);
     print(out, name);
     print(out, "\n");
@@ -145,7 +193,11 @@ void kmain_stage2(void)
     UINT64 ist_nmi = vmm_alloc_stack(4, "NMI stack (IST2)");
     UINT64 ist_mc = vmm_alloc_stack(4, "machine check stack (IST3)");
 
+    kmain_step(6, "TSS with separate fault stacks");
+
     kx_load_tss(ist_df, ist_nmi, ist_mc, 0);
+
+    kmain_step(7, "starting the console");
 
     /* --- 6. консоль --- */
     kcon_init();
@@ -386,6 +438,7 @@ void kmain_stage2(void)
         }
     }
 
+    kcon_flush();
     kx_usb_start(out);
 
     /* --- таблица функций ядра для шелла и GUI --- */

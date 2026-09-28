@@ -442,7 +442,13 @@ UINT64 acpi_hpet_measure_tsc_hz(void)
 
         do {
             ticks = ((mmio_read64(g_acpi.hpet_addr + 0xF0) & m) - c0) & m;
-            if (++guard > 50000000ull)
+            /* страховка по времени: не дольше ~0.2 с (по замеру
+               загрузчика), иначе на медленном железе "лимит
+               попыток" растянулся бы на десятки секунд */
+            if ((++guard & 0xFFu) == 0 && g_tsc_hz_stall != 0 &&
+                rdtsc() - t0 > g_tsc_hz_stall / 5u)
+                return 0;
+            if (guard > 50000000ull)
                 return 0;
         } while (ticks < want);
 
@@ -492,7 +498,10 @@ UINT64 acpi_pmtimer_measure_tsc_hz(void)
 
         do {
             d = ((io_in32(port) & mask) - c0) & mask;
-            if (++guard > 20000000ull)
+            if ((++guard & 0xFFu) == 0 && g_tsc_hz_stall != 0 &&
+                rdtsc() - t0 > g_tsc_hz_stall / 5u)
+                return 0;
+            if (guard > 20000000ull)
                 return 0;
         } while (d < want);
 

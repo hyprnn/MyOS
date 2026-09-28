@@ -1855,7 +1855,7 @@ void pmm_free_pages(UINT64 phys, UINT64 count);
 UINT64 pmm_alloc_zeroed(UINT64 count, UINT64 limit);
 const char *kmm_type_name(UINT32 t);
 BOOLEAN pmm_free_type(UINT32 t);
-UINT64 pmm_reclaim_type(UINT32 type);
+UINT64 pmm_release_loader_temp(void);
 
 /* --- drivers/keyboard.c --- */
 void kbd_enqueue(UINT16 scan, CHAR16 uc);
