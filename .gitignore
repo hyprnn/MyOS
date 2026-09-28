@@ -1,0 +1,8 @@
+main.o
+*.o
+build/
+MyOS.iso
+fat.img
+iso_root/
+MyOS_hdd.img
+MyOS_hdd.vdi
