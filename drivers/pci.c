@@ -1,18 +1,40 @@
 /*
- * drivers/pci.c - конфигурационное пространство PCI через порты 0xCF8/0xCFC.
+ * drivers/pci.c - конфигурационное пространство PCI.
  * Часть MyOS; общие объявления - в myos.h.
+ *
+ * Два способа до него добраться:
+ *   * старый (Mechanism #1, с 1990-х): записать адрес в порт 0xCF8
+ *     и прочитать данные из порта 0xCFC. Работает везде, но видит
+ *     только первые 256 байт конфигурации устройства, и два порта
+ *     на всю систему - узкое место;
+ *   * современный (PCIe ECAM): конфигурация каждого устройства - это
+ *     просто 4 КиБ памяти в большом окне, адрес окна сообщает
+ *     таблица ACPI MCFG. Адрес = база + (шина << 20) + (устройство
+ *     << 15) + (функция << 12) + смещение.
+ * После разбора ACPI ядро включает ECAM (pci_use_ecam), если окно
+ * отвечает то же, что и порты. Загрузчик всегда работает портами.
  */
 #include "myos.h"
 
-/*
- * Читает 32-битное слово конфигурационного пространства PCI
- * по (bus, dev, func, offset). offset должен быть выровнен
- * по 4 байтам - младшие 2 бита адреса игнорируются самим
- * протоколом Mechanism #1, поэтому маскируем их явно.
- */
-UINT32 pci_config_read32(
-    UINT8 bus, UINT8 dev, UINT8 func, UINT8 offset
-)
+UINT64  g_pci_ecam_base = 0;      /* физический адрес окна (для шины 0) */
+UINT8   g_pci_ecam_bus_start = 0;
+UINT8   g_pci_ecam_bus_end = 0;
+BOOLEAN g_pci_ecam_active = FALSE;
+
+static BOOLEAN pci_ecam_covers(UINT8 bus)
+{
+    return g_pci_ecam_active &&
+           bus >= g_pci_ecam_bus_start && bus <= g_pci_ecam_bus_end;
+}
+
+static UINT64 pci_ecam_addr(UINT8 bus, UINT8 dev, UINT8 func, UINT8 offset)
+{
+    return g_pci_ecam_base +
+           ((UINT64)bus << 20) + ((UINT64)(dev & 31u) << 15) +
+           ((UINT64)(func & 7u) << 12) + (UINT64)(offset & 0xFCu);
+}
+
+static UINT32 pci_port_read32(UINT8 bus, UINT8 dev, UINT8 func, UINT8 offset)
 {
     UINT32 address =
         (1u << 31) |
@@ -26,10 +48,78 @@ UINT32 pci_config_read32(
     return io_in32(PCI_CONFIG_DATA);
 }
 
+/*
+ * Читает 32-битное слово конфигурационного пространства PCI
+ * по (bus, dev, func, offset). offset должен быть выровнен
+ * по 4 байтам - младшие 2 бита отбрасываем явно.
+ */
+UINT32 pci_config_read32(
+    UINT8 bus, UINT8 dev, UINT8 func, UINT8 offset
+)
+{
+    if (pci_ecam_covers(bus))
+        return mmio_read32(pci_ecam_addr(bus, dev, func, offset));
+
+    return pci_port_read32(bus, dev, func, offset);
+}
+
+#ifndef MYOS_LOADER
+/*
+ * Включить ECAM по данным MCFG. Проверка на честность: у всех
+ * устройств на шине 0 идентификатор (Vendor/Device ID) через окно
+ * должен совпасть с тем, что отвечают старые порты. Не совпал -
+ * остаёмся на портах (TRUE/FALSE - включили или нет).
+ */
+BOOLEAN pci_use_ecam(UINT64 base, UINT8 bus_start, UINT8 bus_end)
+{
+    if (base == 0 || bus_end < bus_start)
+        return FALSE;
+
+    UINT64 first = base + ((UINT64)bus_start << 20);
+    UINT64 size = ((UINT64)(bus_end - bus_start) + 1u) << 20;
+
+    if (!vmm_ensure_mapped(first, size, VMM_UC))
+        return FALSE;
+
+    g_pci_ecam_base = base;
+    g_pci_ecam_bus_start = bus_start;
+    g_pci_ecam_bus_end = bus_end;
+
+    if (bus_start != 0)
+        return FALSE;       /* сверять нечего - не рискуем */
+
+    UINTN seen = 0;
+
+    for (UINT8 dev = 0; dev < 32; dev++) {
+
+        UINT32 by_port = pci_port_read32(0, dev, 0, 0);
+        UINT32 by_ecam = mmio_read32(pci_ecam_addr(0, dev, 0, 0));
+
+        if (by_port != by_ecam)
+            return FALSE;
+
+        if ((by_port & 0xFFFFu) != 0xFFFFu)
+            seen++;
+    }
+
+    if (seen == 0)
+        return FALSE;
+
+    g_pci_ecam_active = TRUE;
+
+    return TRUE;
+}
+#endif
+
 void pci_config_write32(
     UINT8 bus, UINT8 dev, UINT8 func, UINT8 offset, UINT32 value
 )
 {
+    if (pci_ecam_covers(bus)) {
+        mmio_write32(pci_ecam_addr(bus, dev, func, offset), value);
+        return;
+    }
+
     UINT32 address =
         (1u << 31) |
         ((UINT32)bus  << 16) |

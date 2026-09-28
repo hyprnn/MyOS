@@ -295,6 +295,41 @@ BOOLEAN vmm_map_mmio(UINT64 phys, UINT64 size, UINT32 cache)
     return TRUE;
 }
 
+/*
+ * Убедиться, что участок физической памяти виден через прямое
+ * отображение; недостающие страницы отобразить с атрибутом cache
+ * (0 = обычная кэшируемая, VMM_UC - устройства). Уже отображённое
+ * НЕ трогаем (в отличие от vmm_map_mmio). Нужно для таблиц ACPI и
+ * окна PCIe (ECAM), которые на некоторых машинах лежат выше
+ * последней RAM - туда прямое отображение заранее не доходит.
+ */
+BOOLEAN vmm_ensure_mapped(UINT64 phys, UINT64 size, UINT32 cache)
+{
+    UINT64 p = phys & ~4095ull;
+    UINT64 end = (phys + size + 4095u) & ~4095ull;
+
+    while (p < end) {
+
+        UINT64 e = vmm_query(MYOS_HHDM_BASE + p);
+
+        if (e != 0) {
+            /* большая страница уже есть - прыгаем через неё целиком */
+            if (e & PTE_PS)
+                p = (p & ~0x1FFFFFull) + 0x200000u;
+            else
+                p += 4096u;
+            continue;
+        }
+
+        if (!vmm_map_page(MYOS_HHDM_BASE + p, p, cache))
+            return FALSE;
+
+        p += 4096u;
+    }
+
+    return TRUE;
+}
+
 /* ---------------------------------------------------------------- */
 
 static BOOLEAN vmm_ram_type(UINT32 t)

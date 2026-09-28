@@ -21,9 +21,12 @@ Linux, fish; беспроводная мышь Onikuma через USB-донгл
 по-русски.
 
 Есть документ-план «MyOS: план пути к настоящей ОС» (10 этапов).
-**Этапы 0 (порядок в коде) и 1 (загрузчик + ядро, виртуальная память)
-выполнены.** Следующие по плану — этап 2 (ACPI: MADT, MCFG, HPET,
-команда `acpi`) и этап 4 (многозадачность); их можно в любом порядке.
+**Этапы 0 (порядок в коде), 1 (загрузчик + ядро, виртуальная память)
+и 2 (ACPI) выполнены.** Следующие по плану — этап 3 (прерывания вместо
+опроса, USB-хабы, горячее подключение; нужен этап 2 — он готов) и
+этап 4 (многозадачность); их можно в любом порядке. AML (байт-код
+DSDT/SSDT) не исполняется: решение — взять библиотеку uACPI, когда
+понадобятся батарея/крышка/кнопка питания (этап 9).
 
 ## Сборка, запуск, тест
 
@@ -31,7 +34,8 @@ Linux, fish; беспроводная мышь Onikuma через USB-донгл
 make            # BOOTX64.EFI + kernel.elf, инкрементально; оба -> esp/EFI/BOOT/
 make run        # ISO + QEMU, лог COM1 в терминал (-serial stdio)
 make run-tablet # мышь-планшет (без «стенок» в окне QEMU)
-make test       # tools/autotest.py: 4 запуска QEMU (~1 мин): основной +
+make test       # tools/autotest.py: 5 запусков QEMU (~1.5 мин): основной
+                # (-smp 2), q35 (ECAM, сброс через FADT) и
                 # crash write / crash stack / crash null (экраны паники)
 ```
 Опции автотеста: `--quick` (без crash-запусков), `--mem 5G`,
@@ -52,8 +56,8 @@ make test       # tools/autotest.py: 4 запуска QEMU (~1 мин): осно
 | `bootinfo.h` | паспорт загрузки `MYOS_BOOT_INFO` + раскладка адресов: HHDM `0xFFFF800000000000`, стеки `0xFFFFFE8000000000`, ядро `0xFFFFFFFF80000000`; свои типы памяти `MYOS_MEM_KERNEL/LOADER_TEMP` |
 | `myos.h` | общий заголовок; `P2V()`/`V2P()` (физ. адрес <-> указатель прямого отображения), `mmio_read32/write32` берут ФИЗИЧЕСКИЙ адрес и сами переводят |
 | `lib/` | `libc.c` (memcpy/memset), `string.c` (+`kstreq`), `kprintf.c` (`kprintf`, `ksnprintf`, `klog` — только COM1; `%S` = CHAR16*), `serial.c` |
-| `kernel/` | `kmain.c` порядок запуска; `kernel.ld`; `vmm.c` таблицы страниц (код RX, rodata R, данные RW+NX, RAM WB, не-RAM ниже 4 ГиБ UC, экран WC через PAT, нижняя половина пуста), стеки с защитными страницами; `pmm.c` страницы (свободны также BootServices*/Loader*); `kmalloc.c` слабы 16..1024 + крупные страницами; `cpu.c` GDT+TSS (IST1 #DF, IST2 NMI, IST3 #MC), IDT, экран паники с разбором #PF/#DF; `power.c` CMOS-часы, reboot (0xCF9/8042), shutdown (FADT + `_S5_` из DSDT, QEMU-порты); `shim.c` таблица `g_kst` для шелла/GUI (свои BootServices/RuntimeServices, без прошивки); `kcon.c`, `time.c`, `kcmds.c` (kinfo/usb/mousetest/mem/boot/vm/crash) |
-| `drivers/` | `pci.c`, `xhci_common.c` (общие с загрузчиком), `usb.c` (xHCI+HID, все DMA-адреса через `P2V`), `hid.c`, `keyboard.c`, `ps2.c` |
+| `kernel/` | `kmain.c` порядок запуска; `kernel.ld`; `vmm.c` таблицы страниц (код RX, rodata R, данные RW+NX, RAM WB, не-RAM ниже 4 ГиБ UC, экран WC через PAT, нижняя половина пуста), стеки с защитными страницами; `pmm.c` страницы (свободны также BootServices*/Loader*); `kmalloc.c` слабы 16..1024 + крупные страницами; `cpu.c` GDT+TSS (IST1 #DF, IST2 NMI, IST3 #MC), IDT, экран паники с разбором #PF/#DF; `acpi.c` разбор ACPI (RSDP→XSDT/RSDT, контрольные суммы, MADT: ядра/I/O APIC/переназначения IRQ, FADT: порты PM, таймер PM, регистр сброса, век RTC, MCFG: ECAM, HPET: запуск и замер TSC; команда `acpi`); `power.c` CMOS-часы (век из FADT), reboot (регистр FADT → 0xCF9 → 8042 → triple fault), shutdown (`_S5_` из DSDT/SSDT, QEMU-порты); `shim.c` таблица `g_kst` для шелла/GUI (свои BootServices/RuntimeServices, без прошивки); `kcon.c`, `time.c`, `kcmds.c` (kinfo/usb/mousetest/mem/boot/vm/crash) |
+| `drivers/` | `pci.c` (порты или ECAM после `pci_use_ecam` со сверкой), `xhci_common.c` (общие с загрузчиком), `usb.c` (xHCI+HID, все DMA-адреса через `P2V`), `hid.c`, `keyboard.c`, `ps2.c` |
 | `gui/` | `gui.c` цикл `start`, `desktop.c` (вывод кадра без мигания: `gui_present_frame`/`gui_present_cursor`), `draw.c`, `minesweeper*.c`, `terminal.c` (+`gui_term_exec`) |
 | `shell/` | `commands.c`, `console.c`, `readline.c`, `fs.c`, `fetch.c`, `editor.c`, `calc.c`, `history.c` |
 | `tools/` | `autotest.py` (свой FAT16-образ с обоими файлами, QMP, проверки по COM1), `split_main.py` |
@@ -68,8 +72,10 @@ make test       # tools/autotest.py: 4 запуска QEMU (~1 мин): осно
 GDT/IDT (старые — в памяти прошивки, которую сейчас отдадим) → карта
 памяти + pmm → vmm (свои таблицы, CR3, сброс глобальных TLB) → отдать
 таблицы загрузчика → стек 256 КиБ с защитной страницей → TSS/IST →
-консоль → PIC/IOAPIC → TSC по PIT (контроль — замер загрузчика по
-Stall) → LAPIC timer 1 кГц → CMOS → ACPI (для shutdown) → PS/2 → xHCI
+консоль → PIC → ACPI (таблицы; I/O APIC из MADT маскируются; ECAM;
+подготовка shutdown) → TSC по HPET / PIT / таймеру PM (берётся первый,
+согласный с контролем — замером загрузчика по Stall) → LAPIC timer
+1 кГц → CMOS → PS/2 → xHCI
 (BAR отображается UC через `vmm_map_mmio`) → `g_kst` → шелл.
 
 Правило: **физический адрес никогда не приводить к указателю
@@ -77,7 +83,10 @@ Stall) → LAPIC timer 1 кГц → CMOS → ACPI (для shutdown) → PS/2 →
 Page Fault с текстом «lower half: nothing is mapped there». Новые
 устройства выше 4 ГиБ — `vmm_map_mmio(phys, size, VMM_UC)`.
 
-Команды для проверки: `vm` (раскладка, стеки, проверка перевода
+Без ACPI (проверено подменой) ядро откатывается на 0xFEC00000, порты
+PCI и PIT. OVMF с `-no-acpi` сам не грузится — так не проверить.
+
+Команды для проверки: `acpi` (таблицы, ядра, I/O APIC, ECAM, HPET, FADT), `vm` (раскладка, стеки, проверка перевода
 адресов), `mem` (карта, pmm, куча, самотесты), `boot` (что сделал
 загрузчик + его журнал), `crash`/`crash null`/`crash write`/`crash stack`.
 

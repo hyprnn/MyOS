@@ -50,6 +50,8 @@ void busy_wait_ms(UINTN ms)
 
 UINT64 g_tsc_hz_stall = 0;   /* замер через Stall прошивки
                                         (ещё до ExitBootServices) */
+UINT64 g_tsc_hz_hpet = 0;    /* замер по HPET (ACPI) */
+UINT64 g_tsc_hz_pmtmr = 0;   /* замер по таймеру ACPI PM */
 UINT64 g_tsc_hz_pit = 0;     /* замер через PIT - уже без
                                         прошивки */
 const char *g_tsc_source = "none";

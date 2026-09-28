@@ -51,6 +51,10 @@ void run_command(
 
         kernel_cmd_mem(st, out);
 
+    } else if (streq(line, "acpi")) {
+
+        kernel_cmd_acpi(out);
+
     } else if (streq(line, "boot")) {
 
         kernel_cmd_boot(out);
@@ -176,6 +180,11 @@ void run_command(
         print(
             out,
             "  clear         - clear the screen\n"
+        );
+
+        print(
+            out,
+            "  acpi          - ACPI tables: CPU cores, I/O APIC, HPET, PCIe, power\n"
         );
 
         print(

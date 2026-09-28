@@ -163,7 +163,7 @@ class VM:
 # ------------------------------------------------------------ the test
 
 
-def run_steps(a, work, steps, name):
+def run_steps(a, work, steps, name, extra=()):
     """Один запуск ВМ: пройти шаги, вернуть (ok, текст лога)."""
     disk = os.path.join(work, name + '.img')
     make_fat_image(a.efi, a.kernel, disk)
@@ -171,7 +171,7 @@ def run_steps(a, work, steps, name):
     vmdir = os.path.join(work, name)
     os.makedirs(vmdir, exist_ok=True)
     vm = VM(a.qemu, a.ovmf, disk, vmdir, ['qemu-xhci', 'usb-mouse', 'usb-kbd'],
-            mem=a.mem, extra=a.extra.split() if a.extra else ())
+            mem=a.mem, extra=(a.extra.split() if a.extra else []) + list(extra))
 
     ok = True
     for keys, expect, timeout in steps:
@@ -210,6 +210,10 @@ def main():
         (None, 'entered kmain', 60),
         ('', 'own page tables on', 10),
         ('', "Type 'help'", 30),
+        ('', 'all checksums OK', 5),
+        ('', 'source: HPET', 5),
+        ('acpi\n', 'CPU cores (MADT): 2 enabled', 15),
+        ('', 'I/O APIC #0: id', 5),
         ('kinfo\n', 'LAPIC timer: running', 15),
         ('usb\n', 'keyboard (boot protocol)', 15),
         ('', 'mouse (boot protocol)', 5),
@@ -222,9 +226,17 @@ def main():
         ('time\n', ':', 15),
     ]
 
-    runs = [('main', main_steps)]
+    runs = [('main', main_steps, ['-smp', '2'])]
 
     if not a.quick:
+        # чипсет q35: PCIe через ECAM (MCFG), перезагрузка через FADT
+        runs.append(('q35', [
+            (None, "Type 'help'", 90),
+            ('', 'PCIe config space via ECAM', 5),
+            ('usb\n', 'mouse (boot protocol)', 15),
+            ('acpi\n', 'MyOS uses it', 15),
+            ('', "used by 'reboot'", 5),
+        ], ['-machine', 'q35']))
         runs.append(('crash-write', [
             (None, "Type 'help'", 90),
             ('crash write\n', 'Page Fault: WRITE', 15),
@@ -242,9 +254,11 @@ def main():
 
     ok = True
     last_log = ''
-    for name, steps in runs:
+    for run in runs:
+        name, steps = run[0], run[1]
+        extra = run[2] if len(run) > 2 else []
         print('--- run: %s' % name)
-        r, last_log = run_steps(a, work, steps, name)
+        r, last_log = run_steps(a, work, steps, name, extra)
         if not r:
             ok = False
             break

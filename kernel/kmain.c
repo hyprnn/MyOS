@@ -174,12 +174,65 @@ void kmain_stage2(void)
     kx_pic_disable();
     print(out, "  8259 PIC remapped to 0x20-0x2F and masked\n");
 
-    UINTN ioapic_n = kx_ioapic_mask_all();
+    /* --- ACPI: что за компьютер. Нужно раньше таймеров (HPET,
+       таймер PM) и контроллеров прерываний (адреса I/O APIC). --- */
+    kmain_section(out, "[acpi]");
 
-    if (ioapic_n > 0)
-        kprintf(out, "  I/O APIC: %u redirection entries masked\n", (UINT32)ioapic_n);
-    else
-        print(out, "  I/O APIC: not found at 0xFEC00000 (skipped)\n");
+    if (acpi_init()) {
+
+        UINT32 ntab = (UINT32)g_acpi.ntables;
+        UINT32 bad = 0;
+
+        for (UINTN i = 0; i < g_acpi.ntables; i++)
+            if (!g_acpi.tables[i].sum_ok)
+                bad++;
+
+        kprintf(out, "  ACPI %s by \"%s\": %u tables%s\n",
+                g_acpi.revision >= 2 ? "2.0+" : "1.0", g_acpi.oem, ntab,
+                bad ? " (some with BAD checksums - ignored)" : ", all checksums OK");
+
+        if (g_acpi.have_madt)
+            kprintf(out, "  CPU cores: %u (MADT); MyOS uses one of them for now\n",
+                    (UINT32)g_acpi.ncpus_enabled);
+    } else {
+        kprintf(out, "  no usable ACPI tables: %s\n", g_acpi.why);
+    }
+
+    /* I/O APIC: все из MADT; без MADT - стандартный адрес */
+    if (g_acpi.nioapics > 0) {
+
+        for (UINTN i = 0; i < g_acpi.nioapics; i++) {
+            UINTN n = kx_ioapic_mask_all(g_acpi.ioapics[i].addr);
+            g_acpi.ioapics[i].count = (UINT32)n;
+            kprintf(out, "  I/O APIC %u at 0x%llx (from MADT): %u lines, all masked\n",
+                    g_acpi.ioapics[i].id, g_acpi.ioapics[i].addr, (UINT32)n);
+        }
+
+    } else {
+
+        UINTN n = kx_ioapic_mask_all(0xFEC00000ull);
+
+        if (n > 0)
+            kprintf(out, "  I/O APIC at 0xFEC00000 (guessed, no MADT): %u lines masked\n",
+                    (UINT32)n);
+        else
+            print(out, "  I/O APIC: not found (skipped)\n");
+    }
+
+    /* PCIe через память */
+    if (g_acpi.n_mcfg > 0) {
+        if (pci_use_ecam(g_acpi.ecam_base, g_acpi.ecam_bus_start, g_acpi.ecam_bus_end))
+            kprintf(out, "  PCIe config space via ECAM at 0x%llx (MCFG), buses %u..%u\n",
+                    g_acpi.ecam_base, g_acpi.ecam_bus_start, g_acpi.ecam_bus_end);
+        else
+            print(out, "  MCFG present, but ECAM check failed - PCI via ports 0xCF8/0xCFC\n");
+    } else {
+        print(out, "  no MCFG - PCI config via ports 0xCF8/0xCFC\n");
+    }
+
+    acpi_power_init();
+
+    kprintf(out, "  shutdown: %s\n", g_acpi_power.ok ? "ACPI S5 ready" : g_acpi_power.why);
 
     kmain_section(out, "[memory]");
     kprintf(out, "  page tables: kernel at 0xFFFFFFFF80000000, all RAM at 0xFFFF800000000000\n");
@@ -202,40 +255,59 @@ void kmain_stage2(void)
     /* --- таймеры --- */
     kmain_section(out, "[time]");
 
+    /*
+     * Частота TSC - по нескольким независимым эталонам:
+     *   HPET        - высокоточный таймер из ACPI (обычно 14-25 МГц);
+     *   PIT 8254    - старый таймер, 1.193182 МГц;
+     *   ACPI PM     - таймер управления питанием, 3.579545 МГц;
+     *   Stall       - замер загрузчика через прошивку (контроль).
+     * Берём первый по точности, который согласуется с контролем
+     * (расхождение меньше 25%). Раньше эталон был один - PIT, и
+     * если прошивка его выключила, оставалось только гадать.
+     */
     g_tsc_hz_stall = g_boot.tsc_hz_stall;
+    g_tsc_hz_hpet = acpi_hpet_measure_tsc_hz();
     g_tsc_hz_pit = kx_pit_measure_tsc_hz();
+    g_tsc_hz_pmtmr = acpi_pmtimer_measure_tsc_hz();
 
-    if (g_tsc_hz_pit >= 1000000ull)
-        kprintf(out, "  TSC by PIT (8254):      %llu MHz\n", g_tsc_hz_pit / 1000000u);
-    else
-        print(out, "  TSC by PIT (8254):      PIT does not respond\n");
+    {
+        const char *names[3] = { "HPET", "PIT 8254", "ACPI PM timer" };
+        UINT64 vals[3] = { g_tsc_hz_hpet, g_tsc_hz_pit, g_tsc_hz_pmtmr };
 
-    kprintf(out, "  TSC by firmware Stall:  %llu MHz (measured by the loader)\n",
-            g_tsc_hz_stall / 1000000u);
+        for (UINTN i = 0; i < 3; i++) {
+            if (vals[i] >= 1000000ull)
+                kprintf(out, "  TSC by %-14s %llu.%03llu MHz\n", names[i],
+                        vals[i] / 1000000u, (vals[i] / 1000u) % 1000u);
+            else
+                kprintf(out, "  TSC by %-14s - (not available)\n", names[i]);
+        }
 
-    /* PIT - основной, независимый от прошивки эталон. Если он
-       молчит или явно расходится с контрольным замером - берём
-       контрольный. */
-    BOOLEAN pit_ok = FALSE;
+        kprintf(out, "  TSC by firmware Stall  %llu MHz (measured by the loader)\n",
+                g_tsc_hz_stall / 1000000u);
 
-    if (g_tsc_hz_pit >= 100000000ull && g_tsc_hz_pit <= 20000000000ull) {
+        g_tsc_hz = 0;
 
-        UINT64 a = g_tsc_hz_pit;
-        UINT64 bref = g_tsc_hz_stall;
+        for (UINTN i = 0; i < 3 && g_tsc_hz == 0; i++) {
 
-        if (bref == 0 || (a * 4u > bref * 3u && a * 3u < bref * 4u))
-            pit_ok = TRUE;
-    }
+            UINT64 a = vals[i];
+            UINT64 bref = g_tsc_hz_stall;
 
-    if (pit_ok) {
-        g_tsc_hz = g_tsc_hz_pit;
-        g_tsc_source = "PIT 8254";
-    } else if (g_tsc_hz_stall >= 100000000ull) {
-        g_tsc_hz = g_tsc_hz_stall;
-        g_tsc_source = "firmware Stall (PIT unusable)";
-    } else {
-        g_tsc_hz = 2000000000ull;
-        g_tsc_source = "GUESS 2 GHz (no reference worked!)";
+            if (a < 100000000ull || a > 20000000000ull)
+                continue;
+
+            if (bref == 0 || (a * 4u > bref * 3u && a * 3u < bref * 4u)) {
+                g_tsc_hz = a;
+                g_tsc_source = names[i];
+            }
+        }
+
+        if (g_tsc_hz == 0 && g_tsc_hz_stall >= 100000000ull) {
+            g_tsc_hz = g_tsc_hz_stall;
+            g_tsc_source = "firmware Stall (no hardware timer agreed)";
+        } else if (g_tsc_hz == 0) {
+            g_tsc_hz = 2000000000ull;
+            g_tsc_source = "GUESS 2 GHz (no reference worked!)";
+        }
     }
 
     g_kboot_tsc = rdtsc();
@@ -274,17 +346,6 @@ void kmain_stage2(void)
         else
             print(out, "  CMOS clock: not responding\n");
     }
-
-    /* --- ACPI: пока только то, что нужно для выключения --- */
-    kmain_section(out, "[acpi]");
-
-    acpi_power_init();
-
-    if (g_boot.rsdp_phys != 0)
-        kprintf(out, "  RSDP at 0x%llx (ACPI %u.0); shutdown via ACPI: %s\n",
-                g_boot.rsdp_phys, g_boot.acpi_version, g_acpi_power.why);
-    else
-        print(out, "  no ACPI tables - shutdown works only in virtual machines\n");
 
     /* --- ввод --- */
     kmain_section(out, "[input]");
@@ -343,7 +404,7 @@ void kmain_stage2(void)
     print(out, "\nMyOS is running on its own kernel - no firmware underneath.\n");
     set_color(out, 0x07);
     print(out, "Type 'help' for the list of commands, or 'fetch' for a system summary.\n");
-    print(out, "New: boot, vm, crash null|write|stack (fault screens).\n\n");
+    print(out, "New: acpi (what the ACPI tables say), boot, vm, crash null|write|stack.\n\n");
 
     CHAR16 line[LINE_MAX];
 

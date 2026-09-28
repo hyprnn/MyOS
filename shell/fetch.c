@@ -263,6 +263,18 @@ void cmd_fetch(
 
     print_label(
         out,
+        "CPU cores"
+    );
+
+    if (g_acpi.have_madt)
+        kprintf(out, "    : %u (from ACPI), MyOS uses 1 for now\n",
+                (UINT32)g_acpi.ncpus_enabled);
+    else
+        print(out, "    : unknown (no ACPI MADT)\n");
+
+
+    print_label(
+        out,
         "Boot Mode"
     );
 

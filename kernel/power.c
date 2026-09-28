@@ -84,11 +84,15 @@ BOOLEAN rtc_read(EFI_TIME *t)
         if (pm) hour = (UINT8)(hour + 12u);
     }
 
-    /* регистр века (0x32) есть не везде; если там чушь - 20xx */
-    cent = rtc_bcd(rtc_reg(0x32), binary);
+    /* Регистр века есть не везде: его номер (обычно 0x32) сообщает
+       таблица ACPI FADT. Нет его или там чушь - считаем 20xx. */
+    cent = 20;
 
-    if (cent < 19 || cent > 21)
-        cent = 20;
+    if (g_acpi.century >= 0x0E && g_acpi.century < 0x80) {
+        UINT8 c = rtc_bcd(rtc_reg(g_acpi.century), binary);
+        if (c >= 19 && c <= 21)
+            cent = c;
+    }
 
     UINT8 *raw = (UINT8 *)t;
     for (UINTN i = 0; i < sizeof(EFI_TIME); i++)
@@ -117,6 +121,31 @@ void kx_reboot(void)
     kx_cli();
     kcon_flush();
     klog("reboot requested\n");
+
+    /* 0. Регистр перезагрузки из ACPI (FADT) - так прошивка сама
+          говорит, как её перезагружать. Чаще всего это тот же порт
+          0xCF9, но бывает и память, и конфигурация PCI. */
+    if (g_acpi.reset_ok) {
+
+        if (g_acpi.reset_space == 1) {
+            io_out8((UINT16)g_acpi.reset_addr, g_acpi.reset_value);
+        } else if (g_acpi.reset_space == 0) {
+            vmm_ensure_mapped(g_acpi.reset_addr, 1, VMM_UC);
+            *(volatile UINT8 *)P2V(g_acpi.reset_addr) = g_acpi.reset_value;
+        } else if (g_acpi.reset_space == 2) {
+            /* адрес: устройство [47:32], функция [31:16], смещение [15:0]
+               на шине 0 */
+            UINT8 dev = (UINT8)(g_acpi.reset_addr >> 32);
+            UINT8 fn = (UINT8)(g_acpi.reset_addr >> 16);
+            UINT8 off = (UINT8)g_acpi.reset_addr;
+            UINT32 v = pci_config_read32(0, dev, fn, (UINT8)(off & ~3u));
+            UINT32 sh = (off & 3u) * 8u;
+            v = (v & ~(0xFFu << sh)) | ((UINT32)g_acpi.reset_value << sh);
+            pci_config_write32(0, dev, fn, (UINT8)(off & ~3u), v);
+        }
+
+        busy_wait_ms(100);
+    }
 
     /* 1. Reset Control Register чипсета (порт 0xCF9): 0x02 -
           подготовить, 0x06 - "горячий" сброс всей платформы.
@@ -156,110 +185,14 @@ void kx_reboot(void)
 
 ACPI_POWER g_acpi_power;
 
-static BOOLEAN acpi_sum_ok(const UINT8 *p, UINT32 len)
+/* Найти "_S5_" в одной таблице AML и прочитать SLP_TYPa/b.
+   После "_S5_": 0x12 (Package), длина пакета (1-4 байта), число
+   элементов, затем два числа - каждое либо 0x0A <байт>
+   (BytePrefix), либо голые 0x00 / 0x01 (ZeroOp / OneOp). Перед
+   "_S5_" стоит 0x08 (NameOp), иногда с префиксом пути '\\'. */
+static BOOLEAN acpi_find_s5(const UINT8 *d, UINT32 dlen, UINT8 *a, UINT8 *b)
 {
-    UINT8 sum = 0;
-
-    for (UINT32 i = 0; i < len; i++)
-        sum = (UINT8)(sum + p[i]);
-
-    return sum == 0;
-}
-
-/* Найти таблицу с подписью sig ("FACP", "APIC", ...) по RSDP */
-const UINT8 *acpi_find_table(const char *sig)
-{
-    if (g_boot.rsdp_phys == 0)
-        return NULL;
-
-    const UINT8 *rsdp = (const UINT8 *)P2V(g_boot.rsdp_phys);
-
-    if (rsdp[0] != 'R' || rsdp[1] != 'S' || rsdp[2] != 'D' || rsdp[3] != ' ')
-        return NULL;
-
-    UINT8 rev = rsdp[15];
-    UINT64 root;
-    UINTN entry;
-
-    if (rev >= 2 && *(const UINT64 *)(rsdp + 24) != 0) {
-        root = *(const UINT64 *)(rsdp + 24);       /* XSDT: 8-байтные ссылки */
-        entry = 8;
-    } else {
-        root = *(const UINT32 *)(rsdp + 16);       /* RSDT: 4-байтные */
-        entry = 4;
-    }
-
-    const UINT8 *rt = (const UINT8 *)P2V(root);
-    UINT32 len = *(const UINT32 *)(rt + 4);
-
-    if (len < 36 || len > 0x100000u)
-        return NULL;
-
-    for (UINT32 off = 36; off + entry <= len; off += (UINT32)entry) {
-
-        UINT64 a = (entry == 8) ? *(const UINT64 *)(rt + off)
-                                : *(const UINT32 *)(rt + off);
-        const UINT8 *t = (const UINT8 *)P2V(a);
-
-        if (t[0] == (UINT8)sig[0] && t[1] == (UINT8)sig[1] &&
-            t[2] == (UINT8)sig[2] && t[3] == (UINT8)sig[3])
-            return t;
-    }
-
-    return NULL;
-}
-
-/* Разобрать FADT и _S5_ - один раз, при старте ядра */
-void acpi_power_init(void)
-{
-    ACPI_POWER *ap = &g_acpi_power;
-
-    ap->ok = FALSE;
-
-    const UINT8 *fadt = acpi_find_table("FACP");
-
-    if (fadt == NULL) {
-        ap->why = "no FADT table";
-        return;
-    }
-
-    UINT32 flen = *(const UINT32 *)(fadt + 4);
-
-    ap->smi_cmd = *(const UINT32 *)(fadt + 48);
-    ap->acpi_enable = fadt[52];
-    ap->pm1a_cnt = *(const UINT32 *)(fadt + 64);
-    ap->pm1b_cnt = *(const UINT32 *)(fadt + 68);
-
-    UINT64 dsdt = *(const UINT32 *)(fadt + 40);
-
-    if (flen >= 148 && *(const UINT64 *)(fadt + 140) != 0)
-        dsdt = *(const UINT64 *)(fadt + 140);    /* X_DSDT (ACPI 2.0+) */
-
-    if (ap->pm1a_cnt == 0) {
-        ap->why = "FADT has no PM1a control port (hardware-reduced ACPI)";
-        return;
-    }
-
-    if (dsdt == 0) {
-        ap->why = "no DSDT";
-        return;
-    }
-
-    const UINT8 *d = (const UINT8 *)P2V(dsdt);
-    UINT32 dlen = *(const UINT32 *)(d + 4);
-
-    if (d[0] != 'D' || d[1] != 'S' || d[2] != 'D' || d[3] != 'T' ||
-        dlen < 36 || dlen > 4u * 1024u * 1024u || !acpi_sum_ok(d, dlen)) {
-        ap->why = "DSDT is damaged";
-        return;
-    }
-
-    /* Ищем "_S5_" и за ним: 0x12 (Package), длина пакета (1-4
-       байта), число элементов, затем SLP_TYPa и SLP_TYPb - каждое
-       либо 0x0A <байт> (BytePrefix), либо голые 0x00 / 0x01
-       (ZeroOp / OneOp). Перед "_S5_" стоит 0x08 (NameOp), иногда
-       с префиксом пути '\\'. */
-    for (UINT32 i = 36; i + 8 < dlen; i++) {
+    for (UINT32 i = 38; i + 8 < dlen; i++) {
 
         if (d[i] != '_' || d[i + 1] != 'S' || d[i + 2] != '5' || d[i + 3] != '_')
             continue;
@@ -279,6 +212,8 @@ void acpi_power_init(void)
         UINT8 v[2];
 
         for (UINTN k = 0; k < 2; k++) {
+            if (p + 1 >= dlen)
+                return FALSE;
             if (d[p] == 0x0A) {
                 v[k] = d[p + 1];
                 p += 2;
@@ -288,14 +223,65 @@ void acpi_power_init(void)
             }
         }
 
-        ap->slp_typa = v[0];
-        ap->slp_typb = v[1];
-        ap->ok = TRUE;
-        ap->why = "ok";
+        *a = v[0];
+        *b = v[1];
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/* Подготовить выключение - один раз, после acpi_init */
+void acpi_power_init(void)
+{
+    ACPI_POWER *ap = &g_acpi_power;
+
+    ap->ok = FALSE;
+
+    if (!g_acpi.present) {
+        ap->why = "no ACPI tables";
         return;
     }
 
-    ap->why = "no _S5_ object in DSDT";
+    if (!g_acpi.have_fadt) {
+        ap->why = "no FADT table";
+        return;
+    }
+
+    ap->smi_cmd = g_acpi.smi_cmd;
+    ap->acpi_enable = g_acpi.acpi_enable;
+    ap->pm1a_cnt = g_acpi.pm1a_cnt;
+    ap->pm1b_cnt = g_acpi.pm1b_cnt;
+
+    if (ap->pm1a_cnt == 0) {
+        ap->why = "FADT has no PM1a control port (hardware-reduced ACPI)";
+        return;
+    }
+
+    UINT32 len = 0;
+    const UINT8 *t = acpi_table("DSDT", 0, &len);
+
+    if (t == NULL) {
+        ap->why = "no valid DSDT";
+        return;
+    }
+
+    if (acpi_find_s5(t, len, &ap->slp_typa, &ap->slp_typb)) {
+        ap->ok = TRUE;
+        ap->why = "ok (_S5_ in DSDT)";
+        return;
+    }
+
+    /* бывает, что _S5_ живёт в одной из SSDT */
+    for (UINTN n = 0; (t = acpi_table("SSDT", n, &len)) != NULL; n++) {
+        if (acpi_find_s5(t, len, &ap->slp_typa, &ap->slp_typb)) {
+            ap->ok = TRUE;
+            ap->why = "ok (_S5_ in SSDT)";
+            return;
+        }
+    }
+
+    ap->why = "no _S5_ object in DSDT/SSDT";
 }
 
 static void io_out16(UINT16 port, UINT16 v)

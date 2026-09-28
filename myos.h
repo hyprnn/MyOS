@@ -802,6 +802,102 @@ typedef struct __attribute__((packed)) {
     UINT16 iomap_base;
 } KX_TSS;
 
+/* ACPI: всё, что ядро узнало из таблиц (kernel/acpi.c) */
+#define ACPI_MAX_TABLES   48
+#define ACPI_MAX_CPUS     64
+#define ACPI_MAX_IOAPICS  8
+#define ACPI_MAX_ISOS     24
+
+typedef struct {
+    char    sig[5];
+    UINT64  phys;
+    UINT32  len;
+    UINT8   rev;
+    BOOLEAN sum_ok;
+    char    oem[7];
+    char    oem_table[9];
+} ACPI_TABLE_INFO;
+
+typedef struct {
+    UINT32  apic_id;
+    UINT32  uid;
+    BOOLEAN enabled;
+    BOOLEAN online_capable;
+    BOOLEAN x2;
+} ACPI_CPU;
+
+typedef struct {
+    UINT8  id;
+    UINT64 addr;
+    UINT32 gsi_base;
+    UINT32 count;       /* линий (узнаём из самого I/O APIC) */
+} ACPI_IOAPIC;
+
+typedef struct {       /* "IRQ N старого PC на самом деле - линия GSI" */
+    UINT8  bus, irq;
+    UINT32 gsi;
+    UINT16 flags;       /* полярность [1:0], срабатывание [3:2] */
+} ACPI_ISO;
+
+typedef struct {
+    BOOLEAN present;
+    const char *why;
+    UINT8   revision;
+    UINT64  rsdp, root;
+    BOOLEAN xsdt;
+    char    oem[7];
+
+    ACPI_TABLE_INFO tables[ACPI_MAX_TABLES];
+    UINTN   ntables;
+
+    /* MADT */
+    BOOLEAN have_madt;
+    UINT64  lapic_addr;
+    BOOLEAN pcat_compat;
+    ACPI_CPU cpus[ACPI_MAX_CPUS];
+    UINTN   ncpus, ncpus_enabled;
+    ACPI_IOAPIC ioapics[ACPI_MAX_IOAPICS];
+    UINTN   nioapics;
+    ACPI_ISO isos[ACPI_MAX_ISOS];
+    UINTN   nisos;
+    UINTN   n_lapic_nmi;
+
+    /* FADT */
+    BOOLEAN have_fadt;
+    UINT8   fadt_rev;
+    UINT16  sci_irq;
+    UINT32  smi_cmd;
+    UINT8   acpi_enable;
+    UINT32  pm1a_evt, pm1a_cnt, pm1b_cnt;
+    UINT32  pm_tmr;
+    BOOLEAN pm_tmr_32;
+    UINT8   century;
+    UINT16  boot_arch;
+    UINT32  fadt_flags;
+    BOOLEAN hw_reduced;
+    BOOLEAN reset_ok;
+    UINT8   reset_space;
+    UINT64  reset_addr;
+    UINT8   reset_value;
+    UINT64  dsdt;
+    UINT32  dsdt_len;
+    UINTN   n_ssdt;
+    UINT32  aml_bytes;
+
+    /* MCFG */
+    UINTN   n_mcfg;
+    UINT64  ecam_base;
+    UINT16  ecam_seg;
+    UINT8   ecam_bus_start, ecam_bus_end;
+
+    /* HPET */
+    BOOLEAN have_hpet, hpet_ok, hpet_64;
+    UINT64  hpet_addr;
+    UINT32  hpet_period_fs;
+    UINT8   hpet_timers;
+    UINT16  hpet_min_tick;
+} ACPI_INFO;
+
 /* ACPI: то, что нужно для выключения (kernel/power.c) */
 typedef struct {
     BOOLEAN ok;
@@ -1086,6 +1182,13 @@ extern UINT64 g_kheap_live_bytes;
 extern UINT64 g_kheap_bad_frees;
 extern UINT64 g_kmm_reclaimed_pages;
 extern ACPI_POWER g_acpi_power;
+extern ACPI_INFO g_acpi;
+extern UINT64  g_pci_ecam_base;
+extern UINT8   g_pci_ecam_bus_start;
+extern UINT8   g_pci_ecam_bus_end;
+extern BOOLEAN g_pci_ecam_active;
+extern UINT64  g_tsc_hz_hpet;
+extern UINT64  g_tsc_hz_pmtmr;
 extern EFI_RUNTIME_SERVICES g_krt;
 extern KX_IDT_ENTRY g_kidt[256] __attribute__((aligned(16)));
 extern volatile UINT64 g_kticks;
@@ -1203,6 +1306,7 @@ void print_hex(
 );
 
 /* --- drivers/pci.c --- */
+BOOLEAN pci_use_ecam(UINT64 base, UINT8 bus_start, UINT8 bus_end);
 UINT32 pci_config_read32(
     UINT8 bus, UINT8 dev, UINT8 func, UINT8 offset
 );
@@ -1679,7 +1783,7 @@ void kx_isr_dispatch(KX_ISR_FRAME *f);
 void kx_idt_set(UINTN vec, UINT64 handler);
 void kx_load_idt(void);
 void kx_pic_disable(void);
-UINTN kx_ioapic_mask_all(void);
+UINTN kx_ioapic_mask_all(UINT64 base);
 void kx_load_tss(UINT64 ist_df, UINT64 ist_nmi, UINT64 ist_mc, UINT64 rsp0);
 
 /* --- kernel/vmm.c --- */
@@ -1687,6 +1791,7 @@ BOOLEAN vmm_init(void);
 BOOLEAN vmm_map_page(UINT64 virt, UINT64 phys, UINT32 attr);
 void vmm_unmap_page(UINT64 virt);
 BOOLEAN vmm_map_mmio(UINT64 phys, UINT64 size, UINT32 cache);
+BOOLEAN vmm_ensure_mapped(UINT64 phys, UINT64 size, UINT32 cache);
 UINT64 vmm_virt_to_phys(UINT64 virt);
 UINT64 vmm_query(UINT64 virt);
 UINT64 vmm_alloc_stack(UINTN pages, const char *name);
@@ -1697,6 +1802,15 @@ VOID *kmalloc(UINTN size);
 VOID *kzalloc(UINTN size);
 BOOLEAN kfree(VOID *ptr);
 BOOLEAN kmalloc_selftest(char *report, UINTN cap);
+
+/* --- kernel/acpi.c --- */
+BOOLEAN acpi_init(void);
+const UINT8 *acpi_table(const char *sig, UINTN n, UINT32 *len_out);
+UINT64 acpi_hpet_counter(void);
+UINT64 acpi_hpet_measure_tsc_hz(void);
+UINT64 acpi_pmtimer_measure_tsc_hz(void);
+UINT32 acpi_current_apic_id(void);
+void kernel_cmd_acpi(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 
 /* --- kernel/power.c --- */
 BOOLEAN rtc_read(EFI_TIME *t);
@@ -1947,6 +2061,16 @@ static inline UINT32 mmio_read32(UINT64 addr)
 static inline void mmio_write32(UINT64 addr, UINT32 value)
 {
     *(volatile UINT32 *)P2V(addr) = value;
+}
+
+static inline UINT64 mmio_read64(UINT64 addr)
+{
+    return *(volatile UINT64 *)P2V(addr);
+}
+
+static inline void mmio_write64(UINT64 addr, UINT64 value)
+{
+    *(volatile UINT64 *)P2V(addr) = value;
 }
 
 static inline UINT64 rdtsc(void)
