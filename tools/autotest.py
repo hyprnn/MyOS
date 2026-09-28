@@ -237,6 +237,14 @@ def main():
             ('acpi\n', 'MyOS uses it', 15),
             ('', "used by 'reboot'", 5),
         ], ['-machine', 'q35']))
+        # часовые пояса: часы машины - 15 января 10:00 UTC (зима):
+        # Москва 13:00 (UTC+3), Иерусалим 12:00 (IST, UTC+2)
+        runs.append(('timezone-winter', [
+            (None, "Type 'help'", 90),
+            ('tz msk\n', 'Moscow (MSK, UTC+3) - now 13:0', 15),
+            ('tz jer\n', 'Jerusalem (IST, UTC+2, winter time) - now 12:0', 15),
+            ('time\n', 'Jerusalem (IST', 15),
+        ], ['-rtc', 'base=2026-01-15T10:00:00']))
         runs.append(('crash-write', [
             (None, "Type 'help'", 90),
             ('crash write\n', 'Page Fault: WRITE', 15),

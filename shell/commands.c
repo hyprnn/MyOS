@@ -155,6 +155,7 @@ void run_command(
         print(
             out,
             "  date          - show current date (CMOS clock)\n"
+            "  tz [msk|jer]  - time zone: Moscow or Jerusalem (GUI: click the clock)\n"
         );
 
         print(
@@ -785,10 +786,10 @@ void run_command(
                 now.Second
             );
 
-            print(
-                out,
-                "\n"
-            );
+            /* какой пояс - чтобы было видно, чьё это время */
+            char tzd[64];
+            tz_describe(tzd, sizeof(tzd));
+            kprintf(out, "  %s\n", tzd);
 
         } else {
 
@@ -797,6 +798,30 @@ void run_command(
                 "Time service unavailable.\n"
             );
         }
+
+
+    /* --------------------------------------------------------
+     * tz - часовой пояс: Москва / Иерусалим (kernel/tz.c)
+     * -------------------------------------------------------- */
+
+    } else if (streq(line, "tz")) {
+
+        kernel_cmd_tz(out, "");
+
+    } else if (starts_with(line, "tz ")) {
+
+        char arg[16];
+        UINTN k = 0;
+
+        for (CHAR16 *c = line + 3; *c && k + 1 < sizeof(arg); c++) {
+            CHAR16 ch = *c;
+            if (ch >= 'A' && ch <= 'Z')
+                ch = (CHAR16)(ch - 'A' + 'a');
+            arg[k++] = (ch < 128) ? (char)ch : '?';
+        }
+
+        arg[k] = '\0';
+        kernel_cmd_tz(out, arg);
 
 
     /* --------------------------------------------------------
@@ -861,86 +886,15 @@ void run_command(
 
     } else if (streq(line, "uptime")) {
 
-        if (
-            !g_have_boot_time ||
-            !st->RuntimeServices->GetTime
-        ) {
+        /* Раньше считалось как "часы сейчас минус часы при
+           загрузке" - ломалось после суток работы и теперь сбилось
+           бы при смене часового пояса. Ядро само знает, сколько
+           прошло с запуска (TSC), - берём это. */
+        UINT64 secs = kx_uptime_us() / 1000000u;
 
-            print(
-                out,
-                "Uptime unavailable.\n"
-            );
-
-        } else {
-
-            EFI_TIME now;
-
-
-            if (
-                st->RuntimeServices->GetTime(
-                    &now,
-                    NULL
-                ) == EFI_SUCCESS
-            ) {
-
-                INT64 secs =
-                    (INT64)now.Hour * 3600 +
-                    (INT64)now.Minute * 60 +
-                    now.Second
-                    -
-                    (
-                        (INT64)g_boot_time.Hour * 3600 +
-                        (INT64)g_boot_time.Minute * 60 +
-                        g_boot_time.Second
-                    );
-
-
-                if (secs < 0)
-                    secs += 86400;
-
-
-                print(
-                    out,
-                    "up "
-                );
-
-
-                print_uint(
-                    out,
-                    (UINT64)secs / 3600
-                );
-
-
-                print(
-                    out,
-                    "h "
-                );
-
-
-                print_uint(
-                    out,
-                    ((UINT64)secs / 60) % 60
-                );
-
-
-                print(
-                    out,
-                    "m "
-                );
-
-
-                print_uint(
-                    out,
-                    (UINT64)secs % 60
-                );
-
-
-                print(
-                    out,
-                    "s\n"
-                );
-            }
-        }
+        kprintf(out, "up %llud %lluh %llum %llus\n",
+                secs / 86400u, (secs / 3600u) % 24u,
+                (secs / 60u) % 60u, secs % 60u);
 
 
     /* --------------------------------------------------------

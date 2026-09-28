@@ -1812,6 +1812,18 @@ UINT64 acpi_pmtimer_measure_tsc_hz(void);
 UINT32 acpi_current_apic_id(void);
 void kernel_cmd_acpi(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 
+/* --- kernel/tz.c --- */
+#define TZ_MOSCOW     0
+#define TZ_JERUSALEM  1
+extern UINTN g_tz;
+INT32 tz_offset_minutes(const EFI_TIME *utc);
+const char *tz_abbrev(const EFI_TIME *utc);
+const char *tz_city(void);
+void tz_to_local(EFI_TIME *t);
+void tz_toggle(void);
+void tz_describe(char *buf, UINTN cap);
+void kernel_cmd_tz(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
+
 /* --- kernel/power.c --- */
 BOOLEAN rtc_read(EFI_TIME *t);
 void kx_reboot(void) __attribute__((noreturn));

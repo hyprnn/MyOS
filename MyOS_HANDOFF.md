@@ -34,8 +34,9 @@ DSDT/SSDT) не исполняется: решение — взять библи
 make            # BOOTX64.EFI + kernel.elf, инкрементально; оба -> esp/EFI/BOOT/
 make run        # ISO + QEMU, лог COM1 в терминал (-serial stdio)
 make run-tablet # мышь-планшет (без «стенок» в окне QEMU)
-make test       # tools/autotest.py: 5 запусков QEMU (~1.5 мин): основной
-                # (-smp 2), q35 (ECAM, сброс через FADT) и
+make test       # tools/autotest.py: 6 запусков QEMU (~2 мин): основной
+                # (-smp 2), q35 (ECAM, сброс через FADT), зимние часы
+                # (-rtc base=2026-01-15: МСК 13:00 / Иерусалим 12:00) и
                 # crash write / crash stack / crash null (экраны паники)
 ```
 Опции автотеста: `--quick` (без crash-запусков), `--mem 5G`,
@@ -56,7 +57,7 @@ make test       # tools/autotest.py: 5 запусков QEMU (~1.5 мин): ос
 | `bootinfo.h` | паспорт загрузки `MYOS_BOOT_INFO` + раскладка адресов: HHDM `0xFFFF800000000000`, стеки `0xFFFFFE8000000000`, ядро `0xFFFFFFFF80000000`; свои типы памяти `MYOS_MEM_KERNEL/LOADER_TEMP` |
 | `myos.h` | общий заголовок; `P2V()`/`V2P()` (физ. адрес <-> указатель прямого отображения), `mmio_read32/write32` берут ФИЗИЧЕСКИЙ адрес и сами переводят |
 | `lib/` | `libc.c` (memcpy/memset), `string.c` (+`kstreq`), `kprintf.c` (`kprintf`, `ksnprintf`, `klog` — только COM1; `%S` = CHAR16*), `serial.c` |
-| `kernel/` | `kmain.c` порядок запуска; `kernel.ld`; `vmm.c` таблицы страниц (код RX, rodata R, данные RW+NX, RAM WB, не-RAM ниже 4 ГиБ UC, экран WC через PAT, нижняя половина пуста), стеки с защитными страницами; `pmm.c` страницы (свободны также BootServices*/Loader*); `kmalloc.c` слабы 16..1024 + крупные страницами; `cpu.c` GDT+TSS (IST1 #DF, IST2 NMI, IST3 #MC), IDT, экран паники с разбором #PF/#DF; `acpi.c` разбор ACPI (RSDP→XSDT/RSDT, контрольные суммы, MADT: ядра/I/O APIC/переназначения IRQ, FADT: порты PM, таймер PM, регистр сброса, век RTC, MCFG: ECAM, HPET: запуск и замер TSC; команда `acpi`); `power.c` CMOS-часы (век из FADT), reboot (регистр FADT → 0xCF9 → 8042 → triple fault), shutdown (`_S5_` из DSDT/SSDT, QEMU-порты); `shim.c` таблица `g_kst` для шелла/GUI (свои BootServices/RuntimeServices, без прошивки); `kcon.c`, `time.c`, `kcmds.c` (kinfo/usb/mousetest/mem/boot/vm/crash) |
+| `kernel/` | `kmain.c` порядок запуска; `kernel.ld`; `vmm.c` таблицы страниц (код RX, rodata R, данные RW+NX, RAM WB, не-RAM ниже 4 ГиБ UC, экран WC через PAT, нижняя половина пуста), стеки с защитными страницами; `pmm.c` страницы (свободны также BootServices*/Loader*); `kmalloc.c` слабы 16..1024 + крупные страницами; `cpu.c` GDT+TSS (IST1 #DF, IST2 NMI, IST3 #MC), IDT, экран паники с разбором #PF/#DF; `acpi.c` разбор ACPI (RSDP→XSDT/RSDT, контрольные суммы, MADT: ядра/I/O APIC/переназначения IRQ, FADT: порты PM, таймер PM, регистр сброса, век RTC, MCFG: ECAM, HPET: запуск и замер TSC; команда `acpi`); `tz.c` часовые пояса: CMOS хранит UTC, `krt_get_time` отдаёт местное время Москвы (UTC+3) или Иерусалима (UTC+2/+3, израильские правила летнего времени; проверено против zoneinfo на 2015–2035), переключение `tz msk|jer|toggle`, клик по часам в GUI или T; по умолчанию Москва, выбор не сохраняется (диска нет); `power.c` CMOS-часы (век из FADT), reboot (регистр FADT → 0xCF9 → 8042 → triple fault), shutdown (`_S5_` из DSDT/SSDT, QEMU-порты); `shim.c` таблица `g_kst` для шелла/GUI (свои BootServices/RuntimeServices, без прошивки); `kcon.c`, `time.c`, `kcmds.c` (kinfo/usb/mousetest/mem/boot/vm/crash) |
 | `drivers/` | `pci.c` (порты или ECAM после `pci_use_ecam` со сверкой), `xhci_common.c` (общие с загрузчиком), `usb.c` (xHCI+HID, все DMA-адреса через `P2V`), `hid.c`, `keyboard.c`, `ps2.c` |
 | `gui/` | `gui.c` цикл `start`, `desktop.c` (вывод кадра без мигания: `gui_present_frame`/`gui_present_cursor`), `draw.c`, `minesweeper*.c`, `terminal.c` (+`gui_term_exec`) |
 | `shell/` | `commands.c`, `console.c`, `readline.c`, `fs.c`, `fetch.c`, `editor.c`, `calc.c`, `history.c` |

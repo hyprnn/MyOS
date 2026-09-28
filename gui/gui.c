@@ -509,7 +509,8 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
     BOOLEAN dirty = TRUE;
     UINTN clock_tick = 0;
-    char clock_text[9];
+    /* "ЧЧ:ММ:СС MSK" + '\0'; пояс переключается кликом по часам */
+    char clock_text[13];
 
     clock_text[0] = '-';
     clock_text[1] = '-';
@@ -520,6 +521,7 @@ void gui_start(EFI_SYSTEM_TABLE *st)
     clock_text[6] = '-';
     clock_text[7] = '-';
     clock_text[8] = '\0';
+    clock_text[12] = '\0';
 
     for (;;) {
 
@@ -538,9 +540,9 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                 ) == EFI_SUCCESS
             ) {
 
-                char new_clock[9];
+                char new_clock[13];
 
-                for (UINTN k = 0; k < 9; k++)
+                for (UINTN k = 0; k < 13; k++)
                     new_clock[k] = clock_text[k];
 
                 gui_uint2_to_str(now.Hour, new_clock);
@@ -552,7 +554,18 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                    только часы ("09"). Возвращаем разделители. */
                 new_clock[2] = ':';
                 new_clock[5] = ':';
-                new_clock[8] = '\0';
+
+                /* пояс: Москва - MSK; Иерусалим - IST зимой, IDT
+                   летом (GetTime ядра ставит флаг летнего времени) */
+                const char *abbr =
+                    (g_tz == TZ_MOSCOW) ? "MSK" :
+                    (now.Daylight & 0x02) ? "IDT" : "IST";
+
+                new_clock[8] = ' ';
+                new_clock[9] = abbr[0];
+                new_clock[10] = abbr[1];
+                new_clock[11] = abbr[2];
+                new_clock[12] = '\0';
 
                 /* Перерисовываем, только если на часах РЕАЛЬНО
                    сменилась цифра. Раньше кадр помечался
@@ -560,7 +573,7 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                    в секунду) - и курсор на ноутбуке моргал. */
                 BOOLEAN changed = FALSE;
 
-                for (UINTN k = 0; k < 8; k++) {
+                for (UINTN k = 0; k < 12; k++) {
                     if (new_clock[k] != clock_text[k])
                         changed = TRUE;
                     clock_text[k] = new_clock[k];
@@ -935,6 +948,15 @@ void gui_start(EFI_SYSTEM_TABLE *st)
             if (cur_y > (INTN)fb_h - GUI_CURSOR_SIZE)
                 cur_y = (INTN)fb_h - GUI_CURSOR_SIZE;
 
+            /* T на рабочем столе - тоже сменить часовой пояс
+               (для тех, кто без мыши) */
+            if (!in_window && !in_minesweeper && !in_terminal &&
+                (key.UnicodeChar == L't' || key.UnicodeChar == L'T')) {
+                tz_toggle();
+                clock_tick = 0;
+                continue;
+            }
+
             /* Enter работает как клик левой кнопкой мыши */
             if (
                 key.ScanCode == 0x00 &&
@@ -943,6 +965,22 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
                 INTN cx = cur_x + GUI_CURSOR_SIZE / 2;
                 INTN cy = cur_y + GUI_CURSOR_SIZE / 2;
+
+                /* Клик по часам на панели задач - сменить часовой
+                   пояс (Москва <-> Иерусалим). Прямоугольник часов -
+                   тот же, что рисует gui_draw_desktop. */
+                if (!in_window && !in_minesweeper && !in_terminal) {
+
+                    UINTN clk_w = gui_text_width(clock_text, 1) + 12;
+                    INTN  clk_x = (INTN)fb_w - (INTN)clk_w - 3;
+
+                    if (gui_point_in_rect(cx, cy, clk_x, 3, clk_w,
+                                          (UINTN)GUI_TASKBAR_H - 6)) {
+                        tz_toggle();
+                        clock_tick = 0;     /* перечитать время сразу */
+                        continue;
+                    }
+                }
 
                 if (!in_window && menu_open) {
 

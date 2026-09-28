@@ -6,6 +6,7 @@ typedef signed char        INT8;
 typedef unsigned short     UINT16;
 typedef unsigned int       UINT32;
 typedef unsigned long long UINT64;
+typedef short              INT16;
 typedef int                INT32;
 typedef long long          INT64;
 
@@ -50,7 +51,9 @@ typedef struct {
     UINT8  Second;
     UINT8  Pad1;
     UINT32 Nanosecond;
-    INT64  TimeZone;
+    INT16  TimeZone;    /* минут от UTC; по спецификации UEFI - 16 бит
+                           (раньше здесь ошибочно стояло INT64, и
+                           структура была длиннее, чем у прошивки) */
     UINT8  Daylight;
     UINT8  Pad2;
 } EFI_TIME;

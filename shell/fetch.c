@@ -478,12 +478,13 @@ void cmd_fetch(
                 g_boot_time.Second;
 
 
-            INT64 secs =
-                now_secs - boot_secs;
+            /* время работы - по счётчику ядра (TSC), а не разностью
+               показаний часов: так оно верно и после суток работы, и
+               после смены часового пояса */
+            INT64 secs = (INT64)(kx_uptime_us() / 1000000u);
 
-
-            if (secs < 0)
-                secs += 86400;
+            (void)now_secs;
+            (void)boot_secs;
 
 
             print_label(

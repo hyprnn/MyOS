@@ -285,7 +285,14 @@ EFI_STATUS EFIAPI krt_get_time(EFI_TIME *t, VOID *caps)
     if (t == NULL)
         return K_EFI_INVALID_PARAMETER;
 
-    return rtc_read(t) ? EFI_SUCCESS : K_EFI_UNSUPPORTED;
+    /* микросхема часов хранит UTC; наружу - местное время
+       выбранного пояса (Москва / Иерусалим, см. tz.c) */
+    if (!rtc_read(t))
+        return K_EFI_UNSUPPORTED;
+
+    tz_to_local(t);
+
+    return EFI_SUCCESS;
 }
 
 VOID EFIAPI krt_reset_system(

@@ -22,7 +22,7 @@
 /* "MYOSBOOT" в ASCII - ядро проверяет, что ему дали именно
    паспорт, а не мусор */
 #define MYOS_BOOT_MAGIC    0x544F4F42534F594Dull
-#define MYOS_BOOT_VERSION  1
+#define MYOS_BOOT_VERSION  2   /* 2: EFI_TIME по спецификации (16 байт) */
 
 /*
  * Раскладка виртуальной памяти (одинаковая для загрузчика и ядра).
