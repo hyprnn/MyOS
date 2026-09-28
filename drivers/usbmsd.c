@@ -19,13 +19,16 @@
  *   REQUEST SENSE (0x03)    - а почему не готов? (сбрасывает ошибку)
  *   READ CAPACITY(10) (0x25)- сколько секторов и какого размера
  *   READ(10) (0x28)         - прочитать секторы
+ *   WRITE(10) (0x2A)        - записать секторы
  *
- * Это первый "диск" MyOS: этап 5 (файловая система) будет читать
- * флешку через usb_disk_read. Запись - там же, на этапе 5.
+ * Для остальной системы флешка - блочное устройство "usbN"
+ * (drivers/blk.c): оно зовёт usb_msd_rw.
  */
 #include "myos.h"
 
 KX_MSD g_kx_msd[KX_MAX_MSD];
+
+static UINT32 g_msd_serial = 0;     /* счётчик подключений */
 
 /*
  * Подготовить флешку: записи, кольца, буферы и две bulk-конечные
@@ -52,6 +55,7 @@ INTN kx_msd_prepare(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di,
 
     raw_zero_mem((volatile UINT8 *)m, sizeof(*m));
 
+    m->serial = ++g_msd_serial;
     m->dev = (UINT8)di;
     m->iface = c->iface;
     m->in_addr = c->in_addr;
@@ -292,216 +296,130 @@ void kx_msd_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN mi)
            m->vendor, m->product, mib, m->blocks, m->block_size);
 }
 
-/* Номер флешки -> запись (n-я по счёту среди подключённых) */
-static KX_MSD *kx_msd_nth(UINTN n)
-{
-    for (UINTN i = 0; i < KX_MAX_MSD; i++)
-        if (g_kx_msd[i].used) {
-            if (n == 0)
-                return &g_kx_msd[i];
-            n--;
-        }
-
-    return NULL;
-}
-
 /*
- * Прочитать count секторов, начиная с lba, в dst (обычная память
- * ядра). Для этапа 5: файловая система будет читать через это.
+ * Прочитать или записать count секторов, начиная с lba. mi - номер
+ * записи в g_kx_msd, serial - "паспорт" подключения: если флешку
+ * вынули и на её место встала другая, serial не совпадёт и мы ничего
+ * не испортим. buf - обычная память ядра; данные идут через буфер
+ * флешки (4 КиБ за раз).
+ *
+ * Под мьютексом контроллера: пока идёт обмен, поток usb не начнёт
+ * настраивать новое устройство (ответы пришли бы в один "ящик").
  */
-static BOOLEAN usb_disk_read_locked(UINTN disk, UINT64 lba, UINT32 count, VOID *dst)
+BOOLEAN usb_msd_rw(UINTN mi, UINT32 serial, UINT64 lba, UINT32 count, VOID *buf, BOOLEAN write)
 {
-    KX_MSD *m = kx_msd_nth(disk);
-
-    if (m == NULL || !m->ready || lba + count > m->blocks || lba > 0xFFFFFFFFull)
+    if (mi >= KX_MAX_MSD)
         return FALSE;
 
-    UINT8 *out = (UINT8 *)dst;
+    kmutex_lock(&g_usb_mutex);
+
+    KX_MSD *m = &g_kx_msd[mi];
+
+    if (!m->used || !m->ready || m->serial != serial ||
+        lba + count > m->blocks || lba + count > 0xFFFFFFFFull) {
+        kmutex_unlock(&g_usb_mutex);
+        return FALSE;
+    }
+
+    UINT8 *p = (UINT8 *)buf;
     UINT32 per = 4096u / m->block_size;     /* секторов за одну передачу */
+    BOOLEAN ok = TRUE;
 
     while (count > 0) {
 
         UINT32 n = (count < per) ? count : per;
+        UINT32 bytes = n * m->block_size;
         UINT8 cdb[16];
+        volatile UINT8 *dma = (volatile UINT8 *)P2V(m->data_buf);
 
         raw_zero_mem((volatile UINT8 *)cdb, 16);
-        cdb[0] = 0x28;
+        cdb[0] = write ? 0x2A : 0x28;
         cdb[2] = (UINT8)(lba >> 24); cdb[3] = (UINT8)(lba >> 16);
         cdb[4] = (UINT8)(lba >> 8);  cdb[5] = (UINT8)lba;
         cdb[7] = (UINT8)(n >> 8);    cdb[8] = (UINT8)n;
 
-        if (kx_msd_scsi(m, cdb, 10, n * m->block_size, TRUE) != 0) {
-            m->errors++;
-            return FALSE;
+        if (write)
+            for (UINT32 i = 0; i < bytes; i++)
+                dma[i] = p[i];
+
+        UINT8 st = kx_msd_scsi(m, cdb, 10, bytes, !write);
+
+        if (st != 0) {
+            /* одна повторная попытка (флешки иногда отвечают "занята") */
+            if (st != 0xFF) {
+                UINT8 sense[16];
+                raw_zero_mem((volatile UINT8 *)sense, 16);
+                sense[0] = 0x03;
+                sense[4] = 18;
+                kx_msd_scsi(m, sense, 6, 18, TRUE);
+            }
+
+            if (write)
+                for (UINT32 i = 0; i < bytes; i++)
+                    dma[i] = p[i];
+
+            st = kx_msd_scsi(m, cdb, 10, bytes, !write);
         }
 
-        volatile UINT8 *src = (volatile UINT8 *)P2V(m->data_buf);
+        if (st != 0) {
+            m->errors++;
+            ok = FALSE;
+            break;
+        }
 
-        for (UINT32 i = 0; i < n * m->block_size; i++)
-            out[i] = src[i];
+        if (!write)
+            for (UINT32 i = 0; i < bytes; i++)
+                p[i] = dma[i];
 
-        out += n * m->block_size;
+        p += bytes;
         lba += n;
         count -= n;
-        m->reads++;
+
+        if (write)
+            m->writes++;
+        else
+            m->reads++;
     }
 
-    return TRUE;
-}
-
-/* ================================================================
- * Команда disk
- * ================================================================ */
-
-static void disk_hexdump(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const UINT8 *p, UINTN n)
-{
-    for (UINTN row = 0; row < n; row += 16) {
-
-        char line[96];
-        UINTN k = ksnprintf(line, sizeof(line), "  %03x: ", (UINT32)row);
-
-        for (UINTN i = 0; i < 16; i++)
-            k += ksnprintf(line + k, sizeof(line) - k, "%02x ", p[row + i]);
-
-        k += ksnprintf(line + k, sizeof(line) - k, " ");
-
-        for (UINTN i = 0; i < 16 && k + 2 < sizeof(line); i++) {
-            UINT8 c = p[row + i];
-            line[k++] = (c >= 32 && c < 127) ? (char)c : '.';
-        }
-
-        line[k] = '\0';
-        kprintf(out, "%s\n", line);
-    }
-}
-
-/* Снаружи - под мьютексом контроллера: пока читаем флешку, поток
-   usb не начнёт настраивать новое устройство (ответы контроллера
-   пришли бы в один и тот же "ящик") */
-BOOLEAN usb_disk_read(UINTN disk, UINT64 lba, UINT32 count, VOID *dst)
-{
-    kmutex_lock(&g_usb_mutex);
-    BOOLEAN ok = usb_disk_read_locked(disk, lba, count, dst);
     kmutex_unlock(&g_usb_mutex);
 
     return ok;
 }
 
-static void kernel_cmd_disk_locked(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
-
-void kernel_cmd_disk(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
+/* Флешка с этим "паспортом" ещё на месте? */
+BOOLEAN usb_msd_alive(UINTN mi, UINT32 serial)
 {
+    if (mi >= KX_MAX_MSD)
+        return FALSE;
+
     kmutex_lock(&g_usb_mutex);
-    kernel_cmd_disk_locked(out, arg);
+    BOOLEAN alive = g_kx_msd[mi].used && g_kx_msd[mi].ready &&
+                    g_kx_msd[mi].serial == serial;
     kmutex_unlock(&g_usb_mutex);
+
+    return alive;
 }
 
-static void kernel_cmd_disk_locked(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
+/* Сведения о готовой флешке mi (для регистрации диска) */
+BOOLEAN usb_msd_info(UINTN mi, UINT32 *serial, UINT64 *blocks, UINT32 *bsize,
+                     char *model, UINTN cap)
 {
-    kernel_poll_input();       /* подобрать свежие подключения */
+    if (mi >= KX_MAX_MSD)
+        return FALSE;
 
-    if (arg[0] == '\0') {
+    kmutex_lock(&g_usb_mutex);
 
-        UINTN n = 0;
+    KX_MSD *m = &g_kx_msd[mi];
+    BOOLEAN ok = m->used && m->ready;
 
-        for (UINTN i = 0; i < KX_MAX_MSD; i++) {
-
-            KX_MSD *m = &g_kx_msd[i];
-
-            if (!m->used)
-                continue;
-
-            char path[32];
-            kx_dev_path(&g_kx_devs[m->dev], path, sizeof(path));
-
-            if (m->ready) {
-                UINT64 mib = (m->blocks * m->block_size) >> 20;
-                kprintf(out, "disk %u: \"%s %s\" on USB port %s, %llu MiB "
-                             "(%llu sectors x %u bytes)\n",
-                        (UINT32)n, m->vendor, m->product, path, mib,
-                        m->blocks, m->block_size);
-            } else {
-                kprintf(out, "disk %u: \"%s %s\" on USB port %s - %s\n",
-                        (UINT32)n, m->vendor, m->product, path, m->note);
-            }
-
-            n++;
-        }
-
-        if (n == 0)
-            print(out, "No USB drives. Plug in a flash drive - it is picked up automatically.\n");
-        else
-            print(out, "Read a sector: disk read <sector> [disk number]  (read-only for now)\n");
-
-        return;
+    if (ok) {
+        *serial = m->serial;
+        *blocks = m->blocks;
+        *bsize = m->block_size;
+        ksnprintf(model, cap, "%s %s", m->vendor, m->product);
     }
 
-    if (arg[0] == 'r' && arg[1] == 'e' && arg[2] == 'a' && arg[3] == 'd') {
+    kmutex_unlock(&g_usb_mutex);
 
-        const char *p = arg + 4;
-        UINT64 lba = 0;
-        UINTN disk = 0;
-
-        while (*p == ' ') p++;
-        while (*p >= '0' && *p <= '9') lba = lba * 10u + (UINT64)(*p++ - '0');
-        while (*p == ' ') p++;
-        while (*p >= '0' && *p <= '9') disk = disk * 10u + (UINTN)(*p++ - '0');
-
-        KX_MSD *m = kx_msd_nth(disk);
-
-        if (m == NULL || !m->ready) {
-            print(out, "No such ready disk (see 'disk').\n");
-            return;
-        }
-
-        UINT8 *buf = (UINT8 *)kmalloc(m->block_size);
-
-        if (buf == NULL) {
-            print(out, "Out of memory.\n");
-            return;
-        }
-
-        if (!usb_disk_read(disk, lba, 1, buf)) {
-            kprintf(out, "Read of sector %llu failed.\n", lba);
-            kfree(buf);
-            return;
-        }
-
-        kprintf(out, "disk %u, sector %llu (first 256 of %u bytes):\n",
-                (UINT32)disk, lba, m->block_size);
-        disk_hexdump(out, buf, 256);
-
-        /* что это за сектор - если узнаём */
-        if (m->block_size >= 512 && buf[510] == 0x55 && buf[511] == 0xAA) {
-            if (lba == 0) {
-                print(out, "Boot signature 55 AA: this is an MBR. Partitions:\n");
-                for (UINTN i = 0; i < 4; i++) {
-                    const UINT8 *e = buf + 446 + i * 16;
-                    UINT32 start = e[8] | (e[9] << 8) | (e[10] << 16) | ((UINT32)e[11] << 24);
-                    UINT32 size = e[12] | (e[13] << 8) | (e[14] << 16) | ((UINT32)e[15] << 24);
-                    if (e[4] == 0)
-                        continue;
-                    kprintf(out, "  #%u type 0x%02x%s, start %u, %u MiB\n",
-                            (UINT32)i + 1, e[4],
-                            e[4] == 0xEE ? " (GPT protective)" :
-                            (e[4] == 0x0B || e[4] == 0x0C) ? " (FAT32)" :
-                            e[4] == 0x07 ? " (NTFS/exFAT)" :
-                            e[4] == 0x83 ? " (Linux)" : "",
-                            start, (UINT32)(((UINT64)size * m->block_size) >> 20));
-                }
-            } else {
-                print(out, "Boot signature 55 AA at the end.\n");
-            }
-        }
-
-        if (buf[0] == 'E' && buf[1] == 'F' && buf[2] == 'I' && buf[3] == ' ' &&
-            buf[4] == 'P' && buf[5] == 'A' && buf[6] == 'R' && buf[7] == 'T')
-            print(out, "\"EFI PART\": this is a GPT header.\n");
-
-        kfree(buf);
-        return;
-    }
-
-    print(out, "Usage: disk             - list USB drives\n");
-    print(out, "       disk read N [D]  - show sector N of drive D (default 0)\n");
+    return ok;
 }

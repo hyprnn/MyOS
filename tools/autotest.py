@@ -22,6 +22,8 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
 Выход: 0 - все проверки прошли, 1 - что-то не так (лог сохранён).
 """
 import argparse, json, os, re, socket, struct, subprocess, sys, tempfile, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fatimg
 
 # ------------------------------------------------------------ FAT16 image
 
@@ -124,7 +126,8 @@ class VM:
                 return r
 
     KEYS = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash',
-            '=': 'equal', ',': 'comma', '*': 'shift-8', '_': 'shift-minus', ':': 'shift-semicolon'}
+            '=': 'equal', ',': 'comma', '*': 'shift-8', '_': 'shift-minus', ':': 'shift-semicolon',
+            '"': 'shift-apostrophe', "'": 'apostrophe', '~': 'shift-grave_accent'}
 
     def type(self, text):
         for ch in text:
@@ -173,17 +176,41 @@ class VM:
 # ------------------------------------------------------------ the test
 
 
-def make_stick_image(path):
-    """Тестовая "флешка": MBR с разделом FAT32 и метками"""
-    img = bytearray(16 * 1024 * 1024)
-    img[0:16] = b'MYOS TEST STICK!'
-    e = bytearray(16)
-    e[4] = 0x0C
-    struct.pack_into('<II', e, 8, 2048, 32768 - 2048)
-    img[446:462] = e
-    img[510], img[511] = 0x55, 0xAA
-    img[2048 * 512:2048 * 512 + 11] = b'HELLO MYOS!'
-    open(path, 'wb').write(img)
+BIG_DATA = bytes((i * 7) & 255 for i in range(300000))
+
+
+def make_test_disk(path, mib, bits, scheme, label):
+    """Диск с FAT и файлами "как с Linux": короткое и длинное имя,
+    папка, большой файл (300 000 байт, много кластеров)"""
+    b = fatimg.FatBuilder(mib * 2048 - 4096, bits, label)
+    b.add_file(b.root, 'HOST.TXT', b'Hello from the host!\n')
+    b.add_file(b.root, 'Long File Name From Linux.txt', b'long name ok\n')
+    d = b.mkdir(b.root, 'docs')
+    b.add_file(d, 'readme.md', b'# readme\n')
+    b.add_file(b.root, 'BIG.BIN', BIG_DATA)
+    fatimg.make_disk(path, mib, b.build(), scheme)
+
+
+def check_disk(path, expect):
+    """Проверить образ НЕЗАВИСИМЫМ читателем FAT (как это сделал бы
+    Linux): целостность + ожидаемые файлы. expect: {путь: байты или
+    None (файла быть не должно)}"""
+    img = bytearray(open(path, 'rb').read())
+    parts = fatimg.partitions(img)
+    if not parts:
+        return ['no FAT volume found']
+    r = fatimg.FatReader(img, parts[0][0])
+    problems = r.fsck()
+    for p, want in expect.items():
+        got = r.read(p)
+        if want is None:
+            if got is not None:
+                problems.append('%s should be gone' % p)
+        elif got != want:
+            problems.append('%s: expected %r..., got %r...' % (p, want[:30], (got or b'')[:30]))
+        elif p.rsplit('/', 1)[-1] not in [e[0] for e in r.listdir(r.lookup(p.rsplit('/', 1)[0] or '/')[2])]:
+            problems.append('%s: the exact name (case) is not in the folder' % p)
+    return problems
 
 
 DEFAULT_DEVICES = ['qemu-xhci', 'usb-mouse', 'usb-kbd']
@@ -229,7 +256,8 @@ def run_steps(a, work, steps, name, extra=(), devices=None):
             found = True
         else:
             found = vm.wait_for(expect, timeout, since=mark if keys else 0)
-        print('%-4s %-14s -> %s' % ('PASS' if found else 'FAIL', label, expect))
+        print('%-4s %-14s -> %s' % ('PASS' if found else 'FAIL', label,
+                                    expect.replace('\r', '\\r').replace('\n', '\\n')))
         if not found:
             ok = False
             break
@@ -273,6 +301,9 @@ def main():
         ('calc 6 * 7\n', '42', 15),
         ('time\n', ':', 15),
         ('cpu\n', 're:CPU load \\(last second[^)]*\\): [0-9]\\.[0-9]%', 15),
+        ('ls /\n', 'RAM disk', 15),
+        ('write memo.txt hi\n', 'memo.txt is now 3 bytes', 15),
+        ('cat memo.txt\n', 'hi', 15),
         ('', 'USB controller (xHCI)', 5),
         # этап 4: потоки
         ('ps\n', 're:idle +(ready|running)', 15),
@@ -293,8 +324,9 @@ def main():
             ('', 'USB events: MSI', 5),
             ('usb\n', 'hub: 8 ports', 15),
             ('', 'USB drive, ready', 5),
-            ('disk read 2048\n', 'HELLO MYOS!', 20),
+            ('disk read 2048\n', 'FAT boot sector', 20),
             ('disk read 0\n', 'this is an MBR', 20),
+            ('cat /usb0p1/host.txt\n', 'Hello from the host!', 20),
             ({'qmp': ('device_add', {'driver': 'usb-mouse', 'bus': 'xhci.0',
                                      'port': '2.3', 'id': 'hm'})},
              're:usb event: .*connected 0627:0001 - HID, active', 20),
@@ -304,7 +336,7 @@ def main():
             ({'qmp': ('device_del', {'id': 'hm'})},
              're:usb event: .*disconnected 0627:0001', 20),
             ('usb\n', '1 removed', 15),
-        ], ['-drive', 'if=none,id=stick,format=raw,file=@WORK@/stick.img'],
+        ], ['-drive', 'if=none,id=stick,format=raw,file=@WORK@/tree.img'],
            ['qemu-xhci,id=xhci', 'usb-kbd,bus=xhci.0,port=1', 'usb-hub,bus=xhci.0,port=2',
             'usb-storage,bus=xhci.0,port=2.2,drive=stick']))
         # только PS/2: клавиатура по IRQ 1, мышь по IRQ 12
@@ -336,12 +368,87 @@ def main():
             ({'key': 'esc'}, 'gui: left', 10),
             ('', 'SLEEP CANCELLED', 1),
         ]))
+        # диски и файлы (этап 5): флешка (MBR+FAT32), SATA-диск через
+        # AHCI (GPT+FAT16), NVMe (GPT+FAT32); файлы с длинными именами,
+        # папки, копирование между дисками, горячее подключение флешки
+        disks = ['-drive', 'if=none,id=stick,format=raw,file=@WORK@/stick.img',
+                 '-drive', 'if=none,id=stick2,format=raw,file=@WORK@/stick2.img',
+                 '-device', 'ahci,id=ahci0',
+                 '-drive', 'if=none,id=sd,format=raw,file=@WORK@/sata.img',
+                 '-device', 'ide-hd,drive=sd,bus=ahci0.0',
+                 '-drive', 'if=none,id=nv,format=raw,file=@WORK@/nvme.img',
+                 '-device', 'nvme,serial=MYOS1,drive=nv']
+        ddev = ['qemu-xhci,id=xhci', 'usb-kbd,bus=xhci.0,port=1',
+                'usb-storage,bus=xhci.0,port=2,drive=stick']
+        runs.append(('storage', [
+            (None, "Type 'help'", 90),
+            ('', 'mounted /usb0p1: FAT32, label "STICK"', 5),
+            ('', 'mounted /sata0p1: FAT16, label "SATADISK"', 5),
+            ('', 'mounted /nvme0p1: FAT32, label "NVME"', 5),
+            ('disk\n', 'sata0p1', 15),
+            ('ls /\n', 're:/usb0p1 +FAT32 STICK', 15),
+            ('cd /usb0p1\n', '/usb0p1>', 10),
+            ('ls\n', 'Long File Name From Linux.txt', 15),
+            ('cat host.txt\n', 'Hello from the host!', 15),
+            ('cat "Long File Name From Linux.txt"\n', 'long name ok', 15),
+            ('mkdir myos\n', '/usb0p1>', 10),
+            ('cd myos\n', '/usb0p1/myos>', 10),
+            ('write hello.txt Hello from MyOS\n', 'is now 16 bytes', 15),
+            ('append hello.txt second line\n', 'is now 28 bytes', 15),
+            ('cat hello.txt\n', 'second line', 15),
+            ('write "Mixed Case Name.txt" mixed\n', 'is now 6 bytes', 15),
+            ('ls\n', 'Mixed Case Name.txt', 15),
+            ('cp /usb0p1/BIG.BIN /nvme0p1/copy.bin\n', 'Copied, 300000 bytes', 30),
+            ('cp hello.txt /sata0p1/\n', 'Copied, 28 bytes', 15),
+            ('mkdir /nvme0p1/a\n', '>', 10),
+            ('mkdir /nvme0p1/a/b\n', '>', 10),
+            ('mv /nvme0p1/copy.bin /nvme0p1/a/b\n', 'Moved.', 15),
+            ('mv /sata0p1/hello.txt /sata0p1/renamed.txt\n', 'Moved.', 15),
+            ('mv /usb0p1/docs/readme.md /nvme0p1/\n', 'Moved to another disk', 15),
+            ('rmdir /usb0p1/docs\n', 'Deleted.', 15),
+            ('rm /usb0p1/host.txt\n', 'Deleted.', 15),
+            ('write /ram/r.txt ram\n', 'is now 4 bytes', 15),
+            ('cp /ram/r.txt /usb0p1/fromram.txt\n', 'Copied, 4 bytes', 15),
+            ('df\n', 're:/nvme0p1 +FAT32', 15),
+            ('mkdir /nvme0p1/x\n', '>', 10),
+            ('write /nvme0p1/x/inner.txt deep\n', 'is now 5 bytes', 15),
+            ('mv /nvme0p1/x /nvme0p1/a\n', 'Moved.', 15),
+            ('cd /nvme0p1/a/x/../b\n', '/nvme0p1/a/b>', 10),
+            ('edit /usb0p1/notes.txt\n', 'Editing', 15),
+            ('line one\n', ': ', 5),
+            ('line two\n', ': ', 5),
+            ('.\n', 'Saved: 2 line(s), 18 bytes', 15),
+            ('ls /sata0p1/nope\n', 'no such file or folder', 15),
+            # вторая флешка - на лету: без таблицы разделов (FAT16 с сектора 0)
+            ({'qmp': ('device_add', {'driver': 'usb-storage', 'bus': 'xhci.0', 'port': '4',
+                                     'drive': 'stick2', 'id': 's2'})},
+             're:usb event: .*connected', 20),
+            ('ls /\n', 're:/usb1 +FAT16 STICK2', 20),
+            ('cd /usb1\n', '/usb1>', 10),
+            ('cat host.txt\n', 'Hello from the host!', 15),
+            ({'qmp': ('device_del', {'id': 's2'})}, 're:usb event: .*disconnected', 20),
+            ('ls /\n', '/usb1 is gone', 15),
+            ('pwd\n', 're:\n/\r?\n', 10),
+        ], disks, ddev))
+        # "перезагрузка": тот же диск - файлы, записанные в прошлый раз,
+        # на месте; потом Проводник GUI видит флешку
+        runs.append(('storage-reboot', [
+            (None, "Type 'help'", 90),
+            ('cat /usb0p1/myos/hello.txt\n', 'Hello from MyOS', 20),
+            ('ls /nvme0p1/a/b\n', 'copy.bin', 15),
+            ('start\n', 'Press any key', 15),
+            (' ', 'gui: started', 10),
+            ('e', 'gui: explorer row: USB0P1/', 10),
+        ], disks, ddev))
         # чипсет q35: PCIe через ECAM (MCFG), перезагрузка через FADT
         runs.append(('q35', [
             (None, "Type 'help'", 90),
             ('', 'PCIe config space via ECAM', 5),
             ('usb\n', 'mouse (boot protocol)', 15),
             ('acpi\n', 'MyOS uses it', 15),
+            # на q35 загрузочный диск - на AHCI: FAT16 без таблицы разделов
+            ('ls /\n', 're:/sata0 +FAT16', 15),
+            ('ls /sata0/efi/boot\n', 'KERNEL.ELF', 15),
             ('', "used by 'reboot'", 5),
         ], ['-machine', 'q35']))
         # часовые пояса: часы машины - 15 января 10:00 UTC (зима):
@@ -369,7 +476,11 @@ def main():
 
     ok = True
     last_log = ''
-    make_stick_image(os.path.join(work, 'stick.img'))
+    make_test_disk(os.path.join(work, 'tree.img'), 64, 32, 'mbr', 'TREE')
+    make_test_disk(os.path.join(work, 'stick.img'), 64, 32, 'mbr', 'STICK')
+    make_test_disk(os.path.join(work, 'stick2.img'), 40, 16, 'none', 'STICK2')
+    make_test_disk(os.path.join(work, 'sata.img'), 40, 16, 'gpt', 'SATADISK')
+    make_test_disk(os.path.join(work, 'nvme.img'), 80, 32, 'gpt', 'NVME')
 
     for run in runs:
         name, steps = run[0], run[1]
@@ -380,6 +491,29 @@ def main():
         if not r:
             ok = False
             break
+
+    # диски после запусков storage: проверка "как в Linux"
+    if ok and not a.quick:
+        for img, expect in (
+                ('stick.img', {'/myos/hello.txt': b'Hello from MyOS\nsecond line\n',
+                               '/myos/Mixed Case Name.txt': b'mixed\n',
+                               '/fromram.txt': b'ram\n',
+                               '/notes.txt': b'line one\nline two\n',
+                               '/HOST.TXT': None, '/docs': None,
+                               '/BIG.BIN': BIG_DATA}),
+                ('sata.img', {'/renamed.txt': b'Hello from MyOS\nsecond line\n',
+                              '/hello.txt': None}),
+                ('nvme.img', {'/a/b/copy.bin': BIG_DATA, '/readme.md': b'# readme\n',
+                              '/a/x/inner.txt': b'deep\n', '/x': None,
+                              '/BIG.BIN': BIG_DATA}),
+                ('stick2.img', {'/HOST.TXT': b'Hello from the host!\n'})):
+            problems = check_disk(os.path.join(work, img), expect)
+            print('%-4s %-14s -> %s' % ('PASS' if not problems else 'FAIL', '[fsck ' + img + ']',
+                                        'consistent, files as expected' if not problems else ''))
+            for p in problems:
+                print('       ', p)
+            if problems:
+                ok = False
 
     if ok:
         print('\nALL TESTS PASSED')

@@ -46,7 +46,7 @@ KLDFLAGS:= -nostdlib -static -z max-page-size=0x1000 -T kernel/kernel.ld
 # Загрузчику из общего кода нужны только поиск xHCI в PCI и "отъём"
 # контроллера у прошивки
 LSRCS   := loader/loader.c drivers/pci.c drivers/xhci_common.c lib/libc.c
-KSRCS   := $(sort $(wildcard lib/*.c drivers/*.c kernel/*.c gui/*.c shell/*.c))
+KSRCS   := $(sort $(wildcard lib/*.c drivers/*.c kernel/*.c fs/*.c gui/*.c shell/*.c))
 
 LOBJS   := $(LSRCS:%.c=build/loader/%.o)
 KOBJS   := $(KSRCS:%.c=build/kernel/%.o)

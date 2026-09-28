@@ -447,10 +447,10 @@ void gui_start(EFI_SYSTEM_TABLE *st)
        i-й строки списка (или -1 для строк-заглушек
        вроде "(EMPTY)"/"..."), чтобы клик по строке
        открывал именно этот файл. */
-    char explorer_buf[GUI_EXPLORER_MAX_ROWS + 1][GUI_EXPLORER_LINE_LEN];
+    /* с этапа 5 Проводник ходит по всем томам VFS (gui/explorer.c);
+       открытая папка запоминается между открытиями окна */
+    static GUI_EXPLORER explorer;
     const char *explorer_lines[GUI_EXPLORER_MAX_ROWS + 1];
-    int explorer_row_fs[GUI_EXPLORER_MAX_ROWS + 1];
-    UINTN explorer_line_count = 0;
 
     windows[GUI_ACT_EXPLORER].title = "FILE EXPLORER";
     windows[GUI_ACT_EXPLORER].lines = explorer_lines;
@@ -461,7 +461,7 @@ void gui_start(EFI_SYSTEM_TABLE *st)
        заново при каждом открытии файла. */
     char fileview_buf[GUI_FILEVIEW_MAX_ROWS][GUI_FILEVIEW_LINE_LEN];
     const char *fileview_lines[GUI_FILEVIEW_MAX_ROWS];
-    char fileview_title[FS_NAME_MAX + 1];
+    char fileview_title[64];
 
     windows[GUI_ACT_FILEVIEW].title = fileview_title;
     windows[GUI_ACT_FILEVIEW].lines = fileview_lines;
@@ -1006,6 +1006,19 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                 continue;
             }
 
+            /* E на рабочем столе - открыть Проводник */
+            if (!in_window && !in_minesweeper && !in_terminal &&
+                (key.UnicodeChar == L'e' || key.UnicodeChar == L'E')) {
+
+                windows[GUI_ACT_EXPLORER].line_count =
+                    gui_explorer_fill(&explorer, explorer_lines);
+                open_action = GUI_ACT_EXPLORER;
+                in_window = TRUE;
+                menu_open = FALSE;
+                dirty = TRUE;
+                continue;
+            }
+
             /* T на рабочем столе - тоже сменить часовой пояс
                (для тех, кто без мыши) */
             if (!in_window && !in_minesweeper && !in_terminal &&
@@ -1113,115 +1126,10 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
                                 if (icons[i].action == GUI_ACT_EXPLORER) {
 
-                                    /* Пересобрать список файлов
-                                       из RAM-FS прямо перед
-                                       открытием окна. */
-                                    explorer_line_count = 0;
-
-                                    for (int fi = 0;
-                                         fi < FS_MAX_FILES &&
-                                         explorer_line_count <
-                                             GUI_EXPLORER_MAX_ROWS;
-                                         fi++) {
-
-                                        if (!g_fs[fi].used)
-                                            continue;
-
-                                        char *row =
-                                            explorer_buf[
-                                                explorer_line_count
-                                            ];
-                                        UINTN p = 0;
-
-                                        for (UINTN c = 0;
-                                             g_fs[fi].name[c] != 0 &&
-                                             p < GUI_EXPLORER_LINE_LEN
-                                                 - 16;
-                                             c++) {
-
-                                            CHAR16 wc =
-                                                g_fs[fi].name[c];
-
-                                            row[p++] =
-                                                (wc < 128)
-                                                    ? (char)wc
-                                                    : ' ';
-                                        }
-
-                                        row[p++] = ' ';
-                                        row[p++] = '-';
-                                        row[p++] = ' ';
-
-                                        p += gui_uint_to_str(
-                                            g_fs[fi].size,
-                                            row + p
-                                        );
-
-                                        row[p++] = 'B';
-                                        row[p] = '\0';
-
-                                        explorer_lines[
-                                            explorer_line_count
-                                        ] = row;
-
-                                        explorer_row_fs[
-                                            explorer_line_count
-                                        ] = fi;
-
-                                        explorer_line_count++;
-                                    }
-
-                                    if (explorer_line_count == 0) {
-
-                                        explorer_lines[0] =
-                                            "EMPTY - NO FILES";
-                                        explorer_row_fs[0] = -1;
-                                        explorer_line_count = 1;
-
-                                    } else {
-
-                                        int more = 0;
-
-                                        for (int fi = 0;
-                                             fi < FS_MAX_FILES;
-                                             fi++) {
-
-                                            if (g_fs[fi].used)
-                                                more++;
-                                        }
-
-                                        if ((UINTN)more >
-                                            explorer_line_count &&
-                                            explorer_line_count <
-                                                GUI_EXPLORER_MAX_ROWS
-                                                    + 1) {
-
-                                            char *row =
-                                                explorer_buf[
-                                                    explorer_line_count
-                                                ];
-
-                                            UINTN p = 0;
-                                            row[p++] = '.';
-                                            row[p++] = '.';
-                                            row[p++] = '.';
-                                            row[p] = '\0';
-
-                                            explorer_lines[
-                                                explorer_line_count
-                                            ] = row;
-
-                                            explorer_row_fs[
-                                                explorer_line_count
-                                            ] = -1;
-
-                                            explorer_line_count++;
-                                        }
-                                    }
-
-                                    windows[GUI_ACT_EXPLORER]
-                                        .line_count =
-                                        explorer_line_count;
+                                    /* Перечитать открытую папку
+                                       прямо перед открытием окна */
+                                    windows[GUI_ACT_EXPLORER].line_count =
+                                        gui_explorer_fill(&explorer, explorer_lines);
                                 }
 
                                 open_action = icons[i].action;
@@ -1280,22 +1188,27 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
                         UINTN row =
                             (UINTN)(cy - rows_y0) / 14;
+                        char fpath[VFS_PATH_MAX];
 
-                        if (row < explorer_line_count &&
-                            explorer_row_fs[row] >= 0) {
+                        if (gui_explorer_click(&explorer, row, fpath, sizeof(fpath))) {
 
-                            windows[GUI_ACT_FILEVIEW]
-                                .line_count =
-                                gui_open_fileview(
-                                    explorer_row_fs[row],
-                                    fileview_buf,
-                                    fileview_lines,
-                                    fileview_title
+                            /* файл - открыть в окне просмотра */
+                            windows[GUI_ACT_FILEVIEW].line_count =
+                                gui_open_fileview_path(
+                                    fpath, fileview_buf, fileview_lines,
+                                    fileview_title, sizeof(fileview_title)
                                 );
 
                             open_action = GUI_ACT_FILEVIEW;
-                            dirty = TRUE;
+
+                        } else {
+
+                            /* папка или ".." - перечитать список */
+                            windows[GUI_ACT_EXPLORER].line_count =
+                                gui_explorer_fill(&explorer, explorer_lines);
                         }
+
+                        dirty = TRUE;
                     }
                 }
             }

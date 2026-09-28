@@ -285,3 +285,57 @@ BOOLEAN pci_find_xhci(
 
     return FALSE;
 }
+
+#ifndef MYOS_LOADER
+/*
+ * nth-е по счёту устройство PCI с данным классом/подклассом
+ * (progif < 0 - любой prog-if). Полный перебор, как в pci_find_xhci.
+ */
+BOOLEAN pci_find_class(UINT8 base, UINT8 sub, INT16 progif, UINTN nth,
+                       UINT8 *out_bus, UINT8 *out_dev, UINT8 *out_func)
+{
+    for (UINTN bus = 0; bus < 256; bus++) {
+
+        for (UINTN dev = 0; dev < 32; dev++) {
+
+            UINT32 id0 = pci_config_read32((UINT8)bus, (UINT8)dev, 0, 0x00);
+
+            if ((id0 & 0xFFFF) == 0xFFFF)
+                continue;
+
+            UINT32 hdr = pci_config_read32((UINT8)bus, (UINT8)dev, 0, 0x0C);
+            UINTN max_func = ((hdr >> 16) & 0x80) ? 8 : 1;
+
+            for (UINTN func = 0; func < max_func; func++) {
+
+                UINT32 id = (func == 0) ? id0 :
+                    pci_config_read32((UINT8)bus, (UINT8)dev, (UINT8)func, 0x00);
+
+                if ((id & 0xFFFF) == 0xFFFF)
+                    continue;
+
+                UINT32 cl = pci_config_read32((UINT8)bus, (UINT8)dev, (UINT8)func, 0x08);
+
+                if (PCI_CLASS_DWORD_BASE_CLASS(cl) != base ||
+                    PCI_CLASS_DWORD_SUB_CLASS(cl) != sub)
+                    continue;
+
+                if (progif >= 0 && PCI_CLASS_DWORD_PROG_IF(cl) != (UINT8)progif)
+                    continue;
+
+                if (nth > 0) {
+                    nth--;
+                    continue;
+                }
+
+                *out_bus = (UINT8)bus;
+                *out_dev = (UINT8)dev;
+                *out_func = (UINT8)func;
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
+#endif

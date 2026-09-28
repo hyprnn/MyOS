@@ -330,13 +330,13 @@ typedef EFI_STATUS (EFIAPI *XHCI_FREE_POOL)(VOID *Buffer);
 /* "Проводник": сколько строк файлов максимум показываем
    в окне (плюс заголовок и, если файлов больше, строка
    "... и ещё N"). */
-#define GUI_EXPLORER_MAX_ROWS   10
-#define GUI_EXPLORER_LINE_LEN   40
+#define GUI_EXPLORER_MAX_ROWS   22
+#define GUI_EXPLORER_LINE_LEN   48
 
 /* Окно "просмотра файла", открываемое кликом по строке
    в Проводнике: показывает содержимое файла построчно. */
-#define GUI_FILEVIEW_MAX_ROWS   14
-#define GUI_FILEVIEW_LINE_LEN   40
+#define GUI_FILEVIEW_MAX_ROWS   22
+#define GUI_FILEVIEW_LINE_LEN   60
 
 /* Терминал внутри GUI: своё окно с чёрным viewport'ом
    и живым вводом, а не выход из GUI в текстовый режим -
@@ -870,7 +870,7 @@ typedef struct KTHREAD {
 
 /* Замок-"мьютекс": пока его держит один поток, другой, пришедший
    за ним, СПИТ (не крутится). Рекурсивный: владелец может взять
-   его ещё раз (например, disk -> usb_disk_read). */
+   его ещё раз (например, blk_register_disk -> blk_read). */
 typedef struct {
     KTHREAD    *owner;
     UINTN       count;
@@ -903,6 +903,157 @@ typedef struct {
 
 #define KMUTEX_INIT(n)   { NULL, 0, (n), 0 }
 #define KSPINLOCK_INIT   { 0 }
+
+
+/* ================================================================
+ * Диски (этап 5): блочные устройства, разделы, FAT, VFS
+ * drivers/blk.c, drivers/ahci.c, drivers/nvme.c, fs/fat.c, fs/vfs.c
+ * ================================================================ */
+
+#define BLK_MAX            24      /* дисков и разделов вместе */
+#define BLK_SECTOR         512     /* файловой системе нужны секторы
+                                      по 512 байт (почти у всех так) */
+#define BLK_CACHE_SECTORS  512     /* кэш: 512 секторов = 256 КиБ */
+
+struct BLKDEV;
+
+/* Чтение/запись целого диска: драйвер (USB, AHCI, NVMe) */
+typedef BOOLEAN (*BLK_RW)(struct BLKDEV *d, UINT64 lba, UINT32 count,
+                          VOID *buf, BOOLEAN write);
+
+typedef struct BLKDEV {
+    BOOLEAN     used;
+    char        name[12];        /* "usb0", "sata0", "nvme0", "usb0p1" */
+    char        model[41];       /* что говорит о себе устройство */
+    const char *kind;            /* "USB", "SATA (AHCI)", "NVMe", "partition" */
+    UINT32      sector_size;
+    UINT64      sectors;
+    BOOLEAN     writable;        /* можно ли писать */
+    const char *ro_reason;       /* почему нельзя */
+
+    /* целый диск */
+    BLK_RW      rw;
+    UINTN       drv_index;       /* номер у драйвера (порт, флешка) */
+    UINT32      drv_serial;      /* "паспорт" подключения (флешку
+                                    вынули и вставили другую) */
+    UINT32      gen;             /* поколение: меняется при каждом
+                                    появлении - кэш и тома сверяются */
+
+    /* раздел: какой диск и с какого сектора */
+    INTN        parent;          /* -1 для целого диска */
+    UINT64      start;
+    UINT32      part_no;
+    char        ptype[24];       /* "FAT32", "EFI System", "Linux", ... */
+    char        label[37];       /* имя раздела из GPT */
+
+    UINT64      reads, writes, errors, cache_hits;
+} BLKDEV;
+
+/* --- VFS: файлы и папки --- */
+
+#define VFS_MAX_MOUNTS   12
+#define VFS_PATH_MAX     256
+#define VFS_NAME_MAX     128
+#define VFS_MAX_FD       16
+
+/* Коды ошибок (отрицательные) */
+#define VFS_OK            0
+#define VFS_ENOENT       -2      /* нет такого файла или папки */
+#define VFS_EEXIST       -3      /* уже есть */
+#define VFS_ENOTDIR      -4      /* это не папка */
+#define VFS_EISDIR       -5      /* это папка */
+#define VFS_ENOTEMPTY    -6      /* папка не пустая */
+#define VFS_ENOSPC       -7      /* нет места */
+#define VFS_EROFS        -8      /* только чтение */
+#define VFS_EIO          -9      /* ошибка диска */
+#define VFS_EINVAL      -10      /* неверное имя/аргумент */
+#define VFS_EBADF       -11      /* неверный номер файла */
+#define VFS_EMFILE      -12      /* открыто слишком много файлов */
+#define VFS_ENOSYS      -13      /* эта файловая система так не умеет */
+#define VFS_EGONE       -14      /* диск вынули */
+#define VFS_EXDEV       -15      /* между разными дисками так нельзя */
+
+/* флаги vfs_open */
+#define VFS_O_READ      0x01u
+#define VFS_O_WRITE     0x02u
+#define VFS_O_CREATE    0x04u
+#define VFS_O_TRUNC     0x08u
+#define VFS_O_APPEND    0x10u
+
+/* Узел - файл или папка внутри одной файловой системы. Что в полях
+   - знает только её драйвер (FAT: кластеры и место записи в папке;
+   RAM-диск: номер файла). */
+typedef struct {
+    BOOLEAN is_dir;
+    UINT64  size;
+    UINT32  first_cluster;       /* FAT: первый кластер (0 - пусто;
+                                    у корня FAT16 - 0) */
+    UINT32  parent_cluster;      /* FAT: папка, где лежит запись */
+    UINT32  entry_index;         /* FAT: номер 32-байтной записи */
+    UINT32  lfn_count;           /* FAT: сколько записей длинного имени
+                                    перед ней */
+    BOOLEAN is_root;
+    INTN    ram_index;           /* RAM-диск: индекс в g_fs */
+    UINT8   attr;
+    UINT16  wdate, wtime;        /* FAT: дата и время изменения */
+} VFS_NODE;
+
+/* Запись каталога для ls */
+typedef struct {
+    char     name[VFS_NAME_MAX];
+    VFS_NODE node;
+} VFS_DIRENT;
+
+struct VFS_MOUNT;
+
+typedef struct {
+    const char *name;            /* "FAT32", "ramfs" */
+    INTN (*root)(struct VFS_MOUNT *m, VFS_NODE *out);
+    /* *cookie = 0 в начале; возвращает 1 - есть запись, 0 - конец */
+    INTN (*readdir)(struct VFS_MOUNT *m, VFS_NODE *dir, UINT64 *cookie, VFS_DIRENT *out);
+    INTN (*lookup)(struct VFS_MOUNT *m, VFS_NODE *dir, const char *name, VFS_NODE *out);
+    INTN (*read)(struct VFS_MOUNT *m, VFS_NODE *f, UINT64 off, VOID *buf, UINTN n);
+    INTN (*write)(struct VFS_MOUNT *m, VFS_NODE *f, UINT64 off, const VOID *buf, UINTN n);
+    INTN (*truncate)(struct VFS_MOUNT *m, VFS_NODE *f, UINT64 size);
+    INTN (*create)(struct VFS_MOUNT *m, VFS_NODE *dir, const char *name, BOOLEAN is_dir, VFS_NODE *out);
+    INTN (*remove)(struct VFS_MOUNT *m, VFS_NODE *dir, VFS_NODE *node);
+    INTN (*rename)(struct VFS_MOUNT *m, VFS_NODE *dir, VFS_NODE *node,
+                   VFS_NODE *newdir, const char *newname);
+    INTN (*statfs)(struct VFS_MOUNT *m, UINT64 *total_bytes, UINT64 *free_bytes);
+} VFS_OPS;
+
+/* Том FAT (fs/fat.c) */
+typedef struct {
+    UINTN   dev;                 /* блочное устройство */
+    UINT32  fat_bits;            /* 16 или 32 */
+    UINT32  spc;                 /* секторов в кластере */
+    UINT32  cluster_bytes;
+    UINT32  reserved;            /* секторов до первой FAT */
+    UINT32  nfats;
+    UINT32  fat_size;            /* секторов в одной FAT */
+    UINT32  root_entries;        /* FAT16: записей в корне */
+    UINT32  root_sector;         /* FAT16: где корень */
+    UINT32  root_sectors;
+    UINT32  data_start;          /* первый сектор кластера 2 */
+    UINT32  clusters;            /* сколько кластеров данных */
+    UINT32  root_cluster;        /* FAT32: первый кластер корня */
+    UINT32  fsinfo;              /* FAT32: сектор FSInfo */
+    UINT32  next_free;           /* откуда искать свободный кластер */
+    INT64   free_count;          /* -1 - ещё не считали */
+    BOOLEAN fsinfo_invalidated;  /* уже сказали FSInfo "не знаю" */
+    char    label[12];
+} FAT_VOL;
+
+typedef struct VFS_MOUNT {
+    BOOLEAN        used;
+    char           name[16];     /* каталог в корне: "ram", "usb0p1" */
+    const VFS_OPS *ops;
+    UINTN          dev;          /* блочное устройство (для дисков) */
+    UINT32         dev_gen;      /* его поколение при монтировании */
+    BOOLEAN        readonly;
+    BOOLEAN        gone;         /* диск пропал - том мёртв */
+    FAT_VOL        fat;
+} VFS_MOUNT;
 
 /* TSS (64-битный), см. kernel/cpu.c */
 typedef struct __attribute__((packed)) {
@@ -1243,7 +1394,10 @@ typedef struct {
     char    vendor[9];
     char    product[17];
     const char *note;
-    UINT64  reads, errors;
+    UINT64  reads, writes, errors;
+    UINT32  serial;           /* номер подключения: у каждой вставленной
+                                 флешки свой (blk.c отличает новую от
+                                 вынутой) */
 } KX_MSD;
 
 typedef struct {
@@ -1616,47 +1770,10 @@ int fs_find(
 
 /* --- shell/fs.c --- */
 int fs_find_free(void);
-void cmd_ls(
-    EFI_SYSTEM_TABLE *st
-);
-void cmd_touch(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *name
-);
-void cmd_cat(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *name
-);
-void cmd_write(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *name,
-    CHAR16 *text
-);
-void cmd_append(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *name,
-    CHAR16 *text
-);
-void cmd_rm(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *name
-);
-void cmd_mv(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *oldname,
-    CHAR16 *newname
-);
-void cmd_cp(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *src,
-    CHAR16 *dst
-);
+BOOLEAN fs_shell_command(EFI_SYSTEM_TABLE *st, const CHAR16 *line);
 
 /* --- shell/editor.c --- */
-void cmd_edit(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *name
-);
+void cmd_edit(EFI_SYSTEM_TABLE *st, const char *path);
 
 /* --- shell/calc.c --- */
 void cmd_calc(
@@ -1933,6 +2050,20 @@ void gui_draw_minesweeper(
 );
 
 /* --- gui/minesweeper_draw.c --- */
+/* Проводник (gui/explorer.c): папка VFS -> строки окна */
+typedef struct {
+    char   path[VFS_PATH_MAX];                     /* какая папка открыта */
+    char   buf[GUI_EXPLORER_MAX_ROWS + 1][GUI_EXPLORER_LINE_LEN];
+    char   names[GUI_EXPLORER_MAX_ROWS + 1][VFS_NAME_MAX];   /* настоящие имена */
+    INT8   kind[GUI_EXPLORER_MAX_ROWS + 1];        /* 0 - файл, 1 - папка,
+                                                      2 - "..", -1 - просто текст */
+    UINTN  count;
+} GUI_EXPLORER;
+
+UINTN gui_explorer_fill(GUI_EXPLORER *ex, const char **lines);
+BOOLEAN gui_explorer_click(GUI_EXPLORER *ex, UINTN row, char *file_path, UINTN cap);
+UINTN gui_open_fileview_path(const char *path, char fileview_buf[][GUI_FILEVIEW_LINE_LEN],
+                             const char **fileview_lines, char *title_buf, UINTN title_cap);
 UINTN gui_open_fileview(
     int idx,
     char fileview_buf[][GUI_FILEVIEW_LINE_LEN],
@@ -2135,6 +2266,61 @@ UINTN sched_snapshot(KT_INFO *out, UINTN cap);
 void kernel_cmd_ps(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void kernel_cmd_threadtest(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 
+/* --- drivers/blk.c --- */
+extern BLKDEV g_blk[BLK_MAX];
+extern KMUTEX g_vfs_mutex;
+INTN blk_register_disk(const char *prefix, const char *kind, const char *model,
+                       UINT64 sectors, UINT32 sector_size, BOOLEAN writable,
+                       const char *ro_reason, BLK_RW rw, UINTN drv_index,
+                       UINT32 drv_serial);
+void blk_remove(UINTN idx);
+BOOLEAN blk_read(UINTN dev, UINT64 lba, UINT32 count, VOID *buf);
+BOOLEAN blk_write(UINTN dev, UINT64 lba, UINT32 count, const VOID *buf);
+void blk_sync_usb(void);
+void blk_scan_partitions(UINTN idx);
+void storage_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kernel_cmd_disk(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
+
+/* --- drivers/usbmsd.c (для blk.c) --- */
+BOOLEAN usb_msd_rw(UINTN mi, UINT32 serial, UINT64 lba, UINT32 count, VOID *buf, BOOLEAN write);
+BOOLEAN usb_msd_alive(UINTN mi, UINT32 serial);
+BOOLEAN usb_msd_info(UINTN mi, UINT32 *serial, UINT64 *blocks, UINT32 *bsize,
+                     char *model, UINTN cap);
+
+/* --- drivers/ahci.c, drivers/nvme.c --- */
+void ahci_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void nvme_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+BOOLEAN pci_find_class(UINT8 base, UINT8 sub, INT16 progif, UINTN nth,
+                       UINT8 *bus, UINT8 *dev, UINT8 *func);
+BOOLEAN blk_wait(volatile UINT32 *reg, UINT32 mask, UINT32 want, UINT64 timeout_ms);
+
+/* --- fs/fat.c --- */
+extern const VFS_OPS g_fat_ops;
+BOOLEAN fat_probe(UINTN dev, FAT_VOL *v, const char **why);
+
+/* --- fs/vfs.c --- */
+extern VFS_MOUNT g_mounts[VFS_MAX_MOUNTS];
+extern char g_cwd[VFS_PATH_MAX];
+void vfs_init(void);
+INTN vfs_mount_dev(UINTN dev, const char *name);
+void vfs_forget_dev(UINTN dev);
+const char *vfs_strerror(INTN e);
+INTN vfs_normalize(const char *path, char *out, UINTN cap);
+INTN vfs_stat(const char *path, VFS_DIRENT *out);
+INTN vfs_list(const char *path, INTN (*cb)(void *ctx, const VFS_DIRENT *e), void *ctx);
+INTN vfs_open(const char *path, UINT32 flags);
+INTN vfs_read(INTN fd, VOID *buf, UINTN n);
+INTN vfs_write(INTN fd, const VOID *buf, UINTN n);
+INTN vfs_close(INTN fd);
+INTN vfs_size(INTN fd, UINT64 *size);
+INTN vfs_mkdir(const char *path);
+INTN vfs_remove(const char *path);
+INTN vfs_rename(const char *from, const char *to);
+INTN vfs_chdir(const char *path);
+INTN vfs_mount_info(const char *path, VFS_MOUNT **m);
+INTN vfs_read_file(const char *path, VOID *buf, UINTN cap, UINTN *got);
+INTN vfs_write_file(const char *path, const VOID *buf, UINTN n, BOOLEAN append);
+
 /* --- kernel/kmain.c --- */
 void kmain(MYOS_BOOT_INFO *bi) __attribute__((noreturn));
 
@@ -2261,8 +2447,6 @@ extern KX_MSD g_kx_msd[KX_MAX_MSD];
 INTN kx_msd_prepare(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di,
                     KX_MSD_CAND *c, KX_EPCFG *eps, UINTN *neps);
 void kx_msd_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN mi);
-BOOLEAN usb_disk_read(UINTN disk, UINT64 lba, UINT32 count, VOID *dst);
-void kernel_cmd_disk(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 
 /* --- kernel/shim.c --- */
 EFI_STATUS EFIAPI kbs_unsupported(void);

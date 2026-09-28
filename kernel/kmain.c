@@ -452,6 +452,10 @@ void kmain_stage2(void)
     /* дальше горячее подключение и хабы обслуживает поток usb */
     kx_usb_start_thread(out);
 
+    /* --- диски и файлы (этап 5) --- */
+    kmain_section(out, "[storage]");
+    storage_init(out);
+
     /* --- таблица функций ядра для шелла и GUI --- */
     kx_install_shims();
 
@@ -468,7 +472,7 @@ void kmain_stage2(void)
     print(out, "\nMyOS is running on its own kernel - no firmware underneath.\n");
     set_color(out, 0x07);
     print(out, "Type 'help' for the list of commands, or 'fetch' for a system summary.\n");
-    print(out, "New: ps (threads and who uses the CPU), threadtest; cpu, usb, disk.\n\n");
+    print(out, "New: disks and folders - ls /, cd /usb0p1, mkdir, cat, write, cp, df, disk.\n\n");
 
     CHAR16 line[LINE_MAX];
 
@@ -477,7 +481,7 @@ void kmain_stage2(void)
         out = g_st->ConOut;
 
         set_color(out, g_color);
-        print(out, "> ");
+        kprintf(out, "%s> ", g_cwd);
 
         read_line(g_st, line, LINE_MAX);
         run_command(g_st, line);

@@ -550,6 +550,10 @@ void gui_draw_window(
 
     for (UINTN i = 0; i < content->line_count; i++) {
 
+        /* не рисовать ниже окна (длинный список в Проводнике) */
+        if (line_y + 10 > win_y + (INTN)win_h - 8)
+            break;
+
         gui_draw_text(
             fb, stride, fb_w, fb_h,
             win_x + 16, line_y,

@@ -302,57 +302,20 @@ void run_command(
 
         print(
             out,
-            "  --- files (RAM disk, cleared on reboot) ---\n"
-        );
-
-        print(
-            out,
-            "  ls            - list files\n"
-        );
-
-        print(
-            out,
+            "  --- files and folders (/ram - RAM disk, /usb0p1 - flash drive...) ---\n"
+            "  ls [path]     - list a folder ('ls /' - all volumes)\n"
+            "  cd <path>     - go to a folder (cd /usb0p1, cd .., cd /)\n"
+            "  pwd           - where am I\n"
+            "  mkdir <name>  - new folder;  rmdir <name> - delete an empty one\n"
             "  touch <name>  - create an empty file\n"
-        );
-
-        print(
-            out,
-            "  cat <name>    - print file contents\n"
-        );
-
-        print(
-            out,
-            "  write <n> <t> - overwrite file with text\n"
-        );
-
-        print(
-            out,
-            "  append <n> <t>- append text to file\n"
-        );
-
-        print(
-            out,
-            "  edit <name>   - multi-line editor, end with '.'\n"
-        );
-
-        print(
-            out,
+            "  cat <name>    - print a file\n"
+            "  write <n> <t> - write a line of text into a file (replaces it)\n"
+            "  append <n> <t>- add a line of text to the end\n"
+            "  edit <name>   - type several lines into a file, end with '.'\n"
             "  rm <name>     - delete a file\n"
-        );
-
-        print(
-            out,
-            "  mv <a> <b>    - rename a file\n"
-        );
-
-        print(
-            out,
-            "  cp <a> <b>    - copy a file\n"
-        );
-
-        print(
-            out,
-            "  size <name>   - show file size in bytes\n"
+            "  mv <a> <b>    - rename / move;  cp <a> <b> - copy (also between disks)\n"
+            "  size <name>   - file size;  df - volumes, size and free space\n"
+            "  disk          - disks and partitions;  disk read N [name] - raw sector\n"
         );
 
         print(
@@ -448,274 +411,14 @@ void run_command(
 
 
     /* --------------------------------------------------------
-     * ls
+     * файлы и папки: ls, cd, pwd, mkdir, rmdir, touch, cat, write,
+     * append, edit, rm, mv, cp, size, df - см. shell/fs.c (через
+     * VFS: RAM-диск /ram, флешки, разделы дисков)
      * -------------------------------------------------------- */
 
-    } else if (
-        streq(line, "ls") ||
-        streq(line, "dir") ||
-        streq(line, "files")
-    ) {
+    } else if (fs_shell_command(st, line)) {
 
-        cmd_ls(st);
-
-
-    /* --------------------------------------------------------
-     * touch
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "touch ")) {
-
-        CHAR16 name[FS_NAME_MAX];
-
-
-        take_word(
-            skip_ws16(line + 6),
-            name,
-            FS_NAME_MAX
-        );
-
-
-        cmd_touch(
-            st,
-            name
-        );
-
-
-    /* --------------------------------------------------------
-     * cat
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "cat ")) {
-
-        CHAR16 name[FS_NAME_MAX];
-
-
-        take_word(
-            skip_ws16(line + 4),
-            name,
-            FS_NAME_MAX
-        );
-
-
-        cmd_cat(
-            st,
-            name
-        );
-
-
-    /* --------------------------------------------------------
-     * write
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "write ")) {
-
-        CHAR16 name[FS_NAME_MAX];
-
-
-        CHAR16 *rest =
-            take_word(
-                skip_ws16(line + 6),
-                name,
-                FS_NAME_MAX
-            );
-
-
-        rest =
-            skip_ws16(rest);
-
-
-        cmd_write(
-            st,
-            name,
-            rest
-        );
-
-
-    /* --------------------------------------------------------
-     * append
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "append ")) {
-
-        CHAR16 name[FS_NAME_MAX];
-
-
-        CHAR16 *rest =
-            take_word(
-                skip_ws16(line + 7),
-                name,
-                FS_NAME_MAX
-            );
-
-
-        rest =
-            skip_ws16(rest);
-
-
-        cmd_append(
-            st,
-            name,
-            rest
-        );
-
-
-    /* --------------------------------------------------------
-     * edit
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "edit ")) {
-
-        CHAR16 name[FS_NAME_MAX];
-
-
-        take_word(
-            skip_ws16(line + 5),
-            name,
-            FS_NAME_MAX
-        );
-
-
-        cmd_edit(
-            st,
-            name
-        );
-
-
-    /* --------------------------------------------------------
-     * rm
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "rm ")) {
-
-        CHAR16 name[FS_NAME_MAX];
-
-
-        take_word(
-            skip_ws16(line + 3),
-            name,
-            FS_NAME_MAX
-        );
-
-
-        cmd_rm(
-            st,
-            name
-        );
-
-
-    /* --------------------------------------------------------
-     * mv
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "mv ")) {
-
-        CHAR16 a[FS_NAME_MAX];
-        CHAR16 b[FS_NAME_MAX];
-
-
-        CHAR16 *rest =
-            take_word(
-                skip_ws16(line + 3),
-                a,
-                FS_NAME_MAX
-            );
-
-
-        rest =
-            skip_ws16(rest);
-
-
-        take_word(
-            rest,
-            b,
-            FS_NAME_MAX
-        );
-
-
-        cmd_mv(
-            st,
-            a,
-            b
-        );
-
-
-    /* --------------------------------------------------------
-     * cp
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "cp ")) {
-
-        CHAR16 a[FS_NAME_MAX];
-        CHAR16 b[FS_NAME_MAX];
-
-
-        CHAR16 *rest =
-            take_word(
-                skip_ws16(line + 3),
-                a,
-                FS_NAME_MAX
-            );
-
-
-        rest =
-            skip_ws16(rest);
-
-
-        take_word(
-            rest,
-            b,
-            FS_NAME_MAX
-        );
-
-
-        cmd_cp(
-            st,
-            a,
-            b
-        );
-
-
-    /* --------------------------------------------------------
-     * size
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "size ")) {
-
-        CHAR16 name[FS_NAME_MAX];
-
-
-        take_word(
-            skip_ws16(line + 5),
-            name,
-            FS_NAME_MAX
-        );
-
-
-        int idx =
-            fs_find(name);
-
-
-        if (idx < 0) {
-
-            print(
-                out,
-                "No such file.\n"
-            );
-
-        } else {
-
-            print_uint(
-                out,
-                g_fs[idx].size
-            );
-
-            print(
-                out,
-                " bytes\n"
-            );
-        }
-
+        /* уже выполнено */
 
     /* --------------------------------------------------------
      * fetch
