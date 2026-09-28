@@ -47,6 +47,15 @@ void kernel_cmd_kinfo(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     kprintf(out, "Mouse: %s%llu reports\n",
             g_kmouse_present ? "present, " : "none, ", g_kmouse_reports);
 
+    kprintf(out, "Input by interrupts: PS/2 keyboard %s, PS/2 mouse %s, USB %s\n",
+            g_ps2_irq ? "IRQ 1" : (g_ps2_present ? "polling" : "absent"),
+            g_ps2_aux_present ? "IRQ 12" : "absent",
+            g_kx.running ? g_kx.irq_mode : "off");
+
+    if (g_cpu_load_valid)
+        kprintf(out, "CPU load: %u.%u%% over the last second (see 'cpu')\n",
+                g_cpu_load_permille / 10u, g_cpu_load_permille % 10u);
+
     kprintf(out, "Console: %llux%llu chars on %ux%u framebuffer\n",
             (UINT64)g_kcon_cols, (UINT64)g_kcon_rows, g_kfb_w, g_kfb_h);
 
@@ -349,8 +358,10 @@ void kernel_cmd_mousetest(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
                 if (!d->used)
                     continue;
 
+                char path[32];
+                kx_dev_path(d, path, sizeof(path));
                 print(out, "Port ");
-                print_uint(out, d->port);
+                print(out, path);
                 print(out, " ");
                 print_hex(out, d->vid, 4);
                 print(out, ":");
@@ -388,13 +399,58 @@ void kernel_cmd_mousetest(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 }
 
 
+/* Одно устройство и (рекурсивно) всё, что за ним, - деревом */
+static void kx_print_dev_tree(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di, UINTN indent)
+{
+    KX_DEV *d = &g_kx_devs[di];
+    char path[32];
+
+    kx_dev_path(d, path, sizeof(path));
+
+    for (UINTN i = 0; i < indent; i++)
+        print(out, "  ");
+
+    kprintf(out, "Port %s  slot %u  %04x:%04x  %s  - %s\n",
+            path, d->slot, d->vid, d->pid, kx_speed_name(d->speed),
+            d->status ? d->status : "?");
+
+    for (UINTN k = 0; k < KX_MAX_HID; k++) {
+        KX_HID *h = &g_kx_hid[k];
+        if (h->used && h->dev == di && h->role != KX_ROLE_HUB) {
+            for (UINTN i = 0; i < indent; i++)
+                print(out, "  ");
+            kx_print_hid_line(out, h);
+        }
+    }
+
+    if (d->msd >= 0) {
+        KX_MSD *m = &g_kx_msd[d->msd];
+        for (UINTN i = 0; i < indent; i++)
+            print(out, "  ");
+        kprintf(out, "    drive \"%s %s\": %s", m->vendor, m->product, m->note);
+        if (m->ready)
+            kprintf(out, ", %llu MiB", (m->blocks * m->block_size) >> 20);
+        kprintf(out, ", reads %llu, errors %llu\n", m->reads, m->errors);
+    }
+
+    if (d->hub >= 0) {
+
+        KX_HUB *hb = &g_kx_hubs[d->hub];
+
+        for (UINTN i = 0; i < indent; i++)
+            print(out, "  ");
+        kprintf(out, "    hub: %u ports, %llu port-change messages\n",
+                hb->nports, hb->events);
+
+        for (UINTN p = 1; p <= hb->nports; p++)
+            if (hb->child[p] >= 0)
+                kx_print_dev_tree(out, (UINTN)hb->child[p], indent + 2);
+    }
+}
+
 void kernel_cmd_usb(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
-    if (!g_kernel_mode) {
-        print(out, "The MyOS USB driver starts with 'ebs' (it needs the\n");
-        print(out, "controller for itself). Use 'xhci' for a read-only look.\n");
-        return;
-    }
+    kernel_poll_input();       /* подобрать свежие подключения */
 
     if (!g_kx.running) {
         print(out, "USB driver is not running (no xHCI or init failed).\n");
@@ -403,44 +459,28 @@ void kernel_cmd_usb(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
     kx_print_hc_status(out);
 
+    kprintf(out, "Events delivered by: %s", g_kx.irq_mode);
+    if (g_kx.irqs)
+        kprintf(out, " (%llu interrupts)", g_kx.irqs);
+    kprintf(out, "; hot-plug: %llu connected, %llu removed since boot\n\n",
+            g_kx.hot_added, g_kx.hot_removed);
+
     UINTN shown = 0;
 
     for (UINTN i = 0; i < KX_MAX_DEVS; i++) {
 
-        KX_DEV *d = &g_kx_devs[i];
-
-        if (!d->used)
+        if (!g_kx_devs[i].used || g_kx_devs[i].parent >= 0)
             continue;
 
+        kx_print_dev_tree(out, i, 0);
         shown++;
-
-        print(out, "Port ");
-        print_uint(out, d->port);
-        print(out, "  slot ");
-        print_uint(out, d->slot);
-        print(out, "  ");
-        print_hex(out, d->vid, 4);
-        print(out, ":");
-        print_hex(out, d->pid, 4);
-        print(out, "  ");
-        print(out, kx_speed_name(d->speed));
-        print(out, "  - ");
-        print(out, d->status ? d->status : "?");
-        print(out, "\n");
-
-        for (UINTN k = 0; k < KX_MAX_HID; k++) {
-
-            KX_HID *h = &g_kx_hid[k];
-
-            if (!h->used || h->dev != i)
-                continue;
-
-            kx_print_hid_line(out, h);
-        }
     }
 
     if (shown == 0)
-        print(out, "No USB devices were found on the root ports.\n");
+        print(out, "No USB devices. Plug something in - it is picked up automatically.\n");
+
+    print(out, "\nPlug / unplug log:\n");
+    kx_print_event_log(out);
 }
 
 

@@ -9,6 +9,15 @@ UINTN g_kbd_q_head = 0;   /* откуда читать */
 UINTN g_kbd_q_tail = 0;   /* куда писать */
 
 BOOLEAN g_kbd_caps = FALSE;
+BOOLEAN g_kbd_num = TRUE;       /* NumLock: цифровой блок - цифры */
+BOOLEAN g_kbd_scroll = FALSE;
+
+/* Огоньки клавиатуры в формате USB: бит 0 Num, 1 Caps, 2 Scroll */
+UINT8 kbd_led_bits(void)
+{
+    return (UINT8)((g_kbd_num ? 1u : 0u) | (g_kbd_caps ? 2u : 0u) |
+                   (g_kbd_scroll ? 4u : 0u));
+}
 UINT8   g_kbd_usb_mods = 0;   /* байт модификаторов из
                                          последнего USB-отчёта */
 UINT8   g_kbd_ps2_mods = 0;   /* то же, собранное из PS/2
@@ -130,6 +139,19 @@ void kbd_press_usage(UINT8 u)
 
     if (u == 0x39) {                        /* Caps Lock */
         g_kbd_caps = !g_kbd_caps;
+        g_kbd_leds_dirty = TRUE;             /* зажечь огонёк (usbhid.c) */
+        return;
+    }
+
+    if (u == 0x53) {                        /* Num Lock */
+        g_kbd_num = !g_kbd_num;
+        g_kbd_leds_dirty = TRUE;
+        return;
+    }
+
+    if (u == 0x47) {                        /* Scroll Lock */
+        g_kbd_scroll = !g_kbd_scroll;
+        g_kbd_leds_dirty = TRUE;
         return;
     }
 
@@ -151,7 +173,19 @@ void kbd_press_usage(UINT8 u)
     if (u == 0x51) { kbd_enqueue(0x02, 0); return; }   /* Down */
     if (u == 0x52) { kbd_enqueue(0x01, 0); return; }   /* Up */
 
-    /* цифровой блок (считаем, что NumLock включён) */
+    /* цифровой блок при выключенном NumLock - стрелки и т.п.
+       (как на любой PC-клавиатуре) */
+    if (!g_kbd_num && u >= 0x59 && u <= 0x63) {
+        static const UINT16 nav[11] = {
+            0x06, 0x02, 0x0A, 0x04, 0x00, 0x03, 0x05, 0x01, 0x09, 0x07, 0x08
+        };  /* 1 End, 2 Down, 3 PgDn, 4 Left, 5 -, 6 Right, 7 Home,
+               8 Up, 9 PgUp, 0 Ins, . Del */
+        if (nav[u - 0x59] != 0)
+            kbd_enqueue(nav[u - 0x59], 0);
+        return;
+    }
+
+    /* цифровой блок (NumLock включён) */
     if (u == 0x54) { kbd_enqueue(0, '/'); return; }
     if (u == 0x55) { kbd_enqueue(0, '*'); return; }
     if (u == 0x56) { kbd_enqueue(0, '-'); return; }
@@ -173,7 +207,7 @@ void kbd_press_usage(UINT8 u)
 /* Какие клавиши НЕ повторяются при удержании */
 BOOLEAN kbd_usage_repeats(UINT8 u)
 {
-    if (u == 0x39)                 /* Caps Lock */
+    if (u == 0x39 || u == 0x53 || u == 0x47)   /* Caps/Num/Scroll Lock */
         return FALSE;
 
     if (u >= 0xE0)                 /* модификаторы */

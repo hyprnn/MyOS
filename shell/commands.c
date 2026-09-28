@@ -51,6 +51,22 @@ void run_command(
 
         kernel_cmd_mem(st, out);
 
+    } else if (streq(line, "cpu")) {
+
+        kernel_cmd_cpu(out);
+
+    } else if (streq(line, "disk") || starts_with(line, "disk ")) {
+
+        char arg[32];
+        UINTN k = 0;
+
+        if (line[4] == ' ')
+            for (CHAR16 *c = line + 5; *c && k + 1 < sizeof(arg); c++)
+                arg[k++] = (*c < 128) ? (char)*c : '?';
+
+        arg[k] = '\0';
+        kernel_cmd_disk(out, arg);
+
     } else if (streq(line, "acpi")) {
 
         kernel_cmd_acpi(out);
@@ -186,6 +202,8 @@ void run_command(
         print(
             out,
             "  acpi          - ACPI tables: CPU cores, I/O APIC, HPET, PCIe, power\n"
+            "  cpu           - CPU load and interrupt counters\n"
+            "  disk [read N] - USB flash drives: list, show a sector\n"
         );
 
         print(
@@ -205,7 +223,7 @@ void run_command(
 
         print(
             out,
-            "  usb           - USB devices found by MyOS's own driver\n"
+            "  usb           - USB devices (tree with hubs), plug/unplug log\n"
         );
 
         print(

@@ -25,7 +25,7 @@ Its just an OS that is not a linux for or something like that.
 make            # собрать BOOTX64.EFI и kernel.elf (только изменённое)
 make run        # собрать ISO и запустить в QEMU; лог ОС - прямо в терминал
 make run-tablet # то же, мышь как планшет (без "упирания в стенки" в окне QEMU)
-make test       # автотест в QEMU без окна (~1 минута, 4 запуска)
+make test       # автотест в QEMU без окна (~3 минуты, 8 запусков)
 make clean
 ```
 
@@ -53,7 +53,7 @@ COM-порта лог молча выключен.
 | `myos.h` | общий заголовок: константы, типы, глобальные переменные, функции |
 | `lib/` | строки, `kprintf`, COM1, `memcpy`/`memset` |
 | `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `power.c` часы/перезагрузка/выключение |
-| `drivers/` | PCI, xHCI/USB HID, PS/2, клавиатура, разбор HID-дескрипторов |
+| `drivers/` | PCI, USB (xHCI, клавиатуры/мыши, хабы, флешки — с горячим подключением), PS/2 (клавиатура, мышь/тачпад), разбор HID-дескрипторов |
 | `gui/` | графическая оболочка (`start`), Сапёр, терминал в GUI |
 | `shell/` | команды шелла, ввод строки, RAM-диск, `fetch`, редактор |
 | `tools/` | `autotest.py`, `split_main.py` (как был разрезан старый `main.c`) |

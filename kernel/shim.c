@@ -185,7 +185,10 @@ EFI_STATUS EFIAPI kbs_locate_protocol(
         return EFI_SUCCESS;
     }
 
-    if (kx_guid_eq(protocol, &ptr_guid) && g_kmouse_present) {
+    /* Мышь отдаём, даже если её пока нет: её могут воткнуть
+       позже (горячее подключение), и GUI сразу её увидит */
+    if (kx_guid_eq(protocol, &ptr_guid) &&
+        (g_kmouse_present || g_kx.running || g_ps2_aux_present)) {
         *iface = &g_kptr;
         return EFI_SUCCESS;
     }
@@ -225,10 +228,12 @@ EFI_STATUS EFIAPI kconin_read_key(
     if (key == NULL)
         return K_EFI_INVALID_PARAMETER;
 
-    if (kbd_dequeue(key))
-        return EFI_SUCCESS;
+    /* очередь пополняется и в прерываниях - берём под замком */
+    kx_lock();
+    BOOLEAN got = kbd_dequeue(key);
+    kx_unlock();
 
-    return K_EFI_NOT_READY;
+    return got ? EFI_SUCCESS : K_EFI_NOT_READY;
 }
 
 
@@ -262,6 +267,8 @@ EFI_STATUS EFIAPI kptr_get_state(
     if (state == NULL)
         return K_EFI_INVALID_PARAMETER;
 
+    kx_lock();
+
     state->RelativeMovementX = (INT32)g_kmouse_dx;
     state->RelativeMovementY = (INT32)g_kmouse_dy;
     state->RelativeMovementZ = (INT32)g_kmouse_dz;
@@ -271,6 +278,8 @@ EFI_STATUS EFIAPI kptr_get_state(
     g_kmouse_dx = 0;
     g_kmouse_dy = 0;
     g_kmouse_dz = 0;
+
+    kx_unlock();
 
     return EFI_SUCCESS;
 }

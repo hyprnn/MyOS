@@ -15,9 +15,15 @@
  * ноутбуке после ExitBootServices не работала бы как раз родная
  * клавиатура. QEMU (машина по умолчанию) тоже эмулирует i8042.
  *
- * Работаем опросом (прерывания IRQ1 не нужны): бит 0 порта
- * 0x64 = "в порту 0x60 есть байт", бит 5 = "этот байт от мыши
- * (второй порт), а не от клавиатуры".
+ * С этапа 3 - по прерываниям: байт от клавиатуры = IRQ 1, от мыши
+ * (второй порт контроллера) = IRQ 12; линии и их настройку берём
+ * из ACPI (kx_irq_to_gsi), вектор - через I/O APIC. Бит 0 порта
+ * 0x64 = "в порту 0x60 есть байт", бит 5 = "этот байт от мыши, а не
+ * от клавиатуры". Опрос (ps2_poll) остаётся запасным путём.
+ *
+ * PS/2-мышь: у многих ноутбуков так подключён и тачпад (в режиме
+ * совместимости он притворяется обычной мышью). Протокол - пакеты по
+ * 3 байта (кнопки, dX, dY), у мыши с колесом - по 4.
  *
  * Коды - "Scan Code Set 1" (контроллер по умолчанию сам
  * переводит в него коды клавиатуры, бит 6 байта конфигурации
@@ -26,6 +32,12 @@
  */
 
 BOOLEAN g_ps2_present = FALSE;
+BOOLEAN g_ps2_aux_present = FALSE;   /* PS/2-мышь / тачпад */
+BOOLEAN g_ps2_aux_wheel = FALSE;
+BOOLEAN g_ps2_irq = FALSE;           /* работаем по прерываниям */
+UINT64  g_ps2_aux_packets = 0;
+static UINT8 g_aux_pkt[4];
+static UINTN g_aux_idx = 0;
 BOOLEAN g_ps2_e0 = FALSE;
 UINTN   g_ps2_skip = 0;       /* сколько байт Pause/Break
                                          ещё пропустить */
@@ -143,6 +155,172 @@ BOOLEAN ps2_wait_output_full(void)
     return FALSE;
 }
 
+static BOOLEAN ps2_cmd(UINT8 c)
+{
+    if (!ps2_wait_input_empty())
+        return FALSE;
+    io_out8(0x64, c);
+    return TRUE;
+}
+
+static BOOLEAN ps2_read_config(UINT8 *cfg)
+{
+    if (!ps2_cmd(0x20) || !ps2_wait_output_full())
+        return FALSE;
+    *cfg = io_in8(0x60);
+    return TRUE;
+}
+
+static void ps2_write_config(UINT8 cfg)
+{
+    if (ps2_cmd(0x60) && ps2_wait_input_empty())
+        io_out8(0x60, cfg);
+    g_ps2_config = cfg;
+}
+
+/* Ответ второго порта (мыши) - с таймаутом в мс; -1 = не ответила.
+   Только до включения прерываний (иначе байт заберёт обработчик). */
+static INTN ps2_aux_read(UINTN ms)
+{
+    UINT64 start = rdtsc();
+    UINT64 lim = (g_tsc_hz / 1000u) * (UINT64)ms;
+
+    while (rdtsc() - start < lim) {
+        UINT8 st = io_in8(0x64);
+        if (st & 0x01u) {
+            UINT8 b = io_in8(0x60);
+            if (st & 0x20u)
+                return b;
+            /* байт клавиатуры посреди настройки мыши - отдать ей */
+            ps2_handle_byte(b);
+        }
+        cpu_pause();
+    }
+
+    return -1;
+}
+
+/* Команда мыши: 0xD4 ("следующий байт - второму порту") + байт;
+   ждём подтверждения 0xFA */
+static BOOLEAN ps2_aux_send(UINT8 b)
+{
+    if (!ps2_cmd(0xD4) || !ps2_wait_input_empty())
+        return FALSE;
+
+    io_out8(0x60, b);
+
+    return ps2_aux_read(100) == 0xFA;
+}
+
+/* Найти и включить PS/2-мышь (тачпад). FALSE - её нет. */
+static BOOLEAN ps2_aux_init(void)
+{
+    /* 0xA8 - включить второй порт; если он есть, бит 5 байта
+       конфигурации ("часы второго порта выключены") станет 0 */
+    UINT8 cfg;
+
+    if (!ps2_cmd(0xA8) || !ps2_read_config(&cfg) || (cfg & 0x20u))
+        return FALSE;
+
+    /* сброс мыши: 0xFA, затем 0xAA (самотест пройден), 0x00 (ID) */
+    if (!ps2_aux_send(0xFF))
+        return FALSE;
+
+    if (ps2_aux_read(800) != 0xAA)
+        return FALSE;
+
+    ps2_aux_read(50);               /* ID = 0 */
+
+    /* "Волшебная" последовательность мыши с колесом (IntelliMouse):
+       частота 200, 100, 80 - после неё ID становится 3, и пакеты -
+       4 байта (четвёртый - колесо) */
+    ps2_aux_send(0xF3); ps2_aux_send(200);
+    ps2_aux_send(0xF3); ps2_aux_send(100);
+    ps2_aux_send(0xF3); ps2_aux_send(80);
+
+    if (ps2_aux_send(0xF2) && ps2_aux_read(50) == 3)
+        g_ps2_aux_wheel = TRUE;
+
+    ps2_aux_send(0xF3); ps2_aux_send(100);  /* 100 пакетов в секунду */
+
+    /* включить поток пакетов */
+    if (!ps2_aux_send(0xF4))
+        return FALSE;
+
+    g_aux_idx = 0;
+
+    return TRUE;
+}
+
+/* Байт от PS/2-мыши: собрать пакет */
+static void ps2_aux_byte(UINT8 b)
+{
+    /* у первого байта пакета бит 3 всегда 1 - если нет, мы
+       рассинхронизировались: ждём настоящее начало */
+    if (g_aux_idx == 0 && !(b & 0x08u))
+        return;
+
+    g_aux_pkt[g_aux_idx++] = b;
+
+    if (g_aux_idx < (g_ps2_aux_wheel ? 4u : 3u))
+        return;
+
+    g_aux_idx = 0;
+
+    UINT8 b0 = g_aux_pkt[0];
+
+    if (b0 & 0xC0u)                 /* переполнение - пакет мусорный */
+        return;
+
+    INT32 dx = (INT32)g_aux_pkt[1] - ((b0 & 0x10u) ? 256 : 0);
+    INT32 dy = (INT32)g_aux_pkt[2] - ((b0 & 0x20u) ? 256 : 0);
+
+    g_kmouse_dx += dx;
+    g_kmouse_dy -= dy;              /* у PS/2 "вверх" - плюс */
+
+    if (g_ps2_aux_wheel)
+        g_kmouse_dz -= (INT8)g_aux_pkt[3];
+
+    g_kmouse_buttons = b0 & 0x07u;  /* левая, правая, средняя */
+    g_kmouse_reports++;
+    g_ps2_aux_packets++;
+}
+
+/* Забрать всё, что есть в контроллере, и разнести по адресатам.
+   Только с запрещёнными прерываниями (в обработчике или под
+   замком). */
+void ps2_service(void)
+{
+    if (!g_ps2_present)
+        return;
+
+    for (UINTN i = 0; i < 32; i++) {
+
+        UINT8 st = io_in8(0x64);
+
+        if (!(st & 0x01u))
+            break;
+
+        UINT8 b = io_in8(0x60);
+
+        if (st & 0x20u) {
+            if (g_ps2_aux_present)
+                ps2_aux_byte(b);
+        } else {
+            ps2_handle_byte(b);
+        }
+    }
+}
+
+static void ps2_irq(void)
+{
+    ps2_service();
+}
+
+void ps2_poll(void)
+{
+    ps2_service();
+}
 
 void ps2_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
@@ -159,67 +337,90 @@ void ps2_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     for (UINTN i = 0; i < 32 && (io_in8(0x64) & 0x01u); i++)
         (void)io_in8(0x60);
 
-    /* прочитать байт конфигурации (команда 0x20) */
-    BOOLEAN have_cfg = FALSE;
+    UINT8 cfg = 0;
+    BOOLEAN have_cfg = ps2_read_config(&cfg);
 
-    if (ps2_wait_input_empty()) {
-
-        io_out8(0x64, 0x20);
-
-        if (ps2_wait_output_full()) {
-            g_ps2_config = io_in8(0x60);
-            have_cfg = TRUE;
-        }
-    }
+    g_ps2_config = cfg;
 
     if (have_cfg) {
-
-        /* бит 6 - перевод в Set 1 (нужен нам), бит 4 - 1 =
-           клавиатурный порт ВЫКЛЮЧЕН (нужен 0) */
-        UINT8 want = (UINT8)((g_ps2_config | 0x40u) & ~0x10u);
-
-        if (want != g_ps2_config && ps2_wait_input_empty()) {
-
-            io_out8(0x64, 0x60);
-
-            if (ps2_wait_input_empty())
-                io_out8(0x60, want);
-
-            g_ps2_config = want;
-        }
+        /* пока настраиваем - без прерываний от контроллера (биты 0,
+           1); бит 6 - перевод в Set 1 (нужен), бит 4 = 0 - клавиатура
+           включена */
+        ps2_write_config((UINT8)((cfg | 0x40u) & ~0x13u));
     }
 
-    /* 0xAE - включить клавиатурный порт (на случай, если
-       прошивка его выключила) */
-    if (ps2_wait_input_empty())
-        io_out8(0x64, 0xAE);
+    /* 0xAE - включить клавиатурный порт */
+    ps2_cmd(0xAE);
 
     g_ps2_present = TRUE;
 
-    print(out, "  PS/2 (i8042): present, config=0x");
-    print_hex(out, g_ps2_config, 2);
-    print(out, have_cfg ? "" : " (could not read)");
-    print(out, " - keyboard polled on ports 0x60/0x64\n");
+    /* мышь / тачпад на втором порту */
+    g_ps2_aux_present = have_cfg && ps2_aux_init();
+
+    /* --- прерывания: IRQ 1 (клавиатура) и IRQ 12 (мышь) --- */
+    BOOLEAN lvl, low;
+    UINT32 gsi1 = kx_irq_to_gsi(1, &lvl, &low);
+    BOOLEAN ok1 = kx_ioapic_route(gsi1, KX_VEC_PS2_KBD, lvl, low);
+    BOOLEAN ok12 = FALSE;
+    UINT32 gsi12 = 0;
+
+    if (g_ps2_aux_present) {
+        gsi12 = kx_irq_to_gsi(12, &lvl, &low);
+        ok12 = kx_ioapic_route(gsi12, KX_VEC_PS2_AUX, lvl, low);
+    }
+
+    kx_irq_register(KX_VEC_PS2_KBD, ps2_irq);
+    kx_irq_register(KX_VEC_PS2_AUX, ps2_irq);
+
+    if (have_cfg && ps2_read_config(&cfg)) {
+        if (ok1)
+            cfg |= 0x01u;           /* прерывание от клавиатуры */
+        if (ok12)
+            cfg |= 0x02u;           /* прерывание от мыши */
+        ps2_write_config(cfg);
+    }
+
+    g_ps2_irq = ok1;
+
+    kprintf(out, "  PS/2 (i8042): present, config=0x%02x - keyboard on %s",
+            g_ps2_config, ok1 ? "IRQ 1" : "polling");
+    if (ok1)
+        kprintf(out, " (GSI %u, vector 0x%02x)", gsi1, KX_VEC_PS2_KBD);
+    print(out, "\n");
+
+    if (g_ps2_aux_present)
+        kprintf(out, "  PS/2 mouse/touchpad: found%s, IRQ 12 -> GSI %u%s\n",
+                g_ps2_aux_wheel ? " (with wheel)" : "", gsi12,
+                ok12 ? "" : " (NOT routed, polling)");
+    else
+        print(out, "  PS/2 mouse/touchpad: none (touchpads on new laptops are usually I2C)\n");
+
+    /* забрать то, что успело прийти за настройку */
+    ps2_service();
 }
 
-
-void ps2_poll(void)
+/* Огоньки PS/2-клавиатуры: команда 0xED + байт (бит 0 Scroll, 1 Num,
+   2 Caps). Подтверждения 0xFA заберёт обработчик прерывания -
+   ps2_handle_byte их игнорирует. */
+void ps2_set_leds(UINT8 usb_bits)
 {
     if (!g_ps2_present)
         return;
 
-    for (UINTN i = 0; i < 32; i++) {
+    UINT8 v = (UINT8)(((usb_bits & 4u) ? 1u : 0u) |     /* Scroll */
+                      ((usb_bits & 1u) ? 2u : 0u) |     /* Num */
+                      ((usb_bits & 2u) ? 4u : 0u));     /* Caps */
 
-        UINT8 st = io_in8(0x64);
+    if (!ps2_wait_input_empty())
+        return;
+    io_out8(0x60, 0xED);
 
-        if (!(st & 0x01u))
-            break;
+    /* клавиатура должна ответить 0xFA, прежде чем принять байт;
+       немного подождать (ответ может забрать и обработчик) */
+    for (UINTN i = 0; i < 2000; i++)
+        cpu_pause();
 
-        UINT8 b = io_in8(0x60);
-
-        if (st & 0x20u)
-            continue;        /* байт от PS/2-мыши - не наш */
-
-        ps2_handle_byte(b);
-    }
+    if (!ps2_wait_input_empty())
+        return;
+    io_out8(0x60, v);
 }

@@ -704,6 +704,11 @@ void kx_isr_dispatch(KX_ISR_FRAME *f)
     if (v == KX_VEC_TIMER) {
 
         g_kticks = g_kticks + 1;
+
+        /* раз в секунду - пересчитать загрузку процессора */
+        if (g_kticks % 1000u == 0)
+            kx_load_tick();
+
         kx_lapic_eoi();
         return;
     }
@@ -735,6 +740,11 @@ void kx_isr_dispatch(KX_ISR_FRAME *f)
         kx_panic(f);
         return;
     }
+
+    /* Прерывание устройства, у которого есть обработчик
+       (kernel/irq.c: PS/2, USB) */
+    if (kx_irq_dispatch((UINT8)v))
+        return;
 
     /* Неожиданное внешнее прерывание (все источники, о которых
        мы знаем, замаскированы - но на всякий случай не

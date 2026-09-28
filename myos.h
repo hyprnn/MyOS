@@ -724,6 +724,11 @@ typedef struct __attribute__((packed)) {
 } KX_IDT_ENTRY;
 
 #define KX_VEC_TIMER     0x40u
+#define KX_VEC_PS2_KBD   0x21u    /* IRQ 1 */
+#define KX_VEC_PS2_AUX   0x2Cu    /* IRQ 12 */
+#define KX_VEC_XHCI      0x50u    /* MSI от USB-контроллера */
+
+typedef void (*KX_IRQ_HANDLER)(void);
 #define KX_VEC_SPURIOUS  0xFFu
 
 extern void kx_isr_stubs(void) __attribute__((visibility("hidden")));
@@ -992,15 +997,20 @@ typedef struct {
 #define KX_RING_TRBS    256u
 #define KX_RING_USABLE  (KX_RING_TRBS - 1u)   /* последний - Link */
 #define KX_EV_TRBS      256u
-#define KX_MAX_DEVS     16
-#define KX_MAX_HID      16
+#define KX_MAX_DEVS     32
+#define KX_MAX_HID      32    /* "трубы" прерываний: HID + хабы */
+#define KX_MAX_HUBS     8
+#define KX_MAX_MSD      4
 #define KX_MAX_IF_PER_DEV 4
+#define KX_MAX_DEV_PAGES  24   /* DMA-страниц на устройство */
+#define KX_HUB_MAX_PORTS  15   /* больше в route string не влезает */
 #define KX_DMA_LIMIT    0x100000000ull        /* ниже 4 ГиБ */
 
 #define KX_ROLE_NONE        0
 #define KX_ROLE_KBD_BOOT    1
 #define KX_ROLE_MOUSE_RPT   2
 #define KX_ROLE_MOUSE_BOOT  3
+#define KX_ROLE_HUB         4   /* труба "изменились порты" хаба */
 
 #define KX_EP_RUN     0
 #define KX_EP_RESET   1    /* ждём завершения Reset Endpoint */
@@ -1012,22 +1022,45 @@ typedef struct {
     UINTN  seq;   /* сквозной номер следующего TRB (0,1,2,...) */
 } KX_RING;
 
+/*
+ * Устройство USB. Устройства образуют дерево: у каждого, кроме
+ * воткнутых прямо в контроллер, есть родитель - хаб.
+ */
 typedef struct {
     BOOLEAN used;
-    UINT8   port;
-    UINT8   speed;
     UINT8   slot;
+    UINT8   speed;         /* 1 FS, 2 LS, 3 HS, 4 SS, 5 SS+ */
+    UINT8   root_port;     /* порт контроллера, через который
+                              устройство подключено (1..) */
+    INT8    parent;        /* индекс хаба-родителя в g_kx_devs,
+                              -1 = прямо в порту контроллера */
+    UINT8   parent_port;   /* порт на хабе-родителе */
+    UINT8   depth;         /* 0 - в порту контроллера, 1 - за
+                              одним хабом, ... */
+    UINT32  route;         /* route string xHCI: по 4 бита на
+                              каждый хаб по пути */
+    UINT8   tt_slot;       /* LS/FS-устройство за HS-хабом: слот
+                              этого хаба (Transaction Translator) */
+    UINT8   tt_port;       /* ...и порт на нём */
     UINT16  vid;
     UINT16  pid;
     UINT8   dclass;
+    UINT8   dprotocol;
     UINT16  mps0;
     UINT64  dev_ctx;
     UINT64  in_ctx;
-    UINT64  buf;       /* страница под дескрипторы */
+    UINT64  buf;           /* страница под дескрипторы/запросы */
     KX_RING ep0;
     const char *status;
+    INT8    hub;           /* индекс в g_kx_hubs или -1 */
+    INT8    msd;           /* индекс в g_kx_msd или -1 */
+    UINT64  pages[KX_MAX_DEV_PAGES];   /* всё, что вернуть при
+                                          отключении */
+    UINT8   npages;
 } KX_DEV;
 
+/* Труба прерываний (Interrupt IN): отчёты HID-клавиатуры/мыши
+   или сообщения хаба "на таких-то портах что-то изменилось" */
 typedef struct {
     BOOLEAN used;
     UINT8   dev;          /* индекс в g_kx_devs */
@@ -1070,6 +1103,41 @@ typedef struct {
     INT64   abs_last_y;
 } KX_HID;
 
+/* USB-хаб */
+typedef struct {
+    BOOLEAN used;
+    UINT8   dev;              /* индекс в g_kx_devs */
+    UINT8   nports;
+    BOOLEAN ss;               /* хаб USB 3 (SuperSpeed) */
+    UINT8   think;            /* TT Think Time (для HS-хаба) */
+    UINT16  pwr_ms;           /* сколько ждать после включения питания */
+    UINT8   pipe;             /* индекс трубы в g_kx_hid */
+    volatile UINT32 pending;  /* биты: порт N изменился (бит 0 - сам хаб) */
+    INT8    child[KX_HUB_MAX_PORTS + 1];   /* устройство на порту */
+    UINT64  events;
+} KX_HUB;
+
+/* USB-флешка / диск (Mass Storage, Bulk-Only + SCSI) */
+typedef struct {
+    BOOLEAN used;
+    BOOLEAN ready;            /* ответил на READ CAPACITY */
+    UINT8   dev;
+    UINT8   iface;
+    UINT8   in_addr, out_addr;
+    UINT8   in_dci, out_dci;
+    UINT16  in_mps, out_mps;
+    KX_RING in_ring, out_ring;
+    UINT64  cmd_buf;          /* CBW/CSW */
+    UINT64  data_buf;         /* 4 КиБ данных */
+    UINT32  tag;
+    UINT64  blocks;           /* сколько секторов */
+    UINT32  block_size;       /* байт в секторе */
+    char    vendor[9];
+    char    product[17];
+    const char *note;
+    UINT64  reads, errors;
+} KX_MSD;
+
 typedef struct {
     BOOLEAN present;      /* контроллер найден до выхода */
     BOOLEAN running;      /* драйвер запущен и опрашивается */
@@ -1090,6 +1158,27 @@ typedef struct {
     UINT64  events;
     UINT64  port_events;
     UINT64  stray_events;
+
+    /* прерывания */
+    const char *irq_mode; /* "MSI", "MSI-X" или "polling" */
+    UINT64  irqs;
+
+    /* кто сейчас синхронно ждёт событие (см. kx_wait_event) */
+    volatile BOOLEAN wait_active;
+    volatile BOOLEAN wait_done;
+    UINT8   wait_type;
+    UINT64  wait_ptr;
+    UINT8   wait_slot, wait_ep;
+    UINT32  wait_ev[4];
+
+    /* корневые порты, на которых что-то изменилось (из обработчика
+       прерывания; разбирается в kx_service): бит 0 - было событие,
+       бит 1 - менялось подключение */
+    volatile UINT8 root_change[256];
+    volatile BOOLEAN any_change;
+
+    UINT64  hot_added;
+    UINT64  hot_removed;
 } KX_STATE;
 
 
@@ -1105,6 +1194,28 @@ typedef struct {
     UINT8  interval;
     UINT16 rdesc_len;
 } KX_HID_CAND;
+
+/* Конечная точка для команды Configure Endpoint */
+typedef struct {
+    UINT8  dci;
+    UINT8  type;          /* 2 Bulk OUT, 3 Interrupt OUT, 6 Bulk IN,
+                             7 Interrupt IN */
+    UINT16 maxpkt;
+    UINT8  burst;
+    UINT8  interval;      /* поле Interval xHCI (для прерываний) */
+    UINT64 ring;
+    UINT16 avg;
+    UINT32 esit;
+} KX_EPCFG;
+
+/* Интерфейс флешки, найденный в Configuration Descriptor */
+typedef struct {
+    BOOLEAN found;
+    UINT8  iface;
+    UINT8  in_addr, out_addr;
+    UINT16 in_mps, out_mps;
+    UINT8  in_burst, out_burst;
+} KX_MSD_CAND;
 
 
 /* ================================================================
@@ -1831,6 +1942,21 @@ void kx_shutdown(void);
 const UINT8 *acpi_find_table(const char *sig);
 void acpi_power_init(void);
 
+/* --- kernel/irq.c --- */
+extern UINT64 g_irq_count[256];
+extern volatile UINT64 g_idle_tsc;
+extern volatile UINT32 g_cpu_load_permille;
+extern volatile UINT32 g_cpu_load_valid;
+void kx_irq_register(UINT8 vector, KX_IRQ_HANDLER fn);
+BOOLEAN kx_irq_dispatch(UINT8 vector);
+UINT32 kx_irq_to_gsi(UINT8 irq, BOOLEAN *level, BOOLEAN *active_low);
+BOOLEAN kx_ioapic_route(UINT32 gsi, UINT8 vector, BOOLEAN level, BOOLEAN active_low);
+UINT8 pci_find_cap(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 id);
+const char *kx_pci_enable_msi(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 vector);
+void kx_idle_hlt(void);
+void kx_load_tick(void);
+void kernel_cmd_cpu(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
 /* --- kernel/kmain.c --- */
 void kmain(MYOS_BOOT_INFO *bi) __attribute__((noreturn));
 
@@ -1869,6 +1995,9 @@ void kbd_usb_boot_report(
     UINT8 prev[6]
 );
 void kbd_repeat_tick(void);
+UINT8 kbd_led_bits(void);
+extern BOOLEAN g_kbd_num;
+extern BOOLEAN g_kbd_scroll;
 
 /* --- drivers/ps2.c --- */
 UINT8 ps2_e0_to_hid(UINT8 code);
@@ -1877,52 +2006,82 @@ BOOLEAN ps2_wait_input_empty(void);
 BOOLEAN ps2_wait_output_full(void);
 void ps2_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void ps2_poll(void);
+void ps2_service(void);
+void ps2_set_leds(UINT8 usb_bits);
+extern BOOLEAN g_ps2_aux_present;
+extern BOOLEAN g_ps2_aux_wheel;
+extern BOOLEAN g_ps2_irq;
+extern UINT64  g_ps2_aux_packets;
 
 /* --- drivers/usb.c --- */
+#define KX_LOG_LINES 12
+#define KX_LOG_LEN   96
+void kx_lock(void);
+void kx_unlock(void);
+void kx_msleep(UINTN ms);
+void kx_out(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+void kx_event_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void kx_print_event_log(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 UINT32 kx_ring_pcs(UINTN seq);
 UINT64 kx_ring_slot_addr(KX_RING *r, UINTN seq);
 void kx_ring_init(KX_RING *r, UINT64 phys);
-UINT64 kx_ring_push(
-    KX_RING *r,
-    UINT32 d0, UINT32 d1, UINT32 d2, UINT32 d3
-);
+UINT64 kx_ring_push(KX_RING *r, UINT32 d0, UINT32 d1, UINT32 d2, UINT32 d3);
 void kx_erdp_update(void);
 BOOLEAN kx_ev_fetch(UINT32 ev[4]);
 void kx_doorbell(UINT8 slot, UINT32 target);
 UINT64 kx_dma_page(void);
+UINT64 kx_dev_page(KX_DEV *d);
+void kx_pump(void);
 void kx_handle_async_event(UINT32 ev[4]);
-BOOLEAN kx_wait_event(
-    UINT8 type,
-    UINT64 match_ptr,
-    UINT8 slot,
-    UINT8 epid,
-    UINT32 out_ev[4],
-    UINTN timeout_ms
-);
-UINT8 kx_command(
-    UINT32 d0, UINT32 d1, UINT32 d2, UINT32 d3,
-    UINT8 *out_slot
-);
+BOOLEAN kx_wait_event(UINT8 type, UINT64 match_ptr, UINT8 slot, UINT8 epid,
+                      UINT32 out_ev[4], UINTN timeout_ms);
+UINT8 kx_command(UINT32 d0, UINT32 d1, UINT32 d2, UINT32 d3, UINT8 *out_slot);
 void kx_recover_sync(UINT8 slot, UINT8 dci, KX_RING *r);
-UINT8 kx_control(
-    KX_DEV *d,
-    UINT8 bm_request_type,
-    UINT8 b_request,
-    UINT16 w_value,
-    UINT16 w_index,
-    UINT16 w_length,
-    UINT64 data_phys
-);
-void kx_hid_queue(KX_HID *h);
-void kx_mouse_report_layout(KX_HID *h, volatile UINT8 *rep, UINTN len);
-void kx_hid_report(KX_HID *h, UINTN len);
-void kx_poll(void);
+UINT8 kx_control(KX_DEV *d, UINT8 bm_request_type, UINT8 b_request,
+                 UINT16 w_value, UINT16 w_index, UINT16 w_length, UINT64 data_phys);
+UINT8 kx_bulk(KX_DEV *d, UINT8 dci, UINT8 ep_addr, KX_RING *r,
+              UINT64 buf, UINT32 len, UINT32 *actual, UINTN timeout_ms);
+void kx_usb_irq(void);
+UINT8 kx_interval_field(UINT8 speed, UINT8 b_interval);
+UINT8 kx_configure_eps(KX_DEV *d, KX_EPCFG *eps, UINTN n, UINT8 hub_ports, UINT8 tt_think);
 const char *kx_speed_name(UINT8 s);
-const char *kx_role_name(UINT8 r);
-BOOLEAN kx_mouse_switch_to_boot(KX_DEV *d, UINT8 iface, KX_HID *h);
-void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p);
+void kx_dev_path(KX_DEV *d, char *buf, UINTN cap);
+INTN kx_enum_device(SIMPLE_TEXT_OUTPUT_INTERFACE *out, INTN parent, UINT8 parent_port,
+                    UINT8 root_port, UINT8 speed);
+void kx_remove_device(UINTN di);
+void kx_root_port_connect(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p);
+void kx_service(void);
 void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void kernel_poll_input(void);
+
+/* --- drivers/usbhid.c --- */
+extern volatile BOOLEAN g_kbd_leds_dirty;
+const char *kx_role_name(UINT8 r);
+void kx_pipe_queue(KX_HID *h);
+void kx_pipe_report(KX_HID *h, UINTN len);
+INTN kx_pipe_alloc(void);
+UINTN kx_hid_prepare(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di,
+                     KX_HID_CAND *cand, UINTN ncand,
+                     KX_EPCFG *eps, UINTN *neps, UINTN *pipes);
+void kx_hid_start(UINTN *pipes, UINTN n);
+void kx_hid_update_presence(void);
+void kx_pipes_watchdog(void);
+void kx_hid_service_leds(void);
+
+/* --- drivers/usbhub.c --- */
+extern KX_HUB g_kx_hubs[KX_MAX_HUBS];
+void kx_hub_setup(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di);
+void kx_hub_report(KX_HID *h, volatile UINT8 *rep, UINTN len);
+void kx_hub_service(void);
+
+/* --- drivers/usbmsd.c --- */
+extern KX_MSD g_kx_msd[KX_MAX_MSD];
+INTN kx_msd_prepare(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di,
+                    KX_MSD_CAND *c, KX_EPCFG *eps, UINTN *neps);
+void kx_msd_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN mi);
+BOOLEAN usb_disk_read(UINTN disk, UINT64 lba, UINT32 count, VOID *dst);
+void kernel_cmd_disk(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 
 /* --- kernel/shim.c --- */
 EFI_STATUS EFIAPI kbs_unsupported(void);

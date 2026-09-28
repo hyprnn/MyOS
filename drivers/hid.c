@@ -562,6 +562,10 @@ void hid_parse_report_descriptor(
 
     /* --- печатаем человеко-читаемый итог разбора --- */
 
+    /* фоновое подключение (горячее, в GUI) - печатать некуда */
+    if (out == NULL)
+        return;
+
     print(out, "\nReport Descriptor parsed (");
     print_uint(out, desc_len);
     print(out, " bytes):\n");

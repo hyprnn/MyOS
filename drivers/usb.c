@@ -1,16 +1,150 @@
 /*
- * drivers/usb.c - неблокирующий xHCI + USB HID драйвер kernel mode.
+ * drivers/usb.c - USB-контроллер xHCI: ядро драйвера.
  * Часть MyOS; общие объявления - в myos.h.
+ *
+ * Что здесь:
+ *   * кольца TRB и разбор событий контроллера;
+ *   * синхронные операции (команды контроллеру, control-запросы на
+ *     Endpoint 0, bulk-передачи) - для настройки устройств;
+ *   * перечисление устройства (Enable Slot, Address Device,
+ *     дескрипторы) - и в порту контроллера, и за хабом;
+ *   * горячее подключение и отключение;
+ *   * прерывание от контроллера (MSI).
+ * Отдельно: usbhid.c (клавиатуры и мыши), usbhub.c (хабы),
+ * usbmsd.c (флешки).
+ *
+ * ДВА "ПОТОКА" И ЗАМОК.
+ * Процессор один, но код драйвера выполняется в двух местах:
+ *   1. в обработчике прерывания (kx_usb_irq) - контроллер сообщил о
+ *      событиях: пришёл отчёт мыши, изменился порт;
+ *   2. в "основном" коде - шелл/GUI спрашивают ввод, и тут же
+ *      (kx_service) выполняется всё, что требует ожидания: настройка
+ *      нового устройства, отключение, светодиоды клавиатуры.
+ * Обработчик прерывания никогда ничего не ждёт. А основной код, пока
+ * трогает общие структуры (кольца, списки устройств), держит "замок"
+ * kx_lock - то есть просто запрещает прерывания. Во время долгих
+ * ожиданий (сброс порта, ответ устройства) замок ненадолго
+ * отпускается (kx_relax), чтобы таймер и клавиатура не простаивали;
+ * если событие, которого ждёт основной код, заберёт обработчик
+ * прерывания - он положит его в "ящик" g_kx.wait_*.
  */
 #include "myos.h"
 
 KX_STATE g_kx;
-
 KX_DEV g_kx_devs[KX_MAX_DEVS];
 KX_HID g_kx_hid[KX_MAX_HID];
 
+/* ================================================================
+ * Замок
+ * ================================================================ */
 
-/* --- кольца, где МЫ производитель (Command/Transfer) --- */
+static UINTN   g_kx_lock_depth = 0;
+static BOOLEAN g_kx_lock_if = FALSE;    /* были ли прерывания включены
+                                           до первого захвата */
+static volatile BOOLEAN g_kx_in_irq = FALSE;
+
+void kx_lock(void)
+{
+    UINT64 fl;
+
+    __asm__ __volatile__("pushfq; popq %0; cli" : "=r"(fl) : : "memory");
+
+    if (g_kx_lock_depth++ == 0)
+        g_kx_lock_if = (fl & (1u << 9)) != 0;
+}
+
+void kx_unlock(void)
+{
+    if (g_kx_lock_depth == 0)
+        return;
+
+    if (--g_kx_lock_depth == 0 && g_kx_lock_if)
+        __asm__ __volatile__("sti" ::: "memory");
+}
+
+/* Посреди долгого ожидания: на мгновение пустить прерывания */
+static void kx_relax(void)
+{
+    if (g_kx_lock_depth > 0 && g_kx_lock_if && !g_kx_in_irq) {
+        __asm__ __volatile__("sti; nop; nop; nop; nop; cli" ::: "memory");
+    } else {
+        cpu_pause();
+    }
+}
+
+/* Пауза в миллисекундах, во время которой прерывания работают */
+void kx_msleep(UINTN ms)
+{
+    UINT64 start = rdtsc();
+    UINT64 cycles = (g_tsc_hz / 1000u) * (UINT64)ms;
+
+    if (g_tsc_hz == 0) {
+        busy_wait_ms(ms);
+        return;
+    }
+
+    while (rdtsc() - start < cycles)
+        kx_relax();
+}
+
+/* Сообщение: либо в консоль (out != NULL), либо только в лог COM1
+   (фоновое подключение - в GUI писать на экран нельзя) */
+void kx_out(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+
+    va_start(ap, fmt);
+    kvsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (out != NULL)
+        print(out, buf);
+    else
+        klog("usb: %s", buf);
+}
+
+/* ================================================================
+ * Журнал подключений (команда usb)
+ * ================================================================ */
+
+static char  g_kx_log[KX_LOG_LINES][KX_LOG_LEN];
+static UINTN g_kx_log_n = 0;
+
+void kx_event_log(const char *fmt, ...)
+{
+    char *dst = g_kx_log[g_kx_log_n % KX_LOG_LINES];
+    va_list ap;
+    UINT64 ms = kx_uptime_us() / 1000u;
+    UINTN n = ksnprintf(dst, KX_LOG_LEN, "[%4llu.%01llu s] ", ms / 1000u, (ms / 100u) % 10u);
+
+    if (n >= KX_LOG_LEN)
+        n = KX_LOG_LEN - 1;
+
+    va_start(ap, fmt);
+    kvsnprintf(dst + n, KX_LOG_LEN - n, fmt, ap);
+    va_end(ap);
+
+    klog("usb event: %s\n", dst);
+    g_kx_log_n++;
+}
+
+void kx_print_event_log(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    UINTN first = (g_kx_log_n > KX_LOG_LINES) ? g_kx_log_n - KX_LOG_LINES : 0;
+
+    if (g_kx_log_n == 0) {
+        print(out, "  (no plug/unplug events since boot)\n");
+        return;
+    }
+
+    for (UINTN i = first; i < g_kx_log_n; i++)
+        kprintf(out, "  %s\n", g_kx_log[i % KX_LOG_LINES]);
+}
+
+/* ================================================================
+ * Кольца, где МЫ производитель (Command / Transfer)
+ * ================================================================ */
 
 UINT32 kx_ring_pcs(UINTN seq)
 {
@@ -41,20 +175,13 @@ void kx_ring_init(KX_RING *r, UINT64 phys)
 
 /*
  * Положить TRB в кольцо (d3 - без Cycle-бита, его ставит сама
- * функция). Возвращает физический адрес TRB (по нему потом
- * находится Command Completion Event этой команды).
+ * функция). Возвращает физический адрес TRB.
  *
- * Link TRB и Cycle-бит (важно, это ровно то место, где раньше
- * прятались баги с "замиранием" на 256-м отчёте): Cycle-бит -
- * это "флажок владения". TRB принадлежит контроллеру, только
- * если его Cycle совпадает с внутренним Cycle State контроллера,
- * который переворачивается каждый раз, когда контроллер проходит
- * по Link TRB в конце страницы. Значит, и Link TRB должен
- * "отдаваться" контроллеру так же, как обычный TRB - в момент,
- * когда МЫ переходим через конец кольца, с Cycle ТЕКУЩЕГО
- * (заканчивающегося) круга. До этого момента у Link TRB Cycle
- * от предыдущего круга, и контроллер, догнав нас, честно
- * останавливается перед ним. Так делает и Linux.
+ * Cycle-бит - "флажок владения": TRB принадлежит контроллеру, если
+ * его Cycle совпадает с внутренним Cycle State контроллера, который
+ * переворачивается при каждом проходе по Link TRB. Link TRB
+ * "отдаётся" контроллеру в момент, когда МЫ переходим через конец
+ * кольца, с Cycle текущего круга (так делает и Linux).
  */
 UINT64 kx_ring_push(
     KX_RING *r,
@@ -67,8 +194,7 @@ UINT64 kx_ring_push(
     if (slot == 0 && r->seq > 0) {
 
         volatile UINT32 *link =
-            (volatile UINT32 *)P2V
-                (r->phys + (KX_RING_TRBS - 1u) * 16u);
+            (volatile UINT32 *)P2V(r->phys + (KX_RING_TRBS - 1u) * 16u);
 
         link[3] = (6u << 10) | (1u << 1) | (pcs ^ 1u);
     }
@@ -91,8 +217,9 @@ UINT64 kx_ring_push(
     return addr;
 }
 
-
-/* --- Event Ring, где производитель - контроллер --- */
+/* ================================================================
+ * Event Ring (производитель - контроллер)
+ * ================================================================ */
 
 void kx_erdp_update(void)
 {
@@ -104,13 +231,11 @@ void kx_erdp_update(void)
     mmio_write32(g_kx.intr0 + 0x1C, (UINT32)(a >> 32));
 }
 
-/* Взять следующее событие, если оно есть (копией - слот в
-   кольце сразу освобождается) */
+/* Взять следующее событие, если оно есть */
 BOOLEAN kx_ev_fetch(UINT32 ev[4])
 {
     volatile UINT32 *t =
-        (volatile UINT32 *)P2V
-            (g_kx.evring + (UINT64)(g_kx.ev_deq % KX_EV_TRBS) * 16u);
+        (volatile UINT32 *)P2V(g_kx.evring + (UINT64)(g_kx.ev_deq % KX_EV_TRBS) * 16u);
 
     UINT32 cyc = ((g_kx.ev_deq / KX_EV_TRBS) % 2u == 0) ? 1u : 0u;
     UINT32 d3 = t[3];
@@ -126,11 +251,8 @@ BOOLEAN kx_ev_fetch(UINT32 ev[4])
     g_kx.ev_deq++;
     g_kx.events++;
 
-    kx_erdp_update();
-
     return TRUE;
 }
-
 
 void kx_doorbell(UINT8 slot, UINT32 target)
 {
@@ -142,213 +264,85 @@ UINT64 kx_dma_page(void)
     return pmm_alloc_zeroed(1, KX_DMA_LIMIT);
 }
 
-
-/*
- * Обработка события, которого сейчас никто синхронно не ждёт:
- * отчёты работающих устройств, шаги восстановления после ошибок,
- * изменения портов.
- */
-void kx_handle_async_event(UINT32 ev[4])
+/* Страница, которая будет возвращена при отключении устройства */
+UINT64 kx_dev_page(KX_DEV *d)
 {
-    UINT8 type = (UINT8)((ev[3] >> 10) & 0x3Fu);
-    UINT8 cc = (UINT8)((ev[2] >> 24) & 0xFFu);
+    if (d->npages >= KX_MAX_DEV_PAGES)
+        return 0;
 
-    if (type == 32) {
+    UINT64 p = kx_dma_page();
 
-        /* Transfer Event */
-        UINT8 slot = (UINT8)((ev[3] >> 24) & 0xFFu);
-        UINT8 epid = (UINT8)((ev[3] >> 16) & 0x1Fu);
+    if (p != 0)
+        d->pages[d->npages++] = p;
 
-        KX_HID *h = NULL;
-
-        for (UINTN i = 0; i < KX_MAX_HID; i++) {
-
-            KX_HID *c = &g_kx_hid[i];
-
-            if (
-                c->used && c->role != KX_ROLE_NONE &&
-                g_kx_devs[c->dev].slot == slot && c->dci == epid
-            ) {
-                h = c;
-                break;
-            }
-        }
-
-        UINT64 trb_ptr = (UINT64)ev[0] | ((UINT64)ev[1] << 32);
-
-        if (h == NULL || h->state != KX_EP_RUN || trb_ptr != h->last_trb) {
-            /* не наш/запоздавший/повторный - не трогаем кольцо,
-               иначе на конечной точке оказалось бы два TRB */
-            g_kx.stray_events++;
-            return;
-        }
-
-        if (cc == 1 || cc == 13) {
-
-            /* в младших 24 битах - сколько байт НЕ пришло */
-            UINT32 residue = ev[2] & 0xFFFFFFu;
-            UINTN len =
-                (residue <= h->req_len) ? (h->req_len - residue) : 0;
-
-            h->reports++;
-            h->err_streak = 0;
-
-            {
-                volatile UINT8 *r = (volatile UINT8 *)P2V(h->rep_buf);
-
-                h->last_len = len;
-
-                for (UINTN k = 0; k < 16; k++)
-                    h->last_rep[k] = (k < len) ? r[k] : 0;
-            }
-
-            kx_hid_report(h, len);
-            kx_hid_queue(h);
-            return;
-        }
-
-        h->errors++;
-        h->last_err = cc;
-        h->err_streak++;
-
-        klog("usb: slot %u EP %u error cc=%u (streak %u)\n",
-             slot, h->dci, cc, h->err_streak);
-
-        /*
-         * РАНЬШЕ: после 200 ошибок ЗА ВСЁ ВРЕМЯ конечная точка
-         * выключалась навсегда. У беспроводного донгла, который
-         * шлёт отчёты до 1000 раз в секунду, редкие ошибки
-         * передачи - норма, и 200 штук могли набежать за
-         * секунды - мышь "немного двигалась и умирала". Теперь
-         * сдаёмся только после многих ошибок ПОДРЯД, без единого
-         * удачного отчёта между ними.
-         */
-        if (h->err_streak > 64) {
-            h->state = KX_EP_DEAD;
-            return;
-        }
-
-        if (cc == 21) {
-
-            /* Missed Service Error: контроллер не успел
-               обслужить конечную точку в её интервал. Она при
-               этом НЕ останавливается (не Halted) - Reset
-               Endpoint тут не нужен и даже вернул бы ошибку
-               "неверное состояние". TRB уже списан - просто
-               ставим следующий. */
-            kx_hid_queue(h);
-            return;
-        }
-
-        /* Остальные ошибки (Transaction Error, Babble, Stall...)
-           останавливают конечную точку (Halted).
-           Шаг 1 восстановления - Reset Endpoint Command */
-        h->recoveries++;
-        h->recover_tsc = rdtsc();
-        h->state = KX_EP_RESET;
-        h->pending_cmd =
-            kx_ring_push(
-                &g_kx.cmd, 0, 0, 0,
-                ((UINT32)slot << 24) | ((UINT32)h->dci << 16) |
-                    (14u << 10)
-            );
-        kx_doorbell(0, 0);
-        return;
-    }
-
-    if (type == 33) {
-
-        /* Command Completion Event - наше ли это восстановление? */
-        UINT64 ptr = (UINT64)ev[0] | ((UINT64)ev[1] << 32);
-
-        for (UINTN i = 0; i < KX_MAX_HID; i++) {
-
-            KX_HID *h = &g_kx_hid[i];
-
-            if (!h->used || h->pending_cmd != ptr || ptr == 0)
-                continue;
-
-            UINT8 slot = g_kx_devs[h->dev].slot;
-
-            h->last_cmd_cc = cc;
-
-            if (h->state == KX_EP_RESET && cc == 19) {
-
-                /* Context State Error: конечная точка на самом деле
-                   не была остановлена (ошибка оказалась из тех,
-                   после которых контроллер продолжает сам) - ни
-                   Reset, ни Set TR Dequeue ей не нужны */
-                h->state = KX_EP_RUN;
-                h->pending_cmd = 0;
-                kx_hid_queue(h);
-
-            } else if (h->state == KX_EP_RESET) {
-
-                /* Шаг 2 - Set TR Dequeue Pointer: сказать
-                   контроллеру, что кольцо продолжается с нашего
-                   следующего свободного TRB (сбойный TRB
-                   пропускаем) */
-                UINT64 deq = kx_ring_slot_addr(&h->ring, h->ring.seq);
-                UINT32 dcs = kx_ring_pcs(h->ring.seq);
-
-                h->state = KX_EP_SETDEQ;
-                h->pending_cmd =
-                    kx_ring_push(
-                        &g_kx.cmd,
-                        (UINT32)(deq & 0xFFFFFFF0u) | dcs,
-                        (UINT32)(deq >> 32),
-                        0,
-                        ((UINT32)slot << 24) |
-                            ((UINT32)h->dci << 16) | (16u << 10)
-                    );
-                kx_doorbell(0, 0);
-
-            } else if (h->state == KX_EP_SETDEQ) {
-
-                /* Шаг 3 - снова работаем */
-                h->state = KX_EP_RUN;
-                h->pending_cmd = 0;
-                kx_hid_queue(h);
-            }
-
-            return;
-        }
-
-        g_kx.stray_events++;
-        return;
-    }
-
-    if (type == 34) {
-
-        /* Port Status Change Event: номер порта в битах 31:24
-           первого слова. Сбрасываем флаги изменений порта
-           (иначе следующих событий по этому порту не будет) */
-        UINT32 port = (ev[0] >> 24) & 0xFFu;
-
-        g_kx.port_events++;
-
-        if (port >= 1 && port <= g_kx.cap.MaxPorts) {
-
-            UINT64 pb = g_kx.op + 0x400u + (UINT64)(port - 1u) * 0x10u;
-            UINT32 cur = mmio_read32(pb);
-
-            mmio_write32(
-                pb,
-                portsc_base_for_write(cur) | (cur & PORTSC_RW1CS_MASK)
-            );
-        }
-
-        return;
-    }
-
-    g_kx.stray_events++;
+    return p;
 }
 
+/* Подходит ли событие тому, кто сейчас ждёт синхронно */
+static BOOLEAN kx_wait_matches(UINT32 ev[4])
+{
+    if (!g_kx.wait_active || g_kx.wait_done)
+        return FALSE;
+
+    UINT8 t = (UINT8)((ev[3] >> 10) & 0x3Fu);
+
+    if (t != g_kx.wait_type)
+        return FALSE;
+
+    if (t == 33) {
+        UINT64 ptr = (UINT64)ev[0] | ((UINT64)ev[1] << 32);
+        return ptr == g_kx.wait_ptr;
+    }
+
+    if (t == 32)
+        return ((UINT8)((ev[3] >> 24) & 0xFFu) == g_kx.wait_slot) &&
+               ((UINT8)((ev[3] >> 16) & 0x1Fu) == g_kx.wait_ep);
+
+    return FALSE;
+}
+
+/*
+ * Разобрать все накопившиеся события. Вызывается ТОЛЬКО с
+ * запрещёнными прерываниями: из обработчика прерывания или под
+ * замком.
+ */
+void kx_pump(void)
+{
+    if (!g_kx.running)
+        return;
+
+    BOOLEAN any = FALSE;
+
+    for (UINTN i = 0; i < 256; i++) {
+
+        UINT32 ev[4];
+
+        if (!kx_ev_fetch(ev))
+            break;
+
+        any = TRUE;
+
+        if (kx_wait_matches(ev)) {
+            g_kx.wait_ev[0] = ev[0];
+            g_kx.wait_ev[1] = ev[1];
+            g_kx.wait_ev[2] = ev[2];
+            g_kx.wait_ev[3] = ev[3];
+            g_kx.wait_done = TRUE;
+            continue;
+        }
+
+        kx_handle_async_event(ev);
+    }
+
+    /* сказать контроллеру, докуда мы дочитали (заодно сбрасывает
+       бит "обработчик занят") - один раз за пачку */
+    if (any)
+        kx_erdp_update();
+}
 
 /*
  * Синхронное ожидание конкретного события (с таймаутом по TSC).
- *   type 33 (Command Completion) - совпадение по адресу TRB
- *           команды (match_ptr);
+ *   type 33 (Command Completion) - совпадение по адресу TRB команды;
  *   type 32 (Transfer) - по SlotID + номеру конечной точки.
  * Всё постороннее - в kx_handle_async_event.
  */
@@ -361,50 +355,44 @@ BOOLEAN kx_wait_event(
     UINTN timeout_ms
 )
 {
+    kx_lock();
+
+    g_kx.wait_type = type;
+    g_kx.wait_ptr = match_ptr;
+    g_kx.wait_slot = slot;
+    g_kx.wait_ep = epid;
+    g_kx.wait_done = FALSE;
+    g_kx.wait_active = TRUE;
+
     UINT64 start = rdtsc();
     UINT64 limit = (g_tsc_hz / 1000u) * (UINT64)timeout_ms;
+    BOOLEAN ok = FALSE;
 
     for (;;) {
 
-        UINT32 ev[4];
+        kx_pump();
 
-        if (kx_ev_fetch(ev)) {
-
-            UINT8 t = (UINT8)((ev[3] >> 10) & 0x3Fu);
-            BOOLEAN match = FALSE;
-
-            if (t == type && type == 33) {
-
-                UINT64 ptr = (UINT64)ev[0] | ((UINT64)ev[1] << 32);
-                match = (ptr == match_ptr);
-
-            } else if (t == type && type == 32) {
-
-                match =
-                    ((UINT8)((ev[3] >> 24) & 0xFFu) == slot) &&
-                    ((UINT8)((ev[3] >> 16) & 0x1Fu) == epid);
-            }
-
-            if (match) {
-
-                out_ev[0] = ev[0];
-                out_ev[1] = ev[1];
-                out_ev[2] = ev[2];
-                out_ev[3] = ev[3];
-                return TRUE;
-            }
-
-            kx_handle_async_event(ev);
-            continue;
+        if (g_kx.wait_done) {
+            out_ev[0] = g_kx.wait_ev[0];
+            out_ev[1] = g_kx.wait_ev[1];
+            out_ev[2] = g_kx.wait_ev[2];
+            out_ev[3] = g_kx.wait_ev[3];
+            ok = TRUE;
+            break;
         }
 
         if (rdtsc() - start > limit)
-            return FALSE;
+            break;
 
-        cpu_pause();
+        kx_relax();
     }
-}
 
+    g_kx.wait_active = FALSE;
+
+    kx_unlock();
+
+    return ok;
+}
 
 /* Команда контроллеру через Command Ring. Возвращает Completion
    Code (1 = Success, 0 = событие так и не пришло) */
@@ -413,53 +401,47 @@ UINT8 kx_command(
     UINT8 *out_slot
 )
 {
+    kx_lock();
+
     UINT64 trb = kx_ring_push(&g_kx.cmd, d0, d1, d2, d3);
 
     kx_doorbell(0, 0);
 
     UINT32 ev[4];
+    UINT8 cc = 0;
 
-    if (!kx_wait_event(33, trb, 0, 0, ev, 1000))
-        return 0;
+    if (kx_wait_event(33, trb, 0, 0, ev, 1000)) {
+        if (out_slot)
+            *out_slot = (UINT8)((ev[3] >> 24) & 0xFFu);
+        cc = (UINT8)((ev[2] >> 24) & 0xFFu);
+    }
 
-    if (out_slot)
-        *out_slot = (UINT8)((ev[3] >> 24) & 0xFFu);
+    kx_unlock();
 
-    return (UINT8)((ev[2] >> 24) & 0xFFu);
+    return cc;
 }
 
-
-/* Синхронное восстановление остановленной (Halted) конечной
-   точки - используется для Endpoint 0 во время настройки
-   устройства (например, если устройство ответило STALL на
-   необязательный запрос вроде SET_IDLE) */
+/* Синхронное восстановление остановленной (Halted) конечной точки:
+   Reset Endpoint + Set TR Dequeue Pointer на наш следующий TRB */
 void kx_recover_sync(UINT8 slot, UINT8 dci, KX_RING *r)
 {
-    kx_command(
-        0, 0, 0,
-        ((UINT32)slot << 24) | ((UINT32)dci << 16) | (14u << 10),
-        NULL
-    );
+    kx_command(0, 0, 0,
+               ((UINT32)slot << 24) | ((UINT32)dci << 16) | (14u << 10),
+               NULL);
 
     UINT64 deq = kx_ring_slot_addr(r, r->seq);
     UINT32 dcs = kx_ring_pcs(r->seq);
 
-    kx_command(
-        (UINT32)(deq & 0xFFFFFFF0u) | dcs,
-        (UINT32)(deq >> 32),
-        0,
-        ((UINT32)slot << 24) | ((UINT32)dci << 16) | (16u << 10),
-        NULL
-    );
+    kx_command((UINT32)(deq & 0xFFFFFFF0u) | dcs,
+               (UINT32)(deq >> 32), 0,
+               ((UINT32)slot << 24) | ((UINT32)dci << 16) | (16u << 10),
+               NULL);
 }
 
-
 /*
- * Control transfer на Endpoint 0 (Setup + [Data] + Status) -
- * та же схема, что xhci_control_transfer выше по файлу (там
- * подробно разобраны биты IDT/IOC/TRT), только поверх kx_ring и
- * с правильным ожиданием. Возвращает Completion Code: 1 или 13
- * (Short Packet) = успех, 0 = таймаут.
+ * Control transfer на Endpoint 0 (Setup + [Data] + Status).
+ * Возвращает Completion Code: 1 или 13 (Short Packet) = успех,
+ * 0 = таймаут.
  */
 UINT8 kx_control(
     KX_DEV *d,
@@ -480,6 +462,8 @@ UINT8 kx_control(
     else
         trt = 2u;
 
+    kx_lock();
+
     kx_ring_push(
         &d->ep0,
         (UINT32)bm_request_type | ((UINT32)b_request << 8) |
@@ -493,13 +477,11 @@ UINT8 kx_control(
 
         UINT32 dir = (bm_request_type & 0x80u) ? 1u : 0u;
 
-        kx_ring_push(
-            &d->ep0,
-            (UINT32)(data_phys & 0xFFFFFFFFu),
-            (UINT32)(data_phys >> 32),
-            w_length,
-            (3u << 10) | (dir << 16)
-        );
+        kx_ring_push(&d->ep0,
+                     (UINT32)(data_phys & 0xFFFFFFFFu),
+                     (UINT32)(data_phys >> 32),
+                     w_length,
+                     (3u << 10) | (dir << 16));
     }
 
     UINT32 status_dir;
@@ -509,212 +491,359 @@ UINT8 kx_control(
     else
         status_dir = (bm_request_type & 0x80u) ? 0u : 1u;
 
-    kx_ring_push(
-        &d->ep0, 0, 0, 0,
-        (1u << 5) | (4u << 10) | (status_dir << 16)
-    );
+    kx_ring_push(&d->ep0, 0, 0, 0,
+                 (1u << 5) | (4u << 10) | (status_dir << 16));
 
     kx_doorbell(d->slot, 1);
 
     UINT32 ev[4];
+    UINT8 cc = 0;
 
-    if (!kx_wait_event(32, 0, d->slot, 1, ev, 1000))
-        return 0;
+    if (kx_wait_event(32, 0, d->slot, 1, ev, 1000)) {
 
-    UINT8 cc = (UINT8)((ev[2] >> 24) & 0xFFu);
+        cc = (UINT8)((ev[2] >> 24) & 0xFFu);
 
-    if (cc != 1 && cc != 13)
-        kx_recover_sync(d->slot, 1, &d->ep0);
+        if (cc != 1 && cc != 13)
+            kx_recover_sync(d->slot, 1, &d->ep0);
+    }
+
+    kx_unlock();
 
     return cc;
 }
 
-
-/* Поставить следующий Normal TRB на Interrupt IN конечную точку */
-void kx_hid_queue(KX_HID *h)
+/*
+ * Bulk-передача (флешки): один Normal TRB на len байт (не больше
+ * одной страницы), ожидание события. actual - сколько байт реально
+ * прошло. Возвращает Completion Code (1/13 - успех).
+ */
+UINT8 kx_bulk(
+    KX_DEV *d, UINT8 dci, UINT8 ep_addr, KX_RING *r,
+    UINT64 buf, UINT32 len, UINT32 *actual, UINTN timeout_ms
+)
 {
-    UINT32 len = h->maxpkt;
+    kx_lock();
 
-    if (len > 512u)
-        len = 512u;
+    kx_ring_push(r,
+                 (UINT32)(buf & 0xFFFFFFFFu), (UINT32)(buf >> 32),
+                 len & 0x1FFFFu,
+                 (1u << 5) | (1u << 2) | (1u << 10));   /* IOC, ISP, Normal */
 
-    if (len == 0)
-        len = 8u;
+    kx_doorbell(d->slot, dci);
 
-    h->req_len = len;
+    UINT32 ev[4];
+    UINT8 cc = 0;
 
-    /* IOC (бит 5) - событие по завершении (в т.ч. коротким
-       пакетом - отчёты часто короче maxpkt, тогда в событии
-       Completion Code 13 = Short Packet). Адрес TRB запоминаем:
-       событие должно прийти именно по нему. */
-    h->last_trb =
-        kx_ring_push(
-            &h->ring,
-            (UINT32)(h->rep_buf & 0xFFFFFFFFu),
-            (UINT32)(h->rep_buf >> 32),
-            len,
-            (1u << 5) | (1u << 10)
-        );
+    if (kx_wait_event(32, 0, d->slot, dci, ev, timeout_ms)) {
 
-    kx_doorbell(g_kx_devs[h->dev].slot, h->dci);
+        cc = (UINT8)((ev[2] >> 24) & 0xFFu);
+
+        UINT32 residue = ev[2] & 0xFFFFFFu;
+
+        if (actual)
+            *actual = (residue <= len) ? len - residue : 0;
+
+        if (cc != 1 && cc != 13) {
+            /* конечная точка остановлена (STALL и т.п.): поправить
+               у контроллера и попросить устройство снять "halt"
+               (CLEAR_FEATURE ENDPOINT_HALT) */
+            kx_recover_sync(d->slot, dci, r);
+            kx_control(d, 0x02, 0x01, 0, ep_addr, 0, 0);
+        }
+    } else {
+        /* таймаут: остановить конечную точку и выровнять кольцо */
+        kx_command(0, 0, 0,
+                   ((UINT32)d->slot << 24) | ((UINT32)dci << 16) | (15u << 10),
+                   NULL);
+        kx_recover_sync(d->slot, dci, r);
+    }
+
+    kx_unlock();
+
+    return cc;
 }
 
+/* ================================================================
+ * События, которых никто не ждёт синхронно
+ * ================================================================ */
 
-/* Отчёт мыши, формат которого разобран из Report Descriptor
-   (см. hid_parse_report_descriptor выше по файлу) */
-void kx_mouse_report_layout(KX_HID *h, volatile UINT8 *rep, UINTN len)
+void kx_handle_async_event(UINT32 ev[4])
 {
-    HID_MOUSE_REPORT_LAYOUT *L = &h->layout;
+    UINT8 type = (UINT8)((ev[3] >> 10) & 0x3Fu);
+    UINT8 cc = (UINT8)((ev[2] >> 24) & 0xFFu);
 
-    /* у составных устройств в одном интерфейсе бывает несколько
-       отчётов с разными Report ID (мышь + мультимедиа и т.п.) -
-       чужие просто пропускаем */
-    if (L->has_report_id) {
+    if (type == 32) {
 
-        if (len < 1 || rep[0] != L->report_id) {
-            h->rejected++;
+        /* Transfer Event: отчёт HID или сообщение хаба */
+        UINT8 slot = (UINT8)((ev[3] >> 24) & 0xFFu);
+        UINT8 epid = (UINT8)((ev[3] >> 16) & 0x1Fu);
+        KX_HID *h = NULL;
+
+        for (UINTN i = 0; i < KX_MAX_HID; i++) {
+            KX_HID *c = &g_kx_hid[i];
+            if (c->used && c->role != KX_ROLE_NONE &&
+                g_kx_devs[c->dev].slot == slot && c->dci == epid) {
+                h = c;
+                break;
+            }
+        }
+
+        UINT64 trb_ptr = (UINT64)ev[0] | ((UINT64)ev[1] << 32);
+
+        if (h == NULL || h->state != KX_EP_RUN || trb_ptr != h->last_trb) {
+            /* не наш/запоздавший/повторный - не трогаем кольцо */
+            g_kx.stray_events++;
             return;
         }
-    }
 
-    UINT32 buttons = 0;
+        if (cc == 1 || cc == 13) {
 
-    if (L->has_buttons) {
-        buttons =
-            hid_extract_bits(
-                rep, len, L->button_bit_offset, L->button_count
-            );
-    }
+            /* в младших 24 битах - сколько байт НЕ пришло */
+            UINT32 residue = ev[2] & 0xFFFFFFu;
+            UINTN len = (residue <= h->req_len) ? (h->req_len - residue) : 0;
+            volatile UINT8 *r = (volatile UINT8 *)P2V(h->rep_buf);
 
-    UINT32 xr = hid_extract_bits(rep, len, L->x_bit_offset, L->x_bit_size);
-    UINT32 yr = hid_extract_bits(rep, len, L->y_bit_offset, L->y_bit_size);
+            h->reports++;
+            h->err_streak = 0;
+            h->last_len = len;
 
-    if (L->x_is_relative) {
+            for (UINTN k = 0; k < 16; k++)
+                h->last_rep[k] = (k < len) ? r[k] : 0;
 
-        g_kmouse_dx += hid_sign_extend(xr, L->x_bit_size);
-
-    } else {
-
-        /* абсолютная координата (планшет, QEMU usb-tablet):
-           переводим в пиксели экрана и отдаём как разницу с
-           прошлой позицией - GUI умеет только относительное */
-        INT64 maxv = (L->x_logical_max > 0) ? L->x_logical_max : 32767;
-        INT64 px = ((INT64)xr * (INT64)g_kfb_w) / (maxv + 1);
-
-        g_kmouse_dx += px - h->abs_last_x;
-        h->abs_last_x = px;
-    }
-
-    if (L->y_is_relative) {
-
-        g_kmouse_dy += hid_sign_extend(yr, L->y_bit_size);
-
-    } else {
-
-        INT64 maxv = (L->y_logical_max > 0) ? L->y_logical_max : 32767;
-        INT64 py = ((INT64)yr * (INT64)g_kfb_h) / (maxv + 1);
-
-        g_kmouse_dy += py - h->abs_last_y;
-        h->abs_last_y = py;
-    }
-
-    if (L->has_wheel) {
-
-        UINT32 wr =
-            hid_extract_bits(
-                rep, len, L->wheel_bit_offset, L->wheel_bit_size
-            );
-
-        g_kmouse_dz += hid_sign_extend(wr, L->wheel_bit_size);
-    }
-
-    g_kmouse_buttons = buttons;
-    g_kmouse_reports++;
-}
-
-
-void kx_hid_report(KX_HID *h, UINTN len)
-{
-    volatile UINT8 *rep = (volatile UINT8 *)P2V(h->rep_buf);
-
-    if (h->role == KX_ROLE_KBD_BOOT) {
-
-        kbd_usb_boot_report(rep, len, h->prev_keys);
-
-    } else if (h->role == KX_ROLE_MOUSE_RPT) {
-
-        kx_mouse_report_layout(h, rep, len);
-
-    } else if (h->role == KX_ROLE_MOUSE_BOOT) {
-
-        /* boot protocol мыши: байт0 кнопки, байт1 dX, байт2 dY,
-           [байт3 колесо] - все знаковые */
-        if (len < 3)
-            h->rejected++;
-
-        if (len >= 3) {
-
-            g_kmouse_buttons = rep[0];
-            g_kmouse_dx += (INT8)rep[1];
-            g_kmouse_dy += (INT8)rep[2];
-
-            if (len >= 4)
-                g_kmouse_dz += (INT8)rep[3];
-
-            g_kmouse_reports++;
+            kx_pipe_report(h, len);
+            kx_pipe_queue(h);
+            return;
         }
-    }
-}
 
+        h->errors++;
+        h->last_err = cc;
+        h->err_streak++;
 
-/* Разобрать все накопившиеся события (без ожидания) */
-void kx_poll(void)
-{
-    if (!g_kx.running)
+        klog("usb: slot %u EP %u error cc=%u (streak %u)\n",
+             slot, h->dci, cc, h->err_streak);
+
+        /* сдаёмся только после многих ошибок ПОДРЯД (у беспроводного
+           донгла редкие ошибки передачи - норма) */
+        if (h->err_streak > 64) {
+            h->state = KX_EP_DEAD;
+            return;
+        }
+
+        if (cc == 21) {
+            /* Missed Service Error: конечная точка не остановлена,
+               просто ставим следующий TRB */
+            kx_pipe_queue(h);
+            return;
+        }
+
+        /* Остальные ошибки останавливают конечную точку (Halted).
+           Шаг 1 восстановления - Reset Endpoint Command. Если
+           устройство выдернули - дальше придёт отключение порта. */
+        h->recoveries++;
+        h->recover_tsc = rdtsc();
+        h->state = KX_EP_RESET;
+        h->pending_cmd =
+            kx_ring_push(&g_kx.cmd, 0, 0, 0,
+                         ((UINT32)slot << 24) | ((UINT32)h->dci << 16) | (14u << 10));
+        kx_doorbell(0, 0);
         return;
-
-    for (UINTN i = 0; i < 64; i++) {
-
-        UINT32 ev[4];
-
-        if (!kx_ev_fetch(ev))
-            break;
-
-        kx_handle_async_event(ev);
     }
 
-    /*
-     * Сторож восстановления: если команда Reset Endpoint / Set TR
-     * Dequeue так и не завершилась за ~300 мс (событие потерялось
-     * или контроллер повёл себя не по книжке), не ждём вечно -
-     * ставим TRB заново. Иначе конечная точка молча "застряла" бы
-     * в состоянии восстановления навсегда.
-     */
-    if (g_tsc_hz != 0) {
+    if (type == 33) {
 
-        UINT64 now = rdtsc();
-        UINT64 limit = (g_tsc_hz / 1000u) * 300u;
+        /* Command Completion - наше ли это восстановление? */
+        UINT64 ptr = (UINT64)ev[0] | ((UINT64)ev[1] << 32);
 
         for (UINTN i = 0; i < KX_MAX_HID; i++) {
 
             KX_HID *h = &g_kx_hid[i];
 
-            if (!h->used || h->role == KX_ROLE_NONE)
+            if (!h->used || h->pending_cmd != ptr || ptr == 0)
                 continue;
 
-            if (
-                (h->state == KX_EP_RESET || h->state == KX_EP_SETDEQ) &&
-                now - h->recover_tsc > limit
-            ) {
+            UINT8 slot = g_kx_devs[h->dev].slot;
+
+            h->last_cmd_cc = cc;
+
+            if (h->state == KX_EP_RESET && cc == 19) {
+
+                /* Context State Error: точка на самом деле не была
+                   остановлена */
                 h->state = KX_EP_RUN;
                 h->pending_cmd = 0;
-                h->last_cmd_cc = 0xFF;   /* "не дождались" */
-                kx_hid_queue(h);
+                kx_pipe_queue(h);
+
+            } else if (h->state == KX_EP_RESET) {
+
+                /* Шаг 2 - Set TR Dequeue Pointer на наш следующий TRB */
+                UINT64 deq = kx_ring_slot_addr(&h->ring, h->ring.seq);
+                UINT32 dcs = kx_ring_pcs(h->ring.seq);
+
+                h->state = KX_EP_SETDEQ;
+                h->pending_cmd =
+                    kx_ring_push(&g_kx.cmd,
+                                 (UINT32)(deq & 0xFFFFFFF0u) | dcs,
+                                 (UINT32)(deq >> 32), 0,
+                                 ((UINT32)slot << 24) | ((UINT32)h->dci << 16) | (16u << 10));
+                kx_doorbell(0, 0);
+
+            } else if (h->state == KX_EP_SETDEQ) {
+
+                /* Шаг 3 - снова работаем */
+                h->state = KX_EP_RUN;
+                h->pending_cmd = 0;
+                kx_pipe_queue(h);
             }
+
+            return;
         }
+
+        g_kx.stray_events++;
+        return;
     }
+
+    if (type == 34) {
+
+        /* Port Status Change Event: номер порта в битах 31:24.
+           Здесь (возможно, в прерывании) только ЗАПОМИНАЕМ, что порт
+           изменился, и сбрасываем флаги изменений - кроме PRC
+           ("сброс порта завершён"): его ждёт и сбрасывает сам код
+           настройки порта. Разбирается - в kx_service. */
+        UINT32 port = (ev[0] >> 24) & 0xFFu;
+
+        g_kx.port_events++;
+
+        if (port >= 1 && port <= g_kx.cap.MaxPorts) {
+
+            UINT64 pb = g_kx.op + 0x400u + (UINT64)(port - 1u) * 0x10u;
+            UINT32 cur = mmio_read32(pb);
+            UINT32 clear = cur & PORTSC_RW1CS_MASK & ~PORTSC_BIT_PRC;
+
+            if (clear)
+                mmio_write32(pb, portsc_base_for_write(cur) | clear);
+
+            g_kx.root_change[port] |= 1u;
+
+            if (cur & PORTSC_BIT_CSC)
+                g_kx.root_change[port] |= 2u;
+
+            g_kx.any_change = TRUE;
+        }
+
+        return;
+    }
+
+    g_kx.stray_events++;
 }
 
+/* ================================================================
+ * Прерывание от контроллера
+ * ================================================================ */
+
+void kx_usb_irq(void)
+{
+    g_kx.irqs++;
+
+    /* USBSTS.EINT (бит 3) и IMAN.IP (бит 0) - "сбросить, записав 1";
+       IMAN.IE (бит 1) оставляем включённым */
+    mmio_write32(g_kx.op + 0x04, 0x8u);
+    mmio_write32(g_kx.intr0 + 0x00, 0x3u);
+
+    g_kx_in_irq = TRUE;
+    kx_pump();
+    g_kx_in_irq = FALSE;
+}
+
+/* ================================================================
+ * Настройка конечных точек (Configure Endpoint)
+ * ================================================================ */
+
+/* Поле Interval для периодической (interrupt) конечной точки из
+   bInterval дескриптора - формат зависит от скорости */
+UINT8 kx_interval_field(UINT8 speed, UINT8 b_interval)
+{
+    if (speed == 3 || speed >= 4) {
+        /* HS/SS: bInterval = степень двойки в микрокадрах (+1) */
+        UINT8 iv = (b_interval >= 1) ? (UINT8)(b_interval - 1u) : 0;
+        return (iv > 15) ? 15 : iv;
+    }
+
+    /* LS/FS: bInterval в миллисекундах -> степень двойки в 125 мкс */
+    UINT8 v = (b_interval == 0) ? 1 : b_interval;
+    UINT8 lg = 0;
+
+    while ((v >> 1) != 0) {
+        v = (UINT8)(v >> 1);
+        lg++;
+    }
+
+    UINT8 iv = (UINT8)(lg + 3u);
+
+    if (iv < 3) iv = 3;
+    if (iv > 10) iv = 10;
+
+    return iv;
+}
+
+/*
+ * Одной командой описать контроллеру все конечные точки устройства.
+ * hub_ports != 0 - устройство хаб: отметить это в Slot Context (Hub,
+ * Number of Ports, TT Think Time) - без этого контроллер не сможет
+ * работать с устройствами за ним.
+ */
+UINT8 kx_configure_eps(KX_DEV *d, KX_EPCFG *eps, UINTN n,
+                       UINT8 hub_ports, UINT8 tt_think)
+{
+    UINT32 cs = g_kx.ctx_size;
+    volatile UINT32 *ictl = (volatile UINT32 *)P2V(d->in_ctx);
+    volatile UINT32 *islot = (volatile UINT32 *)P2V(d->in_ctx + cs);
+    volatile UINT32 *oslot = (volatile UINT32 *)P2V(d->dev_ctx);
+    UINT8 max_dci = 1;
+
+    for (UINTN k = 0; k < n; k++)
+        if (eps[k].dci > max_dci)
+            max_dci = eps[k].dci;
+
+    raw_zero_mem((volatile UINT8 *)P2V(d->in_ctx), 4096);
+
+    ictl[0] = 0;
+    ictl[1] = 0x1u;
+
+    /* Slot Context - копия текущего (его заполнил контроллер),
+       Context Entries = старший используемый DCI */
+    islot[0] = (oslot[0] & ~(0x1Fu << 27)) | ((UINT32)max_dci << 27);
+    islot[1] = oslot[1];
+    islot[2] = oslot[2];
+    islot[3] = 0;
+
+    if (hub_ports != 0) {
+        islot[0] |= (1u << 26);                               /* Hub */
+        islot[1] = (islot[1] & 0x00FFFFFFu) | ((UINT32)hub_ports << 24);
+        islot[2] = (islot[2] & ~(3u << 16)) | ((UINT32)(tt_think & 3u) << 16);
+    }
+
+    for (UINTN k = 0; k < n; k++) {
+
+        KX_EPCFG *e = &eps[k];
+        volatile UINT32 *ep = (volatile UINT32 *)P2V(d->in_ctx + (UINT64)(e->dci + 1u) * cs);
+
+        ictl[1] |= (1u << e->dci);
+
+        ep[0] = (UINT32)e->interval << 16;
+        ep[1] = (3u << 1) | ((UINT32)e->type << 3) | ((UINT32)e->burst << 8) |
+                ((UINT32)e->maxpkt << 16);
+        ep[2] = (UINT32)(e->ring & 0xFFFFFFFFu) | 1u;
+        ep[3] = (UINT32)(e->ring >> 32);
+        ep[4] = (UINT32)e->avg | ((e->esit & 0xFFFFu) << 16);
+    }
+
+    return kx_command((UINT32)(d->in_ctx & 0xFFFFFFFFu), (UINT32)(d->in_ctx >> 32), 0,
+                      ((UINT32)d->slot << 24) | (12u << 10), NULL);
+}
+
+/* ================================================================
+ * Перечисление устройства
+ * ================================================================ */
 
 const char *kx_speed_name(UINT8 s)
 {
@@ -728,127 +857,30 @@ const char *kx_speed_name(UINT8 s)
     }
 }
 
-const char *kx_role_name(UINT8 r)
+/* "3" для корневого порта, "3.2" за хабом, "3.2.1" за двумя */
+void kx_dev_path(KX_DEV *d, char *buf, UINTN cap)
 {
-    switch (r) {
-    case KX_ROLE_KBD_BOOT:   return "keyboard (boot protocol)";
-    case KX_ROLE_MOUSE_RPT:  return "mouse (report descriptor)";
-    case KX_ROLE_MOUSE_BOOT: return "mouse (boot protocol)";
-    default:                 return "not used";
+    UINTN n = ksnprintf(buf, cap, "%u", d->root_port);
+
+    for (UINT8 t = 0; t < d->depth && n + 3 < cap; t++) {
+        UINT32 p = (d->route >> (4u * t)) & 0xFu;
+        n += ksnprintf(buf + n, cap - n, ".%u", p);
     }
 }
 
-
 /*
- * Перевести мышь в boot protocol И УБЕДИТЬСЯ, что она перешла.
- *
- * SET_PROTOCOL(Boot) - просьба, а не приказ: некоторые дешёвые
- * донглы заявляют поддержку boot protocol (subclass 1), отвечают
- * на SET_PROTOCOL "успешно" - и продолжают слать свой обычный
- * формат (часто с байтом Report ID в начале). Тогда мы читали бы
- * Report ID как кнопки, а кнопки как dX - курсор прыгал бы не туда
- * или "залипала" бы левая кнопка. Это и было бы угадывание.
- *
- * Поэтому после SET_PROTOCOL спрашиваем GET_PROTOCOL (bRequest
- * 0x03, ответ - 1 байт: 0 = boot, 1 = report):
- *   0            -> boot точно включён, берём фиксированный формат;
- *   1            -> мышь НЕ переключилась, возвращаем FALSE, и
- *                   вызывающий код разберёт её Report Descriptor;
- *   не ответила  -> (запрос обязателен по спеке для boot-устройств,
- *                   но встречаются и такие) доверяем SET_PROTOCOL.
+ * Настроить новое устройство. Порт, в котором оно сидит, уже
+ * сброшен и включён.
+ *   parent = -1: порт контроллера root_port;
+ *   иначе: порт parent_port хаба g_kx_devs[parent].
+ * Возвращает индекс устройства или -1.
  */
-BOOLEAN kx_mouse_switch_to_boot(KX_DEV *d, UINT8 iface, KX_HID *h)
+INTN kx_enum_device(SIMPLE_TEXT_OUTPUT_INTERFACE *out,
+                    INTN parent, UINT8 parent_port,
+                    UINT8 root_port, UINT8 speed)
 {
-    UINT8 cc = kx_control(d, 0x21, 0x0B, 0, iface, 0, 0);
-
-    if (cc != 1) {
-        h->mode_note = "SET_PROTOCOL(boot) refused";
-        return FALSE;
-    }
-
-    UINT64 buf = d->buf + 512u;
-    volatile UINT8 *b = (volatile UINT8 *)P2V(buf);
-
-    b[0] = 0xEE;   /* заведомо не 0 и не 1 */
-
-    cc = kx_control(d, 0xA1, 0x03, 0, iface, 1, buf);
-
-    if (cc != 1 && cc != 13) {
-        h->mode_note = "boot (GET_PROTOCOL not answered, trusting SET)";
-        return TRUE;
-    }
-
-    if (b[0] == 0) {
-        h->mode_note = "boot (confirmed by GET_PROTOCOL)";
-        return TRUE;
-    }
-
-    h->mode_note = "device ignored SET_PROTOCOL, report mode";
-    return FALSE;
-}
-
-
-/*
- * Полная настройка одного устройства на корневом порту p:
- * Port Reset -> Enable Slot -> Address Device -> дескрипторы ->
- * SET_CONFIGURATION -> настройка HID-интерфейсов -> Configure
- * Endpoint -> первые TRB на опрос. Подробные объяснения каждого
- * шага - в старом коде (xhci_address_device_and_get_descriptor),
- * здесь - только отличия.
- */
-void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
-{
-    UINT64 pb = g_kx.op + 0x400u + (UINT64)(p - 1u) * 0x10u;
-    UINT32 sc = mmio_read32(pb);
-
-    if (!(sc & PORTSC_BIT_CCS))
-        return;
-
-    print(out, "\n  Port ");
-    print_uint(out, p);
-    print(out, ": device connected\n");
-
-    if (!(sc & PORTSC_BIT_PED)) {
-
-        /* USB2-порту нужен явный Port Reset (USB3 включается
-           сам после тренировки линии) */
-        mmio_write32(pb, portsc_base_for_write(sc) | PORTSC_BIT_PR);
-
-        BOOLEAN done = FALSE;
-
-        for (UINTN i = 0; i < 500; i++) {
-
-            busy_wait_ms(1);
-
-            UINT32 s = mmio_read32(pb);
-
-            if (s & PORTSC_BIT_PRC) {
-                done = TRUE;
-                mmio_write32(pb, portsc_base_for_write(s) | PORTSC_BIT_PRC);
-                break;
-            }
-        }
-
-        /* 10 мс "восстановления" после сброса - требование
-           спеки USB 2.0 (TRSTRCY) */
-        busy_wait_ms(20);
-
-        sc = mmio_read32(pb);
-
-        if (!done || !(sc & PORTSC_BIT_PED)) {
-            print(out, "    port reset failed - skipped\n");
-            return;
-        }
-    }
-
-    UINT8 speed = (UINT8)((sc >> 10) & 0xFu);
-
-    print(out, "    ");
-    print(out, kx_speed_name(speed));
-    print(out, "\n");
-
     KX_DEV *d = NULL;
-    UINTN di = 0;
+    INTN di;
 
     for (di = 0; di < KX_MAX_DEVS; di++) {
         if (!g_kx_devs[di].used) {
@@ -858,49 +890,73 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
     }
 
     if (d == NULL) {
-        print(out, "    too many devices - skipped\n");
-        return;
+        kx_out(out, "    too many USB devices - skipped\n");
+        return -1;
     }
 
+    raw_zero_mem((volatile UINT8 *)d, sizeof(*d));
+
     d->used = TRUE;
-    d->port = (UINT8)p;
     d->speed = speed;
+    d->root_port = root_port;
+    d->parent = (INT8)parent;
+    d->parent_port = parent_port;
+    d->hub = -1;
+    d->msd = -1;
     d->status = "setup failed";
+
+    if (parent >= 0) {
+
+        KX_DEV *p = &g_kx_devs[parent];
+        UINT8 pp = (parent_port > 15) ? 15 : parent_port;
+
+        d->depth = (UINT8)(p->depth + 1u);
+        d->route = p->route | ((UINT32)pp << (4u * p->depth));
+
+        /* LS/FS-устройство за HS-хабом: трафик к нему переводит
+           Transaction Translator этого хаба */
+        if (speed == 1 || speed == 2) {
+            if (p->speed == 3) {
+                d->tt_slot = p->slot;
+                d->tt_port = parent_port;
+            } else {
+                d->tt_slot = p->tt_slot;
+                d->tt_port = p->tt_port;
+            }
+        }
+    }
 
     /* --- Enable Slot --- */
     UINT8 slot = 0;
     UINT8 cc = kx_command(0, 0, 0, (9u << 10), &slot);
 
     if (cc != 1 || slot == 0) {
-        print(out, "    Enable Slot failed, cc=");
-        print_uint(out, cc);
-        print(out, "\n");
-        return;
+        kx_out(out, "    Enable Slot failed, cc=%u\n", cc);
+        d->used = FALSE;
+        return -1;
     }
 
     d->slot = slot;
+    d->dev_ctx = kx_dev_page(d);
+    d->in_ctx = kx_dev_page(d);
+    d->buf = kx_dev_page(d);
 
-    d->dev_ctx = kx_dma_page();
-    d->in_ctx = kx_dma_page();
-    d->buf = kx_dma_page();
-
-    UINT64 ep0_ring = kx_dma_page();
+    UINT64 ep0_ring = kx_dev_page(d);
 
     if (!d->dev_ctx || !d->in_ctx || !d->buf || !ep0_ring) {
-        print(out, "    out of memory\n");
-        return;
+        kx_out(out, "    out of memory\n");
+        kx_remove_device((UINTN)di);
+        return -1;
     }
 
     kx_ring_init(&d->ep0, ep0_ring);
 
+    kx_lock();
     ((volatile UINT64 *)P2V(g_kx.dcbaa))[slot] = d->dev_ctx;
+    kx_unlock();
 
-    /* Стартовый Max Packet Size для EP0. Раньше для Full Speed
-       брали 8 - это работает с QEMU, но на настоящем FS-
-       устройстве с bMaxPacketSize0=64 ответ длиннее 8 байт
-       пришёл бы одним "слишком большим" пакетом (Babble). Как в
-       Linux: для FS стартуем с 64 и просим сначала только 8
-       байт дескриптора - такой ответ влезает в любой пакет. */
+    /* Стартовый Max Packet Size для EP0 (для FS - 64, и сначала
+       просим только 8 байт дескриптора: влезает в любой пакет) */
     UINT16 mps0;
 
     if (speed == 2)
@@ -917,9 +973,9 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
 
     ictl[0] = 0;
     ictl[1] = 0x3u;                          /* A0 Slot + A1 EP0 */
-    islot[0] = ((UINT32)speed << 20) | (1u << 27);
-    islot[1] = (UINT32)p << 16;
-    islot[2] = 0;
+    islot[0] = (d->route & 0xFFFFFu) | ((UINT32)speed << 20) | (1u << 27);
+    islot[1] = (UINT32)root_port << 16;
+    islot[2] = (UINT32)d->tt_slot | ((UINT32)d->tt_port << 8);
     islot[3] = 0;
     iep0[0] = 0;
     iep0[1] = (3u << 1) | (4u << 3) | ((UINT32)mps0 << 16);
@@ -928,22 +984,16 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
     iep0[4] = 8;
 
     /* --- Address Device --- */
-    cc = kx_command(
-        (UINT32)(d->in_ctx & 0xFFFFFFFFu),
-        (UINT32)(d->in_ctx >> 32),
-        0,
-        ((UINT32)slot << 24) | (11u << 10),
-        NULL
-    );
+    cc = kx_command((UINT32)(d->in_ctx & 0xFFFFFFFFu), (UINT32)(d->in_ctx >> 32), 0,
+                    ((UINT32)slot << 24) | (11u << 10), NULL);
 
     if (cc != 1) {
-        print(out, "    Address Device failed, cc=");
-        print_uint(out, cc);
-        print(out, "\n");
-        return;
+        kx_out(out, "    Address Device failed, cc=%u\n", cc);
+        kx_remove_device((UINTN)di);
+        return -1;
     }
 
-    busy_wait_ms(5);    /* SET_ADDRESS recovery (2 мс по спеке) */
+    kx_msleep(5);    /* SET_ADDRESS recovery (2 мс по спеке) */
 
     volatile UINT8 *b = (volatile UINT8 *)P2V(d->buf);
 
@@ -951,42 +1001,32 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
     cc = kx_control(d, 0x80, 0x06, 0x0100, 0, 8, d->buf);
 
     if (cc != 1 && cc != 13) {
-        print(out, "    GET_DESCRIPTOR(Device, 8) failed, cc=");
-        print_uint(out, cc);
-        print(out, "\n");
-        return;
+        kx_out(out, "    GET_DESCRIPTOR(Device, 8) failed, cc=%u\n", cc);
+        kx_remove_device((UINTN)di);
+        return -1;
     }
 
     UINT16 real_mps0 = b[7];
 
     if (speed >= 4)
-        real_mps0 = (UINT16)(1u << (b[7] & 0xFu));  /* у USB3 это
-                                                        степень двойки */
+        real_mps0 = (UINT16)(1u << (b[7] & 0xFu));  /* у USB3 - степень двойки */
 
     if (real_mps0 >= 8 && real_mps0 != mps0) {
 
         /* Evaluate Context: обновить MPS у EP0 на настоящий */
         raw_zero_mem((volatile UINT8 *)P2V(d->in_ctx), 4096);
 
-        ictl[1] = 0x2u;                      /* только A1 = EP0 */
+        ictl[1] = 0x2u;
         iep0[1] = (3u << 1) | (4u << 3) | ((UINT32)real_mps0 << 16);
         iep0[2] = (UINT32)(ep0_ring & 0xFFFFFFFFu) | 1u;
         iep0[3] = (UINT32)(ep0_ring >> 32);
         iep0[4] = 8;
 
-        cc = kx_command(
-            (UINT32)(d->in_ctx & 0xFFFFFFFFu),
-            (UINT32)(d->in_ctx >> 32),
-            0,
-            ((UINT32)slot << 24) | (13u << 10),
-            NULL
-        );
+        cc = kx_command((UINT32)(d->in_ctx & 0xFFFFFFFFu), (UINT32)(d->in_ctx >> 32), 0,
+                        ((UINT32)slot << 24) | (13u << 10), NULL);
 
-        if (cc != 1) {
-            print(out, "    Evaluate Context failed, cc=");
-            print_uint(out, cc);
-            print(out, "\n");
-        }
+        if (cc != 1)
+            kx_out(out, "    Evaluate Context failed, cc=%u\n", cc);
 
         mps0 = real_mps0;
     }
@@ -997,30 +1037,22 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
     cc = kx_control(d, 0x80, 0x06, 0x0100, 0, 18, d->buf);
 
     if (cc != 1 && cc != 13) {
-        print(out, "    GET_DESCRIPTOR(Device) failed\n");
-        return;
+        kx_out(out, "    GET_DESCRIPTOR(Device) failed\n");
+        kx_remove_device((UINTN)di);
+        return -1;
     }
 
     d->vid = (UINT16)(b[8] | (b[9] << 8));
     d->pid = (UINT16)(b[10] | (b[11] << 8));
     d->dclass = b[4];
+    d->dprotocol = b[6];
 
-    print(out, "    VID:PID = ");
-    print_hex(out, d->vid, 4);
-    print(out, ":");
-    print_hex(out, d->pid, 4);
-    print(out, ", class ");
-    print_uint(out, d->dclass);
-    print(out, ", slot ");
-    print_uint(out, slot);
-    print(out, ", EP0 max packet ");
-    print_uint(out, mps0);
-    print(out, "\n");
+    kx_out(out, "    VID:PID = %04x:%04x, class %u, slot %u, EP0 max packet %u\n",
+           d->vid, d->pid, d->dclass, slot, mps0);
 
     if (d->dclass == 9) {
-        print(out, "    this is a USB hub - hubs are not supported yet\n");
-        d->status = "hub (not supported yet)";
-        return;
+        kx_hub_setup(out, (UINTN)di);
+        return di;
     }
 
     /* --- Configuration Descriptor: сначала 9 байт (узнать
@@ -1031,31 +1063,36 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
     cc = kx_control(d, 0x80, 0x06, 0x0200, 0, 9, cfg_phys);
 
     if (cc != 1 && cc != 13) {
-        print(out, "    GET_DESCRIPTOR(Configuration) failed\n");
-        return;
+        kx_out(out, "    GET_DESCRIPTOR(Configuration) failed\n");
+        d->status = "no configuration";
+        return di;
     }
 
     UINT16 total = (UINT16)(cfg[2] | (cfg[3] << 8));
     UINT8 cfg_value = cfg[5];
 
-    if (total > 1024u)
-        total = 1024u;
-
-    if (total < 9u)
-        total = 9u;
+    if (total > 1024u) total = 1024u;
+    if (total < 9u) total = 9u;
 
     cc = kx_control(d, 0x80, 0x06, 0x0200, 0, total, cfg_phys);
 
     if (cc != 1 && cc != 13) {
-        print(out, "    GET_DESCRIPTOR(Configuration, full) failed\n");
-        return;
+        kx_out(out, "    GET_DESCRIPTOR(Configuration, full) failed\n");
+        d->status = "no configuration";
+        return di;
     }
 
-    /* --- найти HID-интерфейсы --- */
+    /* --- что за интерфейсы: HID (класс 3) и флешки (класс 8) --- */
     KX_HID_CAND cand[KX_MAX_IF_PER_DEV];
     UINTN ncand = 0;
+    KX_MSD_CAND msd;
     INTN cur = -1;
+    BOOLEAN in_msd = FALSE;
+    UINT8 last_bulk = 0;       /* 1 - последняя bulk-точка была IN,
+                                  2 - OUT (для SS Companion) */
     UINTN off = 0;
+
+    msd.found = FALSE;
 
     while (off + 2u <= total) {
 
@@ -1067,12 +1104,12 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
 
         if (dt == 4 && off + 9u <= total) {
 
-            /* Interface: [2]=номер, [3]=alt setting, [5]=класс,
-               [6]=подкласс, [7]=протокол */
+            /* Interface: [2] номер, [3] alt, [5] класс, [6] подкласс,
+               [7] протокол */
             cur = -1;
+            in_msd = FALSE;
 
-            if (cfg[off + 3] == 0 && cfg[off + 5] == 3 &&
-                ncand < KX_MAX_IF_PER_DEV) {
+            if (cfg[off + 3] == 0 && cfg[off + 5] == 3 && ncand < KX_MAX_IF_PER_DEV) {
 
                 cand[ncand].iface = cfg[off + 2];
                 cand[ncand].subclass = cfg[off + 6];
@@ -1084,339 +1121,328 @@ void kx_enum_port(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
                 cand[ncand].rdesc_len = 0;
                 cur = (INTN)ncand;
                 ncand++;
+
+            } else if (cfg[off + 3] == 0 && cfg[off + 5] == 8 &&
+                       cfg[off + 6] == 6 && cfg[off + 7] == 0x50 && !msd.found) {
+
+                /* Mass Storage, SCSI transparent, Bulk-Only */
+                msd.found = TRUE;
+                msd.iface = cfg[off + 2];
+                msd.in_addr = msd.out_addr = 0;
+                msd.in_mps = msd.out_mps = 0;
+                msd.in_burst = msd.out_burst = 0;
+                in_msd = TRUE;
             }
 
         } else if (dt == 0x21 && cur >= 0 && off + 9u <= total) {
 
             if (cfg[off + 6] == 0x22)
-                cand[cur].rdesc_len =
-                    (UINT16)(cfg[off + 7] | (cfg[off + 8] << 8));
+                cand[cur].rdesc_len = (UINT16)(cfg[off + 7] | (cfg[off + 8] << 8));
 
-        } else if (dt == 5 && cur >= 0 && off + 7u <= total) {
+        } else if (dt == 5 && off + 7u <= total) {
 
             UINT8 a = cfg[off + 2];
-            UINT8 at = cfg[off + 3];
+            UINT8 at = cfg[off + 3] & 3u;
+            UINT16 mp = (UINT16)(cfg[off + 4] | (cfg[off + 5] << 8));
 
-            if (!cand[cur].has_ep && (a & 0x80u) && (at & 0x3u) == 3u) {
-
+            if (cur >= 0 && !cand[cur].has_ep && (a & 0x80u) && at == 3u) {
                 cand[cur].has_ep = TRUE;
                 cand[cur].ep_addr = a;
-                cand[cur].maxpkt_raw =
-                    (UINT16)(cfg[off + 4] | (cfg[off + 5] << 8));
+                cand[cur].maxpkt_raw = mp;
                 cand[cur].interval = cfg[off + 6];
+            } else if (in_msd && at == 2u) {
+                last_bulk = 0;
+                if ((a & 0x80u) && msd.in_addr == 0) {
+                    msd.in_addr = a;
+                    msd.in_mps = (UINT16)(mp & 0x7FFu);
+                    last_bulk = 1;
+                } else if (!(a & 0x80u) && msd.out_addr == 0) {
+                    msd.out_addr = a;
+                    msd.out_mps = (UINT16)(mp & 0x7FFu);
+                    last_bulk = 2;
+                }
             }
+
+        } else if (dt == 0x30 && in_msd && off + 3u <= total) {
+
+            /* SuperSpeed Endpoint Companion идёт сразу за своей
+               конечной точкой: bMaxBurst - ей */
+            if (last_bulk == 1)
+                msd.in_burst = cfg[off + 2];
+            else if (last_bulk == 2)
+                msd.out_burst = cfg[off + 2];
+            last_bulk = 0;
         }
 
         off += dl;
     }
 
-    if (ncand == 0) {
-        print(out, "    not a HID device - left unconfigured\n");
-        d->status = "not HID (unused)";
-        return;
+    if (ncand == 0 && !(msd.found && msd.in_addr && msd.out_addr)) {
+        kx_out(out, "    not a keyboard, mouse, hub or USB drive - left unconfigured\n");
+        d->status = "unused (unsupported class)";
+        return di;
     }
 
     /* --- SET_CONFIGURATION --- */
     cc = kx_control(d, 0x00, 0x09, cfg_value, 0, 0, 0);
 
     if (cc != 1) {
-        print(out, "    SET_CONFIGURATION failed, cc=");
-        print_uint(out, cc);
-        print(out, "\n");
-        return;
+        kx_out(out, "    SET_CONFIGURATION failed, cc=%u\n", cc);
+        return di;
     }
 
-    /* --- каждый HID-интерфейс --- */
-    UINTN hid_idx[KX_MAX_IF_PER_DEV];
-    UINTN nh = 0;
-    UINT8 max_dci = 1;
+    /* --- настроить интерфейсы: сначала собрать конечные точки --- */
+    KX_EPCFG eps[KX_MAX_IF_PER_DEV + 2];
+    UINTN neps = 0;
+    UINTN pipes[KX_MAX_IF_PER_DEV];
+    UINTN npipes = kx_hid_prepare(out, (UINTN)di, cand, ncand, eps, &neps, pipes);
+    INTN mi = -1;
 
-    for (UINTN k = 0; k < ncand; k++) {
+    if (msd.found && msd.in_addr && msd.out_addr)
+        mi = kx_msd_prepare(out, (UINTN)di, &msd, eps, &neps);
 
-        KX_HID_CAND *c = &cand[k];
+    if (neps == 0) {
+        d->status = "nothing usable";
+        return di;
+    }
 
-        print(out, "    HID interface ");
-        print_uint(out, c->iface);
-        print(out, " (subclass ");
-        print_uint(out, c->subclass);
-        print(out, ", protocol ");
-        print_uint(out, c->protocol);
-        print(out, "): ");
+    cc = kx_configure_eps(d, eps, neps, 0, 0);
 
-        if (!c->has_ep) {
-            print(out, "no interrupt IN endpoint - skipped\n");
-            continue;
+    if (cc != 1) {
+        kx_out(out, "    Configure Endpoint failed, cc=%u\n", cc);
+        for (UINTN k = 0; k < npipes; k++)
+            g_kx_hid[pipes[k]].used = FALSE;
+        if (mi >= 0)
+            g_kx_msd[mi].used = FALSE;
+        d->msd = -1;
+        d->status = "Configure Endpoint failed";
+        return di;
+    }
+
+    /* --- поехали --- */
+    kx_hid_start(pipes, npipes);
+
+    d->status = npipes ? "HID, active" : "active";
+
+    if (mi >= 0) {
+        kx_msd_start(out, (UINTN)mi);
+        d->status = g_kx_msd[mi].ready ? "USB drive, ready" : "USB drive, not ready";
+    }
+
+    kx_out(out, "    ready.\n");
+
+    return di;
+}
+
+/* ================================================================
+ * Отключение
+ * ================================================================ */
+
+/* Убрать устройство (и всё, что за ним, если это хаб): остановить
+   его трубы, Disable Slot, вернуть память */
+void kx_remove_device(UINTN di)
+{
+    KX_DEV *d = &g_kx_devs[di];
+
+    if (!d->used)
+        return;
+
+    kx_lock();
+
+    /* дети хаба - первыми */
+    if (d->hub >= 0) {
+
+        KX_HUB *hb = &g_kx_hubs[d->hub];
+
+        for (UINTN p = 1; p <= KX_HUB_MAX_PORTS; p++) {
+            if (hb->child[p] >= 0) {
+                INT8 c = hb->child[p];
+                hb->child[p] = -1;
+                kx_remove_device((UINTN)c);
+            }
         }
 
-        KX_HID *h = NULL;
+        hb->used = FALSE;
+    }
 
-        for (UINTN i = 0; i < KX_MAX_HID; i++) {
-            if (!g_kx_hid[i].used) {
-                h = &g_kx_hid[i];
-                hid_idx[nh] = i;
+    /* трубы прерываний этого устройства */
+    for (UINTN i = 0; i < KX_MAX_HID; i++) {
+        if (g_kx_hid[i].used && g_kx_hid[i].dev == di) {
+            g_kx_hid[i].used = FALSE;
+            g_kx_hid[i].role = KX_ROLE_NONE;
+        }
+    }
+
+    if (d->msd >= 0)
+        g_kx_msd[d->msd].used = FALSE;
+
+    /* у родителя-хаба забыть этого ребёнка */
+    if (d->parent >= 0) {
+        KX_DEV *p = &g_kx_devs[d->parent];
+        if (p->hub >= 0 && d->parent_port <= KX_HUB_MAX_PORTS &&
+            g_kx_hubs[p->hub].child[d->parent_port] == (INT8)di)
+            g_kx_hubs[p->hub].child[d->parent_port] = -1;
+    }
+
+    /* Disable Slot: контроллер забывает устройство */
+    if (d->slot != 0) {
+        kx_command(0, 0, 0, ((UINT32)d->slot << 24) | (10u << 10), NULL);
+        ((volatile UINT64 *)P2V(g_kx.dcbaa))[d->slot] = 0;
+    }
+
+    for (UINTN k = 0; k < d->npages; k++)
+        pmm_free_pages(d->pages[k], 1);
+
+    d->npages = 0;
+    d->used = FALSE;
+
+    kx_hid_update_presence();
+
+    kx_unlock();
+}
+
+/* ================================================================
+ * Порты контроллера
+ * ================================================================ */
+
+/* Устройство, сидящее прямо в корневом порту p (или -1) */
+static INTN kx_root_dev(UINTN p)
+{
+    for (UINTN i = 0; i < KX_MAX_DEVS; i++)
+        if (g_kx_devs[i].used && g_kx_devs[i].parent < 0 &&
+            g_kx_devs[i].root_port == p)
+            return (INTN)i;
+
+    return -1;
+}
+
+/* Сбросить корневой порт (если нужно) и настроить устройство в нём */
+void kx_root_port_connect(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN p)
+{
+    UINT64 pb = g_kx.op + 0x400u + (UINT64)(p - 1u) * 0x10u;
+    UINT32 sc = mmio_read32(pb);
+
+    if (!(sc & PORTSC_BIT_CCS))
+        return;
+
+    kx_out(out, "\n  Port %u: device connected\n", (UINT32)p);
+
+    if (!(sc & PORTSC_BIT_PED)) {
+
+        /* USB2-порту нужен явный Port Reset (USB3 включается
+           сам после тренировки линии) */
+        mmio_write32(pb, portsc_base_for_write(sc) | PORTSC_BIT_PR);
+
+        BOOLEAN done = FALSE;
+
+        for (UINTN i = 0; i < 500; i++) {
+
+            kx_msleep(1);
+
+            UINT32 s = mmio_read32(pb);
+
+            if (s & PORTSC_BIT_PRC) {
+                done = TRUE;
+                mmio_write32(pb, portsc_base_for_write(s) | PORTSC_BIT_PRC);
                 break;
             }
         }
 
-        if (h == NULL) {
-            print(out, "too many HID interfaces - skipped\n");
-            continue;
+        /* "восстановление" после сброса (TRSTRCY, 10 мс по спеке) */
+        kx_msleep(20);
+
+        sc = mmio_read32(pb);
+
+        if (!done || !(sc & PORTSC_BIT_PED)) {
+            kx_out(out, "    port reset failed - skipped\n");
+            return;
         }
-
-        h->dev = (UINT8)di;
-        h->iface = c->iface;
-        h->subclass = c->subclass;
-        h->protocol = c->protocol;
-        h->role = KX_ROLE_NONE;
-        h->ep_addr = c->ep_addr;
-        h->dci = (UINT8)((c->ep_addr & 0x0Fu) * 2u + 1u);
-        h->maxpkt = (UINT16)(c->maxpkt_raw & 0x7FFu);
-        h->burst = (UINT8)((c->maxpkt_raw >> 11) & 0x3u);
-        h->interval_raw = c->interval;
-        h->rdesc_len = c->rdesc_len;
-        h->state = KX_EP_RUN;
-        h->pending_cmd = 0;
-        h->reports = 0;
-        h->errors = 0;
-        h->last_err = 0;
-        h->abs_last_x = (INT64)g_kfb_w / 2;
-        h->abs_last_y = (INT64)g_kfb_h / 2;
-        h->layout.valid = FALSE;
-
-        for (UINTN i = 0; i < 6; i++)
-            h->prev_keys[i] = 0;
-
-        h->err_streak = 0;
-        h->mode_note = "";
-        h->rejected = 0;
-        h->last_cmd_cc = 0;
-        h->recoveries = 0;
-        h->recover_tsc = 0;
-        h->last_len = 0;
-
-        /* Report Descriptor читаем у ВСЕХ HID-интерфейсов, даже
-           у клавиатур (где он нам не нужен): так делает любая
-           ОС, и некоторые устройства (особенно донглы) не
-           начинают слать отчёты, пока его не прочитали */
-        UINT16 rlen = c->rdesc_len ? c->rdesc_len : 256u;
-
-        if (rlen > 2048u)
-            rlen = 2048u;
-
-        UINT64 rd_phys = d->buf + 2048u;
-
-        raw_zero_mem((volatile UINT8 *)P2V(rd_phys), 2048);
-
-        UINT8 rcc = kx_control(d, 0x81, 0x06, 0x2200, c->iface, rlen, rd_phys);
-
-        if (c->subclass == 1 && c->protocol == 1) {
-
-            /* Клавиатура: SET_PROTOCOL(Boot) - гарантированный
-               8-байтный формат, одинаковый у всех клавиатур;
-               SET_IDLE(0) - слать отчёт только при изменениях.
-               Ошибки SET_IDLE не критичны (восстановление EP0
-               делает kx_control) */
-            kx_control(d, 0x21, 0x0B, 0, c->iface, 0, 0);
-            kx_control(d, 0x21, 0x0A, 0, c->iface, 0, 0);
-
-            h->role = KX_ROLE_KBD_BOOT;
-
-        } else if (
-            c->subclass == 1 && c->protocol == 2 &&
-            kx_mouse_switch_to_boot(d, c->iface, h)
-        ) {
-
-            /*
-             * Мышь с поддержкой boot protocol (subclass 1,
-             * protocol 2 - это заявляет сама мышь): переключаем
-             * её SET_PROTOCOL(Boot) в стандартный формат, одинаковый
-             * у всех мышей: байт0 кнопки, байт1 dX, байт2 dY,
-             * [байт3 колесо]. Так делают BIOS и загрузчики.
-             *
-             * РАНЬШЕ основным путём был разбор Report Descriptor.
-             * В QEMU он работал, но на реальном донгле (Onikuma)
-             * отчёты приходили, а курсор стоял на месте - значит,
-             * дескриптор этого устройства разбирался неверно.
-             * Boot protocol от дескриптора не зависит вообще.
-             * Разбор дескриптора остаётся для устройств без boot
-             * protocol (например, планшет с абсолютными
-             * координатами) и на случай, если мышь отказалась
-             * переключаться (SET_PROTOCOL вернул ошибку).
-             */
-            h->role = KX_ROLE_MOUSE_BOOT;
-
-        } else {
-
-            if (c->subclass == 1 && c->protocol == 2)
-                print(out, "\n    mouse stayed in report mode - reading its descriptor");
-
-            if (rcc == 1 || rcc == 13) {
-
-                print(out, "\n");
-
-                hid_parse_report_descriptor(
-                    out,
-                    (volatile UINT8 *)P2V(rd_phys),
-                    rlen,
-                    &h->layout
-                );
-
-                print(out, "    -> ");
-            }
-
-            if (h->layout.valid)
-                h->role = KX_ROLE_MOUSE_RPT;
-        }
-
-        if (h->role == KX_ROLE_NONE) {
-            print(out, "not a keyboard/mouse we understand - skipped\n");
-            continue;
-        }
-
-        /* Interval в формате xHCI (см. подробный разбор в
-           старом коде выше) */
-        UINT8 iv;
-
-        if (speed == 3 || speed >= 4) {
-
-            iv = (c->interval >= 1) ? (UINT8)(c->interval - 1u) : 0;
-
-            if (iv > 15)
-                iv = 15;
-
-        } else {
-
-            UINT8 v = (c->interval == 0) ? 1 : c->interval;
-            UINT8 lg = 0;
-
-            while ((v >> 1) != 0) {
-                v = (UINT8)(v >> 1);
-                lg++;
-            }
-
-            iv = (UINT8)(lg + 3u);
-
-            if (iv < 3)
-                iv = 3;
-
-            if (iv > 10)
-                iv = 10;
-        }
-
-        h->interval_field = iv;
-
-        UINT64 ring = kx_dma_page();
-        h->rep_buf = kx_dma_page();
-
-        if (!ring || !h->rep_buf) {
-            print(out, "out of memory\n");
-            h->role = KX_ROLE_NONE;
-            continue;
-        }
-
-        kx_ring_init(&h->ring, ring);
-
-        h->used = TRUE;
-        nh++;
-
-        if (h->dci > max_dci)
-            max_dci = h->dci;
-
-        print(out, kx_role_name(h->role));
-        print(out, ", EP 0x");
-        print_hex(out, h->ep_addr, 2);
-        print(out, "\n");
     }
 
-    if (nh == 0) {
-        d->status = "HID, nothing usable";
-        return;
-    }
+    UINT8 speed = (UINT8)((sc >> 10) & 0xFu);
 
-    /* --- Configure Endpoint: все найденные конечные точки
-       устройства одной командой --- */
-    raw_zero_mem((volatile UINT8 *)P2V(d->in_ctx), 4096);
+    kx_out(out, "    %s\n", kx_speed_name(speed));
 
-    volatile UINT32 *oslot = (volatile UINT32 *)P2V(d->dev_ctx);
+    INTN di = kx_enum_device(out, -1, 0, (UINT8)p, speed);
 
-    ictl[0] = 0;
-    ictl[1] = 0x1u;
-
-    /* Slot Context - копия текущего (из Device Context, его
-       заполнил контроллер после Address Device), с новым
-       Context Entries = старший используемый DCI */
-    islot[0] = (oslot[0] & ~(0x1Fu << 27)) | ((UINT32)max_dci << 27);
-    islot[1] = oslot[1];
-    islot[2] = oslot[2];
-    islot[3] = 0;
-
-    for (UINTN k = 0; k < nh; k++) {
-
-        KX_HID *h = &g_kx_hid[hid_idx[k]];
-
-        ictl[1] |= (1u << h->dci);
-
-        volatile UINT32 *ep =
-            (volatile UINT32 *)P2V
-                (d->in_ctx + (UINT64)(h->dci + 1u) * cs);
-
-        UINT32 esit = (UINT32)h->maxpkt * (UINT32)(h->burst + 1u);
-
-        ep[0] = (UINT32)h->interval_field << 16;
-        ep[1] = (3u << 1) | (7u << 3) | ((UINT32)h->burst << 8) |
-                ((UINT32)h->maxpkt << 16);
-        ep[2] = (UINT32)(h->ring.phys & 0xFFFFFFFFu) | 1u;
-        ep[3] = (UINT32)(h->ring.phys >> 32);
-        /* Average TRB Length + Max ESIT Payload (некоторые
-           контроллеры отвергают периодическую конечную точку с
-           нулевым Max ESIT Payload) */
-        ep[4] = (UINT32)h->maxpkt | ((esit & 0xFFFFu) << 16);
-    }
-
-    cc = kx_command(
-        (UINT32)(d->in_ctx & 0xFFFFFFFFu),
-        (UINT32)(d->in_ctx >> 32),
-        0,
-        ((UINT32)slot << 24) | (12u << 10),
-        NULL
-    );
-
-    if (cc != 1) {
-
-        print(out, "    Configure Endpoint failed, cc=");
-        print_uint(out, cc);
-        print(out, "\n");
-
-        for (UINTN k = 0; k < nh; k++)
-            g_kx_hid[hid_idx[k]].role = KX_ROLE_NONE;
-
-        return;
-    }
-
-    /* --- поехали: первый TRB на каждую конечную точку --- */
-    for (UINTN k = 0; k < nh; k++) {
-
-        KX_HID *h = &g_kx_hid[hid_idx[k]];
-
-        if (h->role == KX_ROLE_MOUSE_RPT || h->role == KX_ROLE_MOUSE_BOOT)
-            g_kmouse_present = TRUE;
-
-        kx_hid_queue(h);
-    }
-
-    d->status = "HID, active";
-
-    print(out, "    ready.\n");
+    if (out == NULL && di >= 0)
+        kx_event_log("port %u: connected %04x:%04x - %s", (UINT32)p,
+                     g_kx_devs[di].vid, g_kx_devs[di].pid, g_kx_devs[di].status);
 }
 
+/* ================================================================
+ * Обслуживание в основном коде (из kernel_poll_input)
+ * ================================================================ */
 
-/*
- * Запуск драйвера целиком (после ExitBootServices): сброс
- * контроллера, структуры, запуск, питание портов, перечисление
- * всех устройств.
- */
+void kx_service(void)
+{
+    if (!g_kx.running)
+        return;
+
+    kx_lock();
+
+    kx_pump();
+
+    /* корневые порты: подключили / выдернули */
+    if (g_kx.any_change) {
+
+        g_kx.any_change = FALSE;
+
+        for (UINTN p = 1; p <= g_kx.cap.MaxPorts && p < 256; p++) {
+
+            UINT8 ch = g_kx.root_change[p];
+
+            if (ch == 0)
+                continue;
+
+            g_kx.root_change[p] = 0;
+
+            UINT64 pb = g_kx.op + 0x400u + (UINT64)(p - 1u) * 0x10u;
+            UINT32 sc = mmio_read32(pb);
+            INTN di = kx_root_dev(p);
+            BOOLEAN connected = (sc & PORTSC_BIT_CCS) != 0;
+
+            /* выдернули (или передёрнули: подключение менялось) */
+            if (di >= 0 && (!connected || (ch & 2u))) {
+                kx_event_log("port %u: disconnected %04x:%04x", (UINT32)p,
+                             g_kx_devs[di].vid, g_kx_devs[di].pid);
+                kx_remove_device((UINTN)di);
+                g_kx.hot_removed++;
+                di = -1;
+            }
+
+            if (connected && di < 0) {
+                /* дребезг контактов: дать устройству "сесть" */
+                kx_msleep(100);
+                g_kx.hot_added++;
+                kx_root_port_connect(NULL, p);
+            }
+        }
+    }
+
+    /* хабы: что-то изменилось на их портах */
+    kx_hub_service();
+
+    /* сторож восстановления конечных точек */
+    kx_pipes_watchdog();
+
+    /* светодиоды клавиатур */
+    kx_hid_service_leds();
+
+    kx_unlock();
+}
+
+/* ================================================================
+ * Запуск драйвера
+ * ================================================================ */
+
 void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
+    g_kx.irq_mode = "polling";
+
+    for (UINTN i = 0; i < KX_MAX_HUBS; i++)
+        g_kx_hubs[i].used = FALSE;
+
     if (!g_kx.present) {
         print(out, "  No xHCI controller - USB input disabled.\n");
         return;
@@ -1433,22 +1459,11 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     g_kx.ctx_size = (hcc1 & 0x4u) ? 64u : 32u;
 
     UINT32 hcs2 = mmio_read32(mmio + 0x08);
-    g_kx.scratchpads =
-        (((hcs2 >> 21) & 0x1Fu) << 5) | ((hcs2 >> 27) & 0x1Fu);
+    g_kx.scratchpads = (((hcs2 >> 21) & 0x1Fu) << 5) | ((hcs2 >> 27) & 0x1Fu);
 
-    print(out, "  xHCI at ");
-    print_uint(out, g_kx.bus);
-    print(out, ":");
-    print_uint(out, g_kx.devn);
-    print(out, ".");
-    print_uint(out, g_kx.func);
-    print(out, ", ");
-    print_uint(out, g_kx.cap.MaxPorts);
-    print(out, " ports, context size ");
-    print_uint(out, g_kx.ctx_size);
-    print(out, ", scratchpad buffers ");
-    print_uint(out, g_kx.scratchpads);
-    print(out, "\n");
+    kprintf(out, "  xHCI at %u:%u.%u, %u ports, context size %u, scratchpad buffers %u\n",
+            g_kx.bus, g_kx.devn, g_kx.func, g_kx.cap.MaxPorts,
+            g_kx.ctx_size, g_kx.scratchpads);
 
     if (!xhci_reset_controller(g_kx.op)) {
         print(out, "  xHCI reset failed - USB input disabled.\n");
@@ -1466,8 +1481,8 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         return;
     }
 
-    /* Scratchpad Buffer Array: DCBAA[0] -> массив адресов
-       страниц, каждая страница - в распоряжении контроллера */
+    /* Scratchpad Buffer Array: DCBAA[0] -> массив адресов страниц,
+       каждая страница - в распоряжении контроллера */
     if (g_kx.scratchpads > 0) {
 
         UINT64 arr = kx_dma_page();
@@ -1506,8 +1521,7 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
     mmio_write32(g_kx.op + 0x38, g_kx.cap.MaxSlots);
 
-    /* Event Ring: порядок по спеке - ERSTSZ, ERDP, ERSTBA
-       (запись ERSTBA заставляет контроллер прочитать таблицу) */
+    /* Event Ring: порядок по спеке - ERSTSZ, ERDP, ERSTBA */
     volatile UINT32 *erst = (volatile UINT32 *)P2V(g_kx.erst);
 
     erst[0] = (UINT32)(g_kx.evring & 0xFFFFFFFFu);
@@ -1555,44 +1569,76 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
             mmio_write32(pb, portsc_base_for_write(s) | (1u << 9));
     }
 
-    /* Дать устройствам время заново "появиться" после сброса
-       (в QEMU мгновенно, на железе - десятки миллисекунд) */
-    busy_wait_ms(200);
+    /* Дать устройствам время заново "появиться" после сброса */
+    kx_msleep(200);
 
     print(out, "  xHCI running. Scanning root ports...\n");
 
     for (UINTN p = 1; p <= g_kx.cap.MaxPorts; p++)
-        kx_enum_port(out, p);
+        kx_root_port_connect(out, p);
 
-    /* подобрать события, накопившиеся за перечисление */
-    kx_poll();
+    /* события подключения, накопившиеся за перечисление, - уже
+       обработаны; забыть о них */
+    kx_lock();
+    kx_pump();
+    for (UINTN p = 0; p < 256; p++)
+        g_kx.root_change[p] = 0;
+    g_kx.any_change = FALSE;
+    kx_unlock();
 
-    UINTN kbds = 0, mice = 0;
+    /* --- прерывания: MSI -> вектор KX_VEC_XHCI --- */
+    kx_irq_register(KX_VEC_XHCI, kx_usb_irq);
+
+    const char *mode = kx_pci_enable_msi(g_kx.bus, g_kx.devn, g_kx.func, KX_VEC_XHCI);
+
+    if (mode != NULL) {
+
+        /* IMOD: не чаще раза в 250 мкс (1000 x 250 нс) - мышь на
+           1000 Гц этим не тормозится, а шквал событий не душит ядро */
+        mmio_write32(g_kx.intr0 + 0x04, 1000u);
+        /* IMAN: IE (бит 1) включить, IP (бит 0) сбросить */
+        mmio_write32(g_kx.intr0 + 0x00, 0x3u);
+        /* USBCMD.INTE (бит 2) */
+        mmio_write32(g_kx.op + 0x00, mmio_read32(g_kx.op + 0x00) | 0x4u);
+
+        g_kx.irq_mode = mode;
+    }
+
+    UINTN kbds = 0, mice = 0, hubs = 0, disks = 0;
 
     for (UINTN i = 0; i < KX_MAX_HID; i++) {
-
         if (!g_kx_hid[i].used)
             continue;
-
         if (g_kx_hid[i].role == KX_ROLE_KBD_BOOT)
             kbds++;
+        else if (g_kx_hid[i].role == KX_ROLE_HUB)
+            hubs++;
         else if (g_kx_hid[i].role != KX_ROLE_NONE)
             mice++;
     }
 
-    print(out, "\n  USB summary: ");
-    print_uint(out, kbds);
-    print(out, " keyboard(s), ");
-    print_uint(out, mice);
-    print(out, " mouse/pointer interface(s)\n");
+    for (UINTN i = 0; i < KX_MAX_MSD; i++)
+        if (g_kx_msd[i].used)
+            disks++;
+
+    kprintf(out, "\n  USB summary: %u keyboard(s), %u mouse/pointer interface(s), "
+                 "%u hub(s), %u drive(s)\n",
+            (UINT32)kbds, (UINT32)mice, (UINT32)hubs, (UINT32)disks);
+    kprintf(out, "  USB events: %s%s\n", g_kx.irq_mode,
+            mode ? " interrupts (the controller signals by itself)" :
+                   " - no MSI, the driver asks the controller regularly");
 }
 
-
-/* Опросить ВСЕ источники ввода. Зовётся нашими ConIn/
-   SimplePointer при каждом обращении шелла/GUI за вводом */
+/* Опросить ВСЕ источники ввода. Зовётся нашими ConIn/SimplePointer
+   при каждом обращении шелла/GUI за вводом. С прерываниями это
+   почти ничего не стоит: события уже разобраны обработчиком, здесь -
+   только то, что требует ожидания (подключения, светодиоды). */
 void kernel_poll_input(void)
 {
-    kx_poll();
+    kx_service();
+
+    kx_lock();
     ps2_poll();
     kbd_repeat_tick();
+    kx_unlock();
 }

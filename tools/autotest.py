@@ -21,7 +21,7 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
 
 Выход: 0 - все проверки прошли, 1 - что-то не так (лог сохранён).
 """
-import argparse, json, os, socket, struct, subprocess, sys, tempfile, time
+import argparse, json, os, re, socket, struct, subprocess, sys, tempfile, time
 
 # ------------------------------------------------------------ FAT16 image
 
@@ -134,6 +134,11 @@ class VM:
             self.cmd('human-monitor-command', **{'command-line': 'sendkey %s 40' % k})
             time.sleep(0.07)
 
+    def mouse_move(self, dx, dy):
+        self.cmd('input-send-event', events=[
+            {'type': 'rel', 'data': {'axis': 'x', 'value': dx}},
+            {'type': 'rel', 'data': {'axis': 'y', 'value': dy}}])
+
     def log(self):
         try:
             return open(self.serial, 'rb').read().decode('latin-1')
@@ -141,9 +146,14 @@ class VM:
             return ''
 
     def wait_for(self, text, timeout, since=0):
+        """text - подстрока, или 're:...' - регулярное выражение"""
         t0 = time.time()
         while time.time() - t0 < timeout:
-            if text in self.log()[since:]:
+            part = self.log()[since:]
+            if text.startswith('re:'):
+                if re.search(text[3:], part):
+                    return True
+            elif text in part:
                 return True
             if self.p.poll() is not None:
                 return False
@@ -163,24 +173,58 @@ class VM:
 # ------------------------------------------------------------ the test
 
 
-def run_steps(a, work, steps, name, extra=()):
+def make_stick_image(path):
+    """Тестовая "флешка": MBR с разделом FAT32 и метками"""
+    img = bytearray(16 * 1024 * 1024)
+    img[0:16] = b'MYOS TEST STICK!'
+    e = bytearray(16)
+    e[4] = 0x0C
+    struct.pack_into('<II', e, 8, 2048, 32768 - 2048)
+    img[446:462] = e
+    img[510], img[511] = 0x55, 0xAA
+    img[2048 * 512:2048 * 512 + 11] = b'HELLO MYOS!'
+    open(path, 'wb').write(img)
+
+
+DEFAULT_DEVICES = ['qemu-xhci', 'usb-mouse', 'usb-kbd']
+
+
+def run_steps(a, work, steps, name, extra=(), devices=None):
     """Один запуск ВМ: пройти шаги, вернуть (ok, текст лога)."""
     disk = os.path.join(work, name + '.img')
     make_fat_image(a.efi, a.kernel, disk)
 
     vmdir = os.path.join(work, name)
     os.makedirs(vmdir, exist_ok=True)
-    vm = VM(a.qemu, a.ovmf, disk, vmdir, ['qemu-xhci', 'usb-mouse', 'usb-kbd'],
+    extra = [x.replace('@WORK@', work) for x in extra]
+    vm = VM(a.qemu, a.ovmf, disk, vmdir, devices or DEFAULT_DEVICES,
             mem=a.mem, extra=(a.extra.split() if a.extra else []) + list(extra))
 
     ok = True
     for keys, expect, timeout in steps:
         mark = len(vm.log())
-        if keys:
+        label = '(boot)' if keys is None else '  ...'
+        if isinstance(keys, dict):
+            # действие вместо клавиш: QMP-команда или движение мыши
+            if 'qmp' in keys:
+                name, args = keys['qmp']
+                vm.cmd(name, **args)
+                label = '[qmp %s]' % name
+            if 'mouse' in keys:
+                for _ in range(keys['mouse']):
+                    vm.mouse_move(5, 3)
+                    time.sleep(0.03)
+                label = '[mouse]'
+        elif keys:
             vm.type(keys)
-        # проверку ищем в новом выводе; первую - во всём логе
-        found = vm.wait_for(expect, timeout, since=mark if keys else 0)
-        label = '(boot)' if keys is None else (keys.strip() or '  ...')
+            label = keys.strip() or '  ...'
+        # проверку ищем в новом выводе; первую - во всём логе;
+        # пустая проверка - просто действие
+        if expect == '':
+            time.sleep(timeout)
+            found = True
+        else:
+            found = vm.wait_for(expect, timeout, since=mark if keys else 0)
         print('%-4s %-14s -> %s' % ('PASS' if found else 'FAIL', label, expect))
         if not found:
             ok = False
@@ -224,11 +268,43 @@ def main():
         ('int3\n', 'handler ran and returned', 15),
         ('calc 6 * 7\n', '42', 15),
         ('time\n', ':', 15),
+        ('cpu\n', 're:CPU load \\(last second[^)]*\\): [0-9]\\.[0-9]%', 15),
+        ('', 'USB controller (xHCI)', 5),
     ]
 
     runs = [('main', main_steps, ['-smp', '2'])]
 
     if not a.quick:
+        # USB: хаб, мышь за ним, флешка за ним; потом горячее
+        # подключение/отключение через QMP
+        runs.append(('usb-tree', [
+            (None, "Type 'help'", 90),
+            ('', 'USB events: MSI', 5),
+            ('usb\n', 'hub: 8 ports', 15),
+            ('', 'USB drive, ready', 5),
+            ('disk read 2048\n', 'HELLO MYOS!', 20),
+            ('disk read 0\n', 'this is an MBR', 20),
+            ({'qmp': ('device_add', {'driver': 'usb-mouse', 'bus': 'xhci.0',
+                                     'port': '2.3', 'id': 'hm'})},
+             're:usb event: .*connected 0627:0001 - HID, active', 20),
+            ({'mouse': 20}, '', 1),
+            ('usb\n', 're:reports [1-9]', 15),
+            ('', 'hot-plug: 1 connected', 5),
+            ({'qmp': ('device_del', {'id': 'hm'})},
+             're:usb event: .*disconnected 0627:0001', 20),
+            ('usb\n', '1 removed', 15),
+        ], ['-drive', 'if=none,id=stick,format=raw,file=@WORK@/stick.img'],
+           ['qemu-xhci,id=xhci', 'usb-kbd,bus=xhci.0,port=1', 'usb-hub,bus=xhci.0,port=2',
+            'usb-storage,bus=xhci.0,port=2.2,drive=stick']))
+        # только PS/2: клавиатура по IRQ 1, мышь по IRQ 12
+        runs.append(('ps2', [
+            (None, "Type 'help'", 90),
+            ('', 'keyboard on IRQ 1', 5),
+            ('', 'PS/2 mouse/touchpad: found', 5),
+            ({'mouse': 20}, '', 1),
+            ('cpu\n', 're:PS/2 keyboard \\(IRQ 1\\) +[1-9]', 15),
+            ('', 're:PS/2 mouse / touchpad \\(IRQ 12\\) +[1-9]', 5),
+        ], [], ['qemu-xhci']))
         # чипсет q35: PCIe через ECAM (MCFG), перезагрузка через FADT
         runs.append(('q35', [
             (None, "Type 'help'", 90),
@@ -262,11 +338,14 @@ def main():
 
     ok = True
     last_log = ''
+    make_stick_image(os.path.join(work, 'stick.img'))
+
     for run in runs:
         name, steps = run[0], run[1]
         extra = run[2] if len(run) > 2 else []
+        devices = run[3] if len(run) > 3 else None
         print('--- run: %s' % name)
-        r, last_log = run_steps(a, work, steps, name, extra)
+        r, last_log = run_steps(a, work, steps, name, extra, devices)
         if not r:
             ok = False
             break
