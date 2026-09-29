@@ -18,6 +18,7 @@
 #define TCP_SYN_RETRIES    5        /* 1+2+4+8+16 = 31 с на соединение */
 #define TCP_TIME_WAIT_MS   2000u    /* по правилам 2 MSL = минуты; нам хватит */
 #define TCP_ORPHAN_MS      60000u
+#define TCP_OOO_MAX        32       /* сегментов "не по порядку" в ожидании */
 
 #define TCP_FIN   0x01
 #define TCP_SYN   0x02
@@ -38,6 +39,15 @@
 #define TCP_TIME_WAIT    10
 
 struct SOCKET;
+
+/* Сегмент, пришедший раньше предыдущих (что-то потерялось по
+   дороге): ждёт, пока недостающее придёт повтором */
+typedef struct {
+    UINT32  seq;
+    UINT16  len;
+    BOOLEAN fin;
+    UINT8  *data;
+} TCP_OOO;
 
 struct TCB {
     BOOLEAN used;
@@ -60,9 +70,14 @@ struct TCB {
     UINT32  rbuf_start, rbuf_len;
     BOOLEAN rcv_fin;          /* собеседник закрыл свою сторону */
     UINT32  last_adv_wnd;     /* какое окно мы объявили последним */
+    UINT32  last_adv_ack;     /* ... и при каком rcv_nxt */
+    BOOLEAN force_wnd;        /* сообщить новое окно, даже без новых данных */
     BOOLEAN ack_now;
 
     UINT16  mss;              /* сегмент собеседника */
+
+    TCP_OOO ooo[TCP_OOO_MAX];
+    UINT32  ooo_n, ooo_bytes;
 
     /* таймеры и замер времени ответа */
     UINT64  rto_ms;

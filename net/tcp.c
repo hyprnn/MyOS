@@ -112,6 +112,12 @@ void tcb_free(TCB *t)
     if (t->sbuf) kfree(t->sbuf);
     if (t->rbuf) kfree(t->rbuf);
 
+    for (UINT32 i = 0; i < t->ooo_n; i++)
+        if (t->ooo[i].data)
+            kfree(t->ooo[i].data);
+    t->ooo_n = 0;
+    t->ooo_bytes = 0;
+
     /* ждущий в accept потомок слушающего сокета - освободить тоже */
     for (UINTN i = 0; i < TCB_MAX; i++)
         if (g_tcb[i].used && g_tcb[i].listener == t)
@@ -179,9 +185,20 @@ static void tcp_send_seg(TCB *t, UINT8 flags, UINT32 seq, UINT32 off, UINT32 n)
         hl += 4;
     }
 
+    /* Окно. Если rcv_nxt не сдвинулся с прошлого ACK, окно не
+       увеличиваем: иначе повторные ACK (сигнал "потерялся сегмент")
+       отличаются окном, и отправитель не считает их повторными -
+       быстрый повтор не срабатывает, ждёт таймера. Выросшее окно
+       сообщит tcp_window_update. */
+    UINT32 wnd = tcp_window(t);
+
+    if (t->rcv_nxt == t->last_adv_ack && wnd > t->last_adv_wnd && !t->force_wnd &&
+        !(flags & TCP_SYN))
+        wnd = t->last_adv_wnd;
+
     seg[12] = (UINT8)((hl / 4u) << 4);
     seg[13] = flags;
-    net_put16(seg + 14, tcp_window(t));
+    net_put16(seg + 14, (UINT16)wnd);
     net_put16(seg + 16, 0);
     net_put16(seg + 18, 0);
 
@@ -194,7 +211,8 @@ static void tcp_send_seg(TCB *t, UINT8 flags, UINT32 seq, UINT32 off, UINT32 n)
 
     ip_send(t->lip, t->rip, IP_PROTO_TCP, seg, total);
 
-    t->last_adv_wnd = tcp_window(t);
+    t->last_adv_wnd = wnd;
+    t->last_adv_ack = t->rcv_nxt;
     t->ack_now = FALSE;
     t->segs_out++;
 }
@@ -423,7 +441,9 @@ void tcp_window_update(TCB *t)
         (t->state == TCP_ESTABLISHED || t->state == TCP_FIN_WAIT_1 ||
          t->state == TCP_FIN_WAIT_2)) {
         t->ack_now = TRUE;
+        t->force_wnd = TRUE;
         tcp_output(t);
+        t->force_wnd = FALSE;
     }
 }
 
@@ -579,6 +599,130 @@ static void tcp_ack(TCB *t, UINT32 ack, UINT32 win, UINT32 seq)
         t->snd_wl1 = seq;
         t->snd_wl2 = ack;
     }
+}
+
+/* Принимает ли соединение данные в этом состоянии */
+static BOOLEAN tcp_receiving(TCB *t)
+{
+    return t->state == TCP_ESTABLISHED || t->state == TCP_FIN_WAIT_1 ||
+           t->state == TCP_FIN_WAIT_2;
+}
+
+/*
+ * Положить в буфер приёма данные сегмента, начинающегося не позже
+ * rcv_nxt (уже полученное начало пропускается). TRUE - FIN этого
+ * сегмента теперь "по порядку" (все данные до него есть).
+ */
+static BOOLEAN tcp_deliver(TCB *t, UINT32 seq, const UINT8 *data, UINT32 dlen, BOOLEAN fin)
+{
+    if (dlen > 0) {
+
+        UINT32 skip = t->rcv_nxt - seq;
+
+        if (skip < dlen) {
+
+            UINT32 n = dlen - skip;
+            UINT32 room = TCP_RBUF - t->rbuf_len;
+
+            if (n > room)
+                n = room;           /* остальное отправитель повторит */
+
+            if (!tcb_has_reader(t)) {
+                /* программа уже закрыла сокет - принимаем "в никуда" */
+                t->rcv_nxt += n;
+            } else if (n > 0) {
+                ring_write(t->rbuf, TCP_RBUF, t->rbuf_start, t->rbuf_len, t->rbuf_len,
+                           data + skip, n);
+                t->rbuf_len += n;
+                t->rcv_nxt += n;
+                t->bytes_in += n;
+                if (t->sock != NULL)
+                    net_wake(t->sock);
+            }
+        }
+
+        t->ack_now = TRUE;
+    }
+
+    return fin && seq + dlen == t->rcv_nxt;
+}
+
+static void tcp_ooo_drop(TCB *t, UINT32 i)
+{
+    if (t->ooo[i].data)
+        kfree(t->ooo[i].data);
+
+    t->ooo_bytes -= t->ooo[i].len;
+    t->ooo[i] = t->ooo[t->ooo_n - 1];
+    t->ooo_n--;
+}
+
+/* Запомнить сегмент "из будущего" (впереди дыра) */
+static void tcp_ooo_store(TCB *t, UINT32 seq, const UINT8 *data, UINT32 dlen, BOOLEAN fin)
+{
+    if (!tcb_has_reader(t) || t->ooo_n >= TCP_OOO_MAX)
+        return;
+
+    /* только в пределах окна, и всего не больше буфера */
+    if (SEQ_GT(seq + dlen, t->rcv_nxt + (TCP_RBUF - t->rbuf_len)) ||
+        t->ooo_bytes + dlen > TCP_RBUF)
+        return;
+
+    for (UINT32 i = 0; i < t->ooo_n; i++)
+        if (t->ooo[i].seq == seq && t->ooo[i].len >= dlen)
+            return;                              /* такой уже есть */
+
+    UINT8 *copy = NULL;
+
+    if (dlen > 0) {
+        copy = (UINT8 *)kmalloc(dlen);
+        if (copy == NULL)
+            return;
+        memcpy(copy, data, dlen);
+    }
+
+    TCP_OOO *o = &t->ooo[t->ooo_n++];
+
+    o->seq = seq;
+    o->len = (UINT16)dlen;
+    o->fin = fin;
+    o->data = copy;
+    t->ooo_bytes += dlen;
+}
+
+/* Дыра закрылась: забрать ждавшие сегменты, которые теперь по
+   порядку. TRUE - дошли и до FIN */
+static BOOLEAN tcp_ooo_drain(TCB *t)
+{
+    BOOLEAN progress = TRUE;
+
+    while (progress && t->ooo_n > 0) {
+
+        progress = FALSE;
+
+        for (UINT32 i = 0; i < t->ooo_n; i++) {
+
+            TCP_OOO *o = &t->ooo[i];
+
+            if (SEQ_GT(o->seq, t->rcv_nxt))
+                continue;                        /* ещё рано */
+
+            BOOLEAN fin = FALSE;
+
+            if (SEQ_GT(o->seq + o->len, t->rcv_nxt) ||
+                (o->fin && o->seq + o->len == t->rcv_nxt))
+                fin = tcp_deliver(t, o->seq, o->data, o->len, o->fin);
+
+            tcp_ooo_drop(t, i);                  /* использован или устарел */
+            progress = TRUE;
+
+            if (fin)
+                return TRUE;
+            break;
+        }
+    }
+
+    return FALSE;
 }
 
 void tcp_input(NETIF *nif, UINT32 src, UINT32 dst, const UINT8 *p, UINTN len)
@@ -739,9 +883,24 @@ void tcp_input(NETIF *nif, UINT32 src, UINT32 dst, const UINT8 *p, UINTN len)
     else
         acceptable = SEQ_LE(seq, t->rcv_nxt) && SEQ_GT(seq + seg_len, t->rcv_nxt);
 
+    if (!acceptable && SEQ_GT(seq, t->rcv_nxt) && !(fl & (TCP_RST | TCP_SYN)) &&
+        t->state != TCP_SYN_RCVD) {
+        /* сегмент "из будущего": перед ним что-то потерялось. Его
+           подтверждение (ACK) - учесть, данные - отложить до повтора
+           недостающего, отправителю - сразу напомнить, чего нам не
+           хватает (повторный ACK rcv_nxt: после трёх таких он
+           повторит потерянное, не дожидаясь таймера) */
+        if ((fl & TCP_ACK) && SEQ_LE(ack, t->snd_nxt))
+            tcp_ack(t, ack, win, seq);
+        if (tcp_receiving(t) && (dlen > 0 || (fl & TCP_FIN)))
+            tcp_ooo_store(t, seq, data, dlen, (fl & TCP_FIN) != 0);
+        t->ack_now = TRUE;
+        tcp_output(t);
+        return;
+    }
+
     if (!acceptable) {
-        /* старый повтор или сегмент "из будущего" (что-то потерялось
-           раньше) - напомнить, что нам нужно: ACK rcv_nxt */
+        /* старый повтор - напомнить, что нам нужно: ACK rcv_nxt */
         if (!(fl & TCP_RST)) {
             t->ack_now = TRUE;
             tcp_output(t);
@@ -815,44 +974,17 @@ void tcp_input(NETIF *nif, UINT32 src, UINT32 dst, const UINT8 *p, UINTN len)
         }
     }
 
-    /* --- данные --- */
-    if (dlen > 0 && (t->state == TCP_ESTABLISHED || t->state == TCP_FIN_WAIT_1 ||
-                     t->state == TCP_FIN_WAIT_2)) {
+    /* --- данные (и отложенные сегменты, если дыра закрылась) --- */
+    BOOLEAN fin_now = FALSE;
 
-        /* начало могло быть уже получено (повтор с перекрытием) */
-        UINT32 skip = t->rcv_nxt - seq;
-
-        if (skip < dlen) {
-
-            UINT32 n = dlen - skip;
-            UINT32 room = TCP_RBUF - t->rbuf_len;
-
-            if (n > room)
-                n = room;           /* остальное отправитель повторит */
-
-            if (!tcb_has_reader(t)) {
-                /* программа уже закрыла сокет - принимаем "в никуда" */
-                t->rcv_nxt += n;
-            } else if (n > 0) {
-                ring_write(t->rbuf, TCP_RBUF, t->rbuf_start, t->rbuf_len, t->rbuf_len,
-                           data + skip, n);
-                t->rbuf_len += n;
-                t->rcv_nxt += n;
-                t->bytes_in += n;
-                if (t->sock != NULL)
-                    net_wake(t->sock);
-            }
-
-            /* FIN считается, только если все данные до него приняты */
-            if (n < dlen - skip)
-                fl &= (UINT8)~TCP_FIN;
-        }
-
-        t->ack_now = TRUE;
+    if (tcp_receiving(t)) {
+        fin_now = tcp_deliver(t, seq, data, dlen, (fl & TCP_FIN) != 0);
+        if (!fin_now && t->ooo_n > 0)
+            fin_now = tcp_ooo_drain(t);
     }
 
     /* --- FIN от собеседника: он больше ничего не пришлёт --- */
-    if ((fl & TCP_FIN) && seq + dlen == t->rcv_nxt) {
+    if (fin_now) {
 
         t->rcv_nxt++;
         t->rcv_fin = TRUE;

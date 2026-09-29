@@ -26,6 +26,12 @@ KMUTEX g_net_mutex = KMUTEX_INIT("net");
 volatile BOOLEAN g_net_work = FALSE;
 
 static KTHREAD *g_net_thread = NULL;
+
+/* Отладка: терять каждый N-й принятый кадр (кроме петли) - так
+   проверяются повторы TCP и DHCP ("net drop 5"; 0 - не терять) */
+UINT32 g_net_drop_every = 0;
+static UINT32 g_net_drop_count = 0;
+UINT64 g_net_dropped_test = 0;
 static BOOLEAN g_net_started = FALSE;
 
 /* ================================================================
@@ -522,6 +528,12 @@ static void net_process_rx(void)
         if (nif == NULL || !nif->used)
             continue;
 
+        if (g_net_drop_every != 0 && !nif->loopback &&
+            ++g_net_drop_count % g_net_drop_every == 0) {
+            g_net_dropped_test++;
+            continue;
+        }
+
         nif->rx_packets++;
         nif->rx_bytes += cur.len;
 
@@ -580,7 +592,7 @@ static void net_timers(void)
 static BOOLEAN net_have_polling(void)
 {
     for (UINTN i = 0; i < NET_MAX_IF; i++)
-        if (g_netifs[i].used && g_netifs[i].poll != NULL)
+        if (g_netifs[i].used && g_netifs[i].poll_fast)
             return TRUE;
 
     return FALSE;

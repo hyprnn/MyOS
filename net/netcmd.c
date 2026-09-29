@@ -215,9 +215,24 @@ static void print_if(SIMPLE_TEXT_OUTPUT_INTERFACE *out, NETIF *f)
  * Команда ядра "net": что происходит в сети.
  *   net        - интерфейсы, ARP, соединения TCP, сокеты, DNS
  */
+extern UINT32 g_net_drop_every;
+extern UINT64 g_net_dropped_test;
+
 void kernel_cmd_net(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
 {
-    (void)arg;
+    if (arg[0] == 'd' && arg[1] == 'r' && arg[2] == 'o' && arg[3] == 'p') {
+        /* net drop N - терять каждый N-й кадр (проверка повторов) */
+        UINT32 n = 0;
+        for (const char *c = arg + 4; *c; c++)
+            if (*c >= '0' && *c <= '9')
+                n = n * 10u + (UINT32)(*c - '0');
+        g_net_drop_every = n;
+        if (n)
+            kprintf(out, "Test mode: every %u-th received frame is thrown away.\n", n);
+        else
+            print(out, "Test mode off: no frames are thrown away.\n");
+        return;
+    }
 
     if (!net_running()) {
         print(out, "The network is not running (no threads?).\n");
@@ -241,9 +256,14 @@ void kernel_cmd_net(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
     if (net_rxq_overflows())
         kprintf(out, "Receive queue overflows: %llu\n", net_rxq_overflows());
 
+    if (g_net_drop_every)
+        kprintf(out, "TEST MODE: every %u-th frame dropped (%llu so far); 'net drop 0' - off\n",
+                g_net_drop_every, g_net_dropped_test);
+
     dns_print_cache(out);
 
     kmutex_unlock(&g_net_mutex);
 
-    print(out, "\nPrograms: ifconfig, ping, nslookup, wget, nc, httpd (see 'help').\n");
+    print(out, "\nPrograms: ifconfig, ping, nslookup, wget, nc, httpd, nettest (see 'help').\n"
+               "'net drop N' - test mode: lose every N-th received frame.\n");
 }

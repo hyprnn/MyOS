@@ -207,6 +207,7 @@ static void e1k_isr(E1K *e)
         e1k_w(e, E_IMC, 0xFFFFFFFFu);
         e->nif->irq_mode = "polling (shared IRQ line was stuck)";
         e->nif->poll = e1k_poll;
+        e->nif->poll_fast = TRUE;
         klog("e1000: IRQ line %u is stuck, switching to polling\n", e->irq.gsi);
         return;
     }
@@ -461,6 +462,7 @@ static BOOLEAN e1k_start(E1K *e, UINT8 bus, UINT8 dev, UINT8 fn,
     if (mode == NULL) {
         e1k_w(e, E_IMC, 0xFFFFFFFFu);
         e->nif->poll = e1k_poll;
+        e->nif->poll_fast = TRUE;
         e->nif->irq_mode = "polling";
     } else {
         e->nif->irq_mode = mode;

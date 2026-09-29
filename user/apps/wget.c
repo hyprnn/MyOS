@@ -5,6 +5,8 @@
  *   wget http://host:8080/file.bin      -> file.bin
  *   wget -O - http://example.com/       -> на экран
  *   wget -O /usb0p1/page.htm http://... -> в этот файл
+ *   wget -O null http://...             -> никуда (проверка скорости)
+ * В конце печатается CRC-32 скачанного - сверить с оригиналом.
  *
  * Как это работает: DNS (имя -> адрес), соединение TCP с портом 80,
  * запрос "GET /путь HTTP/1.0" + заголовки, ответ: строка статуса
@@ -94,15 +96,34 @@ static const char *header(const char *hdrs, const char *name, char *out, int cap
     return NULL;
 }
 
-/* ---- вывод: файл или экран ---- */
+/* ---- вывод: файл, экран или никуда ---- */
 static int g_out = -1;
 static int g_screen = 0;
+static int g_null = 0;
 static unsigned long long g_written = 0;
+static unsigned int g_crc = 0xFFFFFFFFu;
+
+/* CRC-32 (как у zip и Ethernet) - чтобы сверить файл с оригиналом */
+static void crc_add(const unsigned char *d, long n)
+{
+    for (long i = 0; i < n; i++) {
+        g_crc ^= d[i];
+        for (int k = 0; k < 8; k++)
+            g_crc = (g_crc >> 1) ^ (0xEDB88320u & (0u - (g_crc & 1u)));
+    }
+}
 
 static int out_write(const char *d, long n)
 {
     if (n <= 0)
         return 0;
+
+    crc_add((const unsigned char *)d, n);
+
+    if (g_null) {
+        g_written += (unsigned long long)n;
+        return 0;
+    }
 
     long r = write(g_screen ? 1 : g_out, d, (size_t)n);
 
@@ -355,8 +376,9 @@ int main(int argc, char **argv)
         const char *fname = outname ? outname : base_name(g_path);
 
         g_screen = (strcmp(fname, "-") == 0);
+        g_null = (strcmp(fname, "null") == 0);
 
-        if (!g_screen) {
+        if (!g_screen && !g_null) {
             g_out = open(fname, O_WRITE | O_CREATE | O_TRUNC);
             if (g_out < 0) {
                 printf("wget: cannot create '%s': %s\n", fname, strerror(g_out));
@@ -411,7 +433,7 @@ int main(int argc, char **argv)
 
         close(s);
 
-        if (!g_screen)
+        if (!g_screen && !g_null)
             close(g_out);
 
         if (fail)
@@ -428,11 +450,12 @@ int main(int argc, char **argv)
             ms = 1;
 
         if (!quiet) {
+            int named = !g_screen && !g_null;
             if (g_screen)
                 printf("\n");
-            printf("Done: %llu bytes in %lu ms (%llu KiB/s)%s%s%s\n", g_written, ms,
-                   g_written * 1000ull / 1024ull / ms,
-                   g_screen ? "" : ", saved to '", g_screen ? "" : fname, g_screen ? "" : "'");
+            printf("Done: %llu bytes in %lu ms (%llu KiB/s), CRC-32 %08x%s%s%s\n", g_written, ms,
+                   g_written * 1000ull / 1024ull / ms, ~g_crc,
+                   named ? ", saved to '" : "", named ? fname : "", named ? "'" : "");
         }
 
         return 0;

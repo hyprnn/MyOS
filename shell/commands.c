@@ -105,6 +105,17 @@ void run_command(
 
         kernel_cmd_net(out, "");
 
+    } else if (starts_with(line, "net ")) {
+
+        char arg[32];
+        UINTN k = 0;
+
+        for (CHAR16 *c = line + 4; *c && k + 1 < sizeof(arg); c++)
+            arg[k++] = (*c < 128) ? (char)*c : '?';
+
+        arg[k] = '\0';
+        kernel_cmd_net(out, arg);
+
     } else if (streq(line, "wifi") || starts_with(line, "wifi ")) {
 
         char arg[48];

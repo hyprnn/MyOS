@@ -91,7 +91,8 @@ struct NETIF {
     BOOLEAN     loopback;
     const char *irq_mode;     /* "MSI", "MSI-X", "IRQ 11", "polling" */
     NET_TX_FN   tx;
-    NET_POLL_FN poll;         /* NULL - драйвер работает прерываниями */
+    NET_POLL_FN poll;         /* зовётся из потока net каждый круг (NULL - не нужно) */
+    volatile BOOLEAN poll_fast; /* драйвер работает опросом: будить поток часто */
     void       *drv;          /* данные драйвера */
     UINT32      drv_serial;   /* USB: номер подключения */
 
