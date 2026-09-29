@@ -12,3 +12,4 @@ MyOS_hdd.vdi
 kernel.elf
 __pycache__/
 *.su
+MyOS-*.zip
