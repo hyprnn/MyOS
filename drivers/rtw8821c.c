@@ -2546,6 +2546,20 @@ BOOLEAN rtw8821c_attach(UINT8 bus, UINT8 dev, UINT8 fn, SIMPLE_TEXT_OUTPUT_INTER
     }
     r->err[0] = '\0';
 
+    /* описание для net/wlan.c - сразу: функции драйвера (например,
+       rtw_set_channel ниже) берут своё состояние из hw.priv */
+    r->hw.driver = "rtw8821c";
+    r->hw.model = "Realtek RTL8821CE (802.11ac)";
+    r->hw.set_channel = rtw_set_channel;
+    r->hw.tx = rtw_tx;
+    r->hw.set_scan = rtw_set_scan;
+    r->hw.set_bssid = rtw_set_bssid;
+    r->hw.set_link = rtw_set_link;
+    r->hw.poll = rtw_poll;
+    r->hw.report_rssi = rtw_report_rssi;
+    r->hw.info = rtw_info;
+    r->hw.priv = r;
+
     /* --- шина: разбудить (D0), найти регистры (BAR2, 64 КиБ) --- */
     r->stage = "PCI";
     net_pci_wake(bus, dev, fn);
@@ -2672,19 +2686,7 @@ BOOLEAN rtw8821c_attach(UINT8 bus, UINT8 dev, UINT8 fn, SIMPLE_TEXT_OUTPUT_INTER
             r->pwr_idx[DESC_RATE1M]);
 
     r->stage = "running";
-
-    r->hw.driver = "rtw8821c";
-    r->hw.model = "Realtek RTL8821CE (802.11ac)";
     memcpy(r->hw.mac, r->mac, 6);
-    r->hw.set_channel = rtw_set_channel;
-    r->hw.tx = rtw_tx;
-    r->hw.set_scan = rtw_set_scan;
-    r->hw.set_bssid = rtw_set_bssid;
-    r->hw.set_link = rtw_set_link;
-    r->hw.poll = rtw_poll;
-    r->hw.report_rssi = rtw_report_rssi;
-    r->hw.info = rtw_info;
-    r->hw.priv = r;
 
     klog("rtw8821c: up - firmware %u.%u, MAC %02x:%02x:%02x:%02x:%02x:%02x, RFE %u\n",
          r->fw_ver, r->fw_sub, r->mac[0], r->mac[1], r->mac[2], r->mac[3], r->mac[4],
