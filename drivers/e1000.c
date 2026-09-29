@@ -321,6 +321,7 @@ static BOOLEAN e1k_start(E1K *e, UINT8 bus, UINT8 dev, UINT8 fn,
         return FALSE;
     }
 
+    net_pci_wake(bus, dev, fn);
     vmm_map_mmio(bar, 0x20000u, VMM_UC);
     pci_enable_device(bus, dev, fn);
 

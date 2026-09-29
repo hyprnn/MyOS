@@ -382,6 +382,43 @@ BOOLEAN net_parse_ip(const char *s, UINT32 *ip)
 }
 
 /* ================================================================
+ * Питание карты: прошивка (или Windows перед перезагрузкой) могла
+ * оставить её в режиме сна D3 - тогда регистры не отвечают. Перевести
+ * в рабочий D0 (регистр PMCSR из возможности PCI "Power Management").
+ * При выходе из D3 карта может забыть адреса BAR - вернуть их.
+ * ================================================================ */
+
+void net_pci_wake(UINT8 bus, UINT8 dev, UINT8 fn)
+{
+    UINT8 pm = pci_find_cap(bus, dev, fn, 0x01);
+
+    if (pm == 0)
+        return;
+
+    UINT32 csr = pci_config_read32(bus, dev, fn, (UINT8)(pm + 4));
+
+    if ((csr & 3u) == 0)
+        return;                                   /* уже D0 */
+
+    UINT32 bars[6];
+    UINT32 cmd = pci_config_read32(bus, dev, fn, 0x04);
+
+    for (UINTN i = 0; i < 6; i++)
+        bars[i] = pci_config_read32(bus, dev, fn, (UINT8)(0x10 + 4 * i));
+
+    pci_config_write32(bus, dev, fn, (UINT8)(pm + 4), csr & ~3u);
+    kx_sleep_us(10000);                           /* по правилам - 10 мс */
+
+    for (UINTN i = 0; i < 6; i++)
+        if (pci_config_read32(bus, dev, fn, (UINT8)(0x10 + 4 * i)) != bars[i])
+            pci_config_write32(bus, dev, fn, (UINT8)(0x10 + 4 * i), bars[i]);
+
+    pci_config_write32(bus, dev, fn, 0x04, cmd);
+
+    klog("net: PCI %u:%u.%u woken up from D%u to D0\n", bus, dev, fn, csr & 3u);
+}
+
+/* ================================================================
  * Прерывания сетевых карт. У обработчика прерывания в MyOS нет
  * аргументов, поэтому для каждой карты - своя маленькая функция-
  * прокладка на своём векторе (0x60, 0x61, ...).
@@ -589,13 +626,35 @@ static void net_timers(void)
     tcp_timer();
 }
 
-static BOOLEAN net_have_polling(void)
+/* Как долго потоку net можно спать, если кадров нет: карта без
+   прерываний - 2 мс; идут соединения TCP, вопросы ARP или DHCP -
+   10 мс (таймеры повторов); иначе - 250 мс (в простое процессор
+   почти не тревожим) */
+static UINT64 net_idle_ms(void)
 {
-    for (UINTN i = 0; i < NET_MAX_IF; i++)
-        if (g_netifs[i].used && g_netifs[i].poll_fast)
-            return TRUE;
+    BOOLEAN timers = tcp_busy() || arp_busy();
 
-    return FALSE;
+    for (UINTN i = 0; i < NET_MAX_IF; i++) {
+
+        NETIF *f = &g_netifs[i];
+
+        if (!f->used)
+            continue;
+
+        if (f->poll_fast)
+            return 2;
+
+        if (f->dhcp.state == DHCP_SELECTING || f->dhcp.state == DHCP_REQUESTING ||
+            f->dhcp.state == DHCP_RENEWING)
+            timers = TRUE;
+
+        /* связь появилась, а DHCP ещё не начат (или пропала) */
+        if (!f->loopback && f->cfg == NET_CFG_DHCP &&
+            (f->link != (f->dhcp.state != DHCP_OFF)))
+            timers = TRUE;
+    }
+
+    return timers ? 10u : 250u;
 }
 
 static void net_thread(void *arg)
@@ -617,15 +676,15 @@ static void net_thread(void *arg)
         net_process_rx();
         net_timers();
 
+        UINT64 idle = net_idle_ms();
+
         kmutex_unlock(&g_net_mutex);
 
-        /* спать до нового кадра; таймерам хватает 10 мс, карте без
-           прерываний - 2 мс */
+        /* спать до нового кадра (или до таймеров) */
         UINT64 fl = kx_irq_save();
 
         if (!g_net_work)
-            sched_block((const void *)&g_net_work, "net events",
-                        net_have_polling() ? 2u : 10u);
+            sched_block((const void *)&g_net_work, "net events", idle);
 
         g_net_work = FALSE;
 
@@ -657,6 +716,7 @@ void net_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     e1000_init(out);
     rtl8169_init(out);
     wifi_scan_pci();
+    wifi_boot_report(out);
 
     UINTN n = 0;
 

@@ -223,6 +223,15 @@ void arp_timer(void)
     }
 }
 
+BOOLEAN arp_busy(void)
+{
+    for (UINTN i = 0; i < ARP_ENTRIES; i++)
+        if (g_arp[i].state == ARP_PENDING)
+            return TRUE;
+
+    return FALSE;
+}
+
 void arp_forget_if(NETIF *nif)
 {
     for (UINTN i = 0; i < ARP_ENTRIES; i++)

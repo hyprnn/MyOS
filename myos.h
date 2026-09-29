@@ -2761,6 +2761,7 @@ INTN net_sys_ctl(const struct myos_netctl *c);
 void kernel_cmd_net(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 BOOLEAN net_status_line(char *buf, UINTN cap);
+void net_gui_indicator(char *buf, UINTN cap);
 
 /* Сокеты в таблице fd программы: номер сокета с этим флагом
    (файлы VFS - маленькие неотрицательные числа) */

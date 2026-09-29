@@ -178,6 +178,28 @@ BOOLEAN net_status_line(char *buf, UINTN cap)
     return FALSE;
 }
 
+/* Для панели задач GUI: адрес или "нет сети" (UTF-8) */
+void net_gui_indicator(char *buf, UINTN cap)
+{
+    for (UINTN i = 0; i < NET_MAX_IF; i++) {
+
+        NETIF *f = &g_netifs[i];
+
+        if (f->used && !f->loopback && f->up && f->link) {
+            net_fmt_ip(buf, cap, f->ip);
+            return;
+        }
+    }
+
+    for (UINTN i = 0; i < NET_MAX_IF; i++)
+        if (g_netifs[i].used && !g_netifs[i].loopback && g_netifs[i].link) {
+            ksnprintf(buf, cap, "сеть...");
+            return;
+        }
+
+    ksnprintf(buf, cap, "нет сети");
+}
+
 static void print_if(SIMPLE_TEXT_OUTPUT_INTERFACE *out, NETIF *f)
 {
     char ip[16], mask[16], gw[16], dns[16];

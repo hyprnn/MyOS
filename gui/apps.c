@@ -37,7 +37,13 @@ static void about_paint(WIN *w, GFX *g)
     gfx_text(g, x, y, "с нуля, без Linux и Windows.", C_BLACK); y += 24;
     gfx_text(g, 16, y, "Своё ядро: память, потоки, диски (FAT),", C_BLACK); y += 16;
     gfx_text(g, 16, y, "программы в кольце 3 и эта оконная", C_BLACK); y += 16;
-    gfx_text(g, 16, y, "система с композитором.", C_BLACK); y += 24;
+    gfx_text(g, 16, y, "система с композитором; сеть TCP/IP.", C_BLACK); y += 24;
+
+    char net[48], line[64];
+    net_status_line(net, sizeof(net));
+    ksnprintf(line, sizeof(line), "Сеть: %s", net);
+    gfx_text(g, 16, y, line, C_BLACK); y += 20;
+
     gfx_text(g, 16, y, "Меню «Пуск» → программы и игры.", C_GRAY);
 }
 
@@ -57,7 +63,7 @@ void app_open_about(void)
     static WIN_CLASS cls;
     cls = g_about_class;
     cls.icon = gui_icon("logo");
-    wm_open(&cls, 380, 210, "О системе — MyOS", NULL);
+    wm_open(&cls, 380, 230, "О системе — MyOS", NULL);
 }
 
 

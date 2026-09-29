@@ -21,7 +21,8 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
 
 Выход: 0 - все проверки прошли, 1 - что-то не так (лог сохранён).
 """
-import argparse, json, os, re, socket, struct, subprocess, sys, tempfile, time
+import argparse, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time, zlib
+import http.server, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fatimg
 
@@ -218,6 +219,38 @@ def check_disk(path, expect):
     return problems
 
 
+# ------------------------------------------------------------ сеть (этап 8)
+
+HOST_HELLO = b'Hello from the host over HTTP!\n'
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def start_host_http(folder):
+    """HTTP-сервер на хосте: из QEMU (-netdev user) он виден как
+    10.0.2.2:порт. Раздаёт hello.txt и big.bin (BIG_DATA)."""
+    os.makedirs(folder, exist_ok=True)
+    open(os.path.join(folder, 'hello.txt'), 'wb').write(HOST_HELLO)
+    open(os.path.join(folder, 'big.bin'), 'wb').write(BIG_DATA)
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, directory=folder, **kw)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Quiet)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
+
+
 DEFAULT_DEVICES = ['qemu-xhci', 'usb-mouse', 'usb-kbd']
 
 
@@ -274,6 +307,20 @@ def run_steps(a, work, steps, name, extra=(), devices=None):
                     vm.mouse_move(5, 3)
                     time.sleep(0.03)
                 label = '[mouse]'
+            if 'http' in keys:
+                # хост скачивает страницу у httpd внутри MyOS (hostfwd)
+                port, path, want = keys['http']
+                label = '[host GET %s]' % path
+                try:
+                    got = urllib.request.urlopen('http://127.0.0.1:%d%s' % (port, path),
+                                                 timeout=60).read()
+                except Exception as e:
+                    got = ('error: %s' % e).encode()
+                good = (got == want) if len(want) > 64 else (want in got)
+                if not good:
+                    print('FAIL %-14s -> got %d bytes: %r' % (label, len(got), got[:60]))
+                    ok = False
+                    break
         elif keys:
             vm.type(keys)
             label = keys.strip() or '  ...'
@@ -305,6 +352,8 @@ def main():
     ap.add_argument('--quick', action='store_true', help='skip the crash runs')
     ap.add_argument('--mem', default='256M', help='RAM for the VM, e.g. 8G')
     ap.add_argument('--extra', default='', help='extra QEMU args, e.g. "-machine q35"')
+    ap.add_argument('--internet', action='store_true',
+                    help='also check real DNS and HTTP (needs Internet on the host)')
     a = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix='myos-test-')
@@ -508,6 +557,89 @@ def main():
             ('ls /sata0/efi/boot\n', 'KERNEL.ELF', 15),
             ('', "used by 'reboot'", 5),
         ], ['-machine', 'q35']))
+        # сеть (этап 8): e1000 (QEMU pc по умолчанию), DHCP от QEMU
+        # (-netdev user: шлюз 10.0.2.2 = хост, DNS 10.0.2.3), ping,
+        # TCP/UDP через петлю, wget с HTTP-сервера на хосте (в том числе
+        # с потерей каждого 10-го кадра), скачивание на флешку (потом
+        # файл проверяется), httpd внутри MyOS (хост скачивает у него),
+        # адрес вручную и снова DHCP, самопроверка WPA2
+        hp = start_host_http(os.path.join(work, 'www'))
+        fwd = free_port()
+        crc = 'CRC-32 %08x' % zlib.crc32(BIG_DATA)
+        url = 'http://10.0.2.2:%d' % hp
+        net_steps = [
+            (None, "Type 'help'", 90),
+            ('', 'eth0: Intel 82540EM (e1000)', 5),
+            ('', 'dhcp: eth0: address 10.0.2.15', 20),
+            ('ifconfig\n', 'inet 10.0.2.15/24  gateway 10.0.2.2', 15),
+            ('ping -c 3 10.0.2.2\n', '3 packets transmitted, 3 received', 20),
+            ('ping -c 1 127.0.0.1\n', '1 packets transmitted, 1 received', 15),
+            ('nettest\n', 'nettest: OK', 40),
+            ('nslookup localhost\n', 'Address: 127.0.0.1', 15),
+            ('wget -O - %s/hello.txt\n' % url, 'Hello from the host over HTTP!', 20),
+            ('wget -O /usb0p1/dl.bin %s/big.bin\n' % url, crc, 40),
+            ('net drop 10\n', 'every 10-th received frame', 10),
+            ('wget -O null %s/big.bin\n' % url, crc, 90),
+            ('net drop 0\n', 'Test mode off', 10),
+            ('httpd 80 /usb0p1 -n 2\n', 'httpd: serving', 15),
+            ({'http': (fwd, '/', b'BIG.BIN')}, 'httpd: #1', 20),
+            ({'http': (fwd, '/BIG.BIN', BIG_DATA)}, 'httpd: #2', 60),
+            ('', 'exited with code 0', 10),
+            ('ifconfig eth0 10.0.2.77/24 gw 10.0.2.2 dns 10.0.2.3\n', 'eth0: done', 15),
+            ('ifconfig eth0\n', 'inet 10.0.2.77/24', 15),
+            ('ping -c 1 10.0.2.2\n', '1 packets transmitted, 1 received', 15),
+            ('ifconfig eth0 dhcp\n', 're:got 10\\.0\\.2\\.', 25),
+            ('lspci\n', 'network (Ethernet)', 15),
+            ('wifi selftest\n', 'wifi selftest: OK', 90),
+            ('net\n', 'TCP connections', 15),
+        ]
+        if a.internet:
+            net_steps += [
+                ('nslookup example.com\n', 're:Address: +[0-9]+\\.', 20),
+                ('wget -O null http://example.com/\n', 'Done:', 40),
+            ]
+        runs.append(('network', net_steps,
+                     ['-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:%d-:80' % fwd,
+                      '-device', 'e1000,netdev=n0',
+                      '-drive', 'if=none,id=nstick,format=raw,file=@WORK@/netstick.img'],
+                     ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=nstick']))
+        # Realtek в режиме C+ (тот же механизм колец, что у RTL8111/8168)
+        runs.append(('net-rtl8139', [
+            (None, "Type 'help'", 90),
+            ('', 'eth0: Realtek RTL8139C+', 5),
+            ('', 'dhcp: eth0: address 10.0.2.15', 20),
+            ('ping -c 2 10.0.2.2\n', '2 packets transmitted, 2 received', 20),
+            ('wget -O null %s/big.bin\n' % url, crc, 40),
+        ], ['-netdev', 'user,id=n0', '-device', 'rtl8139,netdev=n0']))
+        # e1000e (82574L) на q35: прерывания MSI
+        runs.append(('net-e1000e', [
+            (None, "Type 'help'", 90),
+            ('', 're:eth0: Intel 82574L \\(e1000e\\).*MSI', 5),
+            ('', 'dhcp: eth0: address 10.0.2.15', 20),
+            ('wget -O null %s/big.bin\n' % url, crc, 40),
+        ], ['-machine', 'q35']))
+        # USB-модем ("раздача интернета с телефона"): QEMU usb-net умеет
+        # и RNDIS (как Android), и CDC-ECM; подключаем на лету, качаем,
+        # выдёргиваем, подключаем другим протоколом
+        runs.append(('usb-tether', [
+            (None, "Type 'help'", 90),
+            ('', 'no wired network card found', 5),
+            ('net usb rndis\n', 'prefer RNDIS', 10),
+            ({'qmp': ('device_add', {'driver': 'usb-net', 'netdev': 'n0', 'bus': 'xhci.0',
+                                     'port': '3', 'id': 'phone'})},
+             're:net: usb0 - USB modem \\(RNDIS\\)', 20),
+            ('', 'dhcp: usb0: address 10.0.2.15', 20),
+            ('ping -c 2 10.0.2.2\n', '2 packets transmitted, 2 received', 20),
+            ('wget -O null %s/big.bin\n' % url, crc, 40),
+            ({'qmp': ('device_del', {'id': 'phone'})}, 'net: usb0 removed', 20),
+            ('net usb auto\n', 'prefer CDC-ECM', 10),
+            ({'qmp': ('device_add', {'driver': 'usb-net', 'netdev': 'n0', 'bus': 'xhci.0',
+                                     'port': '3', 'id': 'phone2'})},
+             're:net: usb0 - USB Ethernet \\(CDC-ECM\\)', 20),
+            ('', 're:dhcp: usb0: address 10\\.0\\.2\\.', 20),
+            ('wget -O null %s/big.bin\n' % url, crc, 40),
+            ('usb\n', 're:network usb-ecm: .*-> usb0', 15),
+        ], ['-netdev', 'user,id=n0'], ['qemu-xhci,id=xhci', 'usb-kbd,bus=xhci.0,port=1']))
         # часовые пояса: часы машины - 15 января 10:00 UTC (зима):
         # Москва 13:00 (UTC+3), Иерусалим 12:00 (IST, UTC+2)
         runs.append(('timezone-winter', [
@@ -538,6 +670,7 @@ def main():
     make_test_disk(os.path.join(work, 'stick2.img'), 40, 16, 'none', 'STICK2')
     make_test_disk(os.path.join(work, 'sata.img'), 40, 16, 'gpt', 'SATADISK')
     make_test_disk(os.path.join(work, 'nvme.img'), 80, 32, 'gpt', 'NVME')
+    make_test_disk(os.path.join(work, 'netstick.img'), 64, 32, 'mbr', 'NETSTICK')
 
     for run in runs:
         name, steps = run[0], run[1]
@@ -563,7 +696,8 @@ def main():
                 ('nvme.img', {'/a/b/copy.bin': BIG_DATA, '/readme.md': b'# readme\n',
                               '/a/x/inner.txt': b'deep\n', '/x': None,
                               '/BIG.BIN': BIG_DATA}),
-                ('stick2.img', {'/HOST.TXT': b'Hello from the host!\n'})):
+                ('stick2.img', {'/HOST.TXT': b'Hello from the host!\n'}),
+                ('netstick.img', {'/dl.bin': BIG_DATA})):
             problems = check_disk(os.path.join(work, img), expect)
             print('%-4s %-14s -> %s' % ('PASS' if not problems else 'FAIL', '[fsck ' + img + ']',
                                         'consistent, files as expected' if not problems else ''))

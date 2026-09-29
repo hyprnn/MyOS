@@ -65,6 +65,11 @@ ULIB    := $(patsubst user/lib/%,build/user/lib/%.o,$(basename $(wildcard user/l
 APP_ELFS:= $(APPS:%=build/user/%)
 
 QEMU_DEV := -device qemu-xhci -device usb-mouse -device usb-kbd
+# сеть в QEMU: по умолчанию карта e1000 + "user"-сеть (DHCP, шлюз 10.0.2.2
+# = хост, DNS 10.0.2.3). Например, открыть httpd из браузера хоста:
+#   make run QEMU_NET="-netdev user,id=n0,hostfwd=tcp::8080-:80 -device e1000,netdev=n0"
+# USB-модем (как телефон): QEMU_NET="-netdev user,id=n0 -device usb-net,netdev=n0"
+QEMU_NET ?=
 
 .PHONY: all iso run run-tablet test clean
 
@@ -136,11 +141,11 @@ MyOS.iso: BOOTX64.EFI kernel.elf
 	./build_iso.sh
 
 run: MyOS.iso
-	$(QEMU) -bios $(OVMF) -cdrom MyOS.iso -m 256M $(QEMU_DEV) -serial stdio
+	$(QEMU) -bios $(OVMF) -cdrom MyOS.iso -m 256M $(QEMU_DEV) $(QEMU_NET) -serial stdio
 
 run-tablet: MyOS.iso
 	$(QEMU) -bios $(OVMF) -cdrom MyOS.iso -m 256M \
-	    -device qemu-xhci -device usb-tablet -device usb-kbd -serial stdio
+	    -device qemu-xhci -device usb-tablet -device usb-kbd $(QEMU_NET) -serial stdio
 
 test: all
 	python3 tools/autotest.py --efi BOOTX64.EFI --kernel kernel.elf \

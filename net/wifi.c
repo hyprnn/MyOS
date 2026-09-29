@@ -146,6 +146,16 @@ void wifi_scan_pci(void)
     }
 }
 
+/* Строка в журнал загрузки: какой Wi-Fi нашёлся */
+void wifi_boot_report(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    for (UINTN i = 0; i < g_wifi_n; i++)
+        kprintf(out, "  Wi-Fi: %s (%04x:%04x) - no radio driver yet, see 'wifi';\n"
+                     "         internet without a cable: USB tethering from a phone\n",
+                g_wifi_found[i].model ? g_wifi_found[i].model->name : "unknown adapter",
+                g_wifi_found[i].vendor, g_wifi_found[i].device);
+}
+
 /* ================================================================
  * Самопроверка: тестовые векторы + рукопожатие с "точкой доступа"
  * ================================================================ */

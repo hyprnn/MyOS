@@ -356,6 +356,22 @@ void run_command(
 
         print(
             out,
+            "  --- network (addresses come from DHCP by themselves) ---\n"
+            "  ifconfig      - interfaces, addresses; ifconfig eth0 dhcp |\n"
+            "                  ifconfig eth0 192.168.1.50/24 gw 192.168.1.1 dns 1.1.1.1\n"
+            "  ping <host>   - are you there? (ping -c N, ping -t)\n"
+            "  nslookup <n>  - name -> address (DNS)\n"
+            "  wget <url>    - download over HTTP (wget -O - url: to the screen)\n"
+            "  nc <h> <port> - raw TCP connection; nc -l <port> - wait for one\n"
+            "  httpd [port] [folder] - a small web server\n"
+            "  nettest       - TCP/UDP self-test over 127.0.0.1\n"
+            "  net           - network internals: ARP, TCP connections, sockets, DNS\n"
+            "  wifi          - Wi-Fi adapter and status; wifi selftest - WPA2 crypto\n"
+            "  (no cable? connect a phone by USB and turn on 'USB tethering')\n"
+        );
+
+        print(
+            out,
             "  start         - launch GUI desktop (icons, taskbar clock, arrows+Enter)\n"
         );
 
@@ -820,6 +836,14 @@ void run_command(
                     print_hex(out, sub_class, 2);
                     print(out, " progif=");
                     print_hex(out, prog_if, 2);
+
+                    /* сеть (этап 8): проводная карта / Wi-Fi */
+                    if (base_class == 0x02 && sub_class == 0x00)
+                        print(out, "  <-- network (Ethernet)");
+                    else if (base_class == 0x02 && sub_class == 0x80)
+                        print(out, "  <-- network (Wi-Fi?) - see 'wifi'");
+                    else if (base_class == 0x02)
+                        print(out, "  <-- network controller");
 
                     if (
                         base_class == PCI_CLASS_SERIAL_BUS &&

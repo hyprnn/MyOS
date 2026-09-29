@@ -413,9 +413,16 @@ static void draw_taskbar(void)
         gfx_text_fit(g, bx + 22, y + 7, w->title, D_BLACK, 15);
 
         bx += bw + 4;
-        if (bx + bw > (INT32)SCR_W - 90)
+        if (bx + bw > (INT32)SCR_W - 200)
             break;
     }
+
+    /* сеть (этап 8): адрес или "нет сети" */
+    char net[24];
+    net_gui_indicator(net, sizeof(net));
+    INT32 nw = gfx_text_width(net);
+    gfx_button(g, (INT32)SCR_W - 96 - nw - 12, y + 4, nw + 12, TASK_H - 8, FALSE);
+    gfx_text(g, (INT32)SCR_W - 96 - nw - 6, y + 7, net, D_BLACK);
 
     /* часы справа + индикатор раскладки */
     EFI_TIME t;

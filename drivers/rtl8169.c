@@ -114,6 +114,7 @@ typedef struct {
     /* сторож прерываний: кадр ждёт, а прерывания всё нет */
     UINT64      watch_irqs;
     UINT64      watch_since;
+    BOOLEAN     watch_pending;
     BOOLEAN     polling;
 } RTL;
 
@@ -243,8 +244,14 @@ static void rtl_poll(NETIF *nif)
     volatile RTL_DESC *d = &((volatile RTL_DESC *)P2V(r->rx_ring))[r->rx_cur];
     UINT64 now = net_now_ms();
 
+    /* кадр ждёт, а прерываний с прошлого раза не было: первый раз -
+       запомнить (прерывание могло просто не успеть), и только если
+       и через 200 мс то же самое - линия не та */
     if ((d->opts1 & D_OWN) || r->irqs != r->watch_irqs) {
         r->watch_irqs = r->irqs;
+        r->watch_pending = FALSE;
+    } else if (!r->watch_pending) {
+        r->watch_pending = TRUE;
         r->watch_since = now;
     } else if (now - r->watch_since > 200u) {
         klog("rtl8169: frames arrive but no interrupts - switching to polling\n");
@@ -330,6 +337,8 @@ static BOOLEAN rtl_is_8168g_plus(UINT32 xid)
 static BOOLEAN rtl_start(RTL *r, UINT8 bus, UINT8 dev, UINT8 fn, const RTL_MODEL *m,
                          SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
+    net_pci_wake(bus, dev, fn);
+
     /* регистры в памяти: первый memory-BAR (у 8139 - BAR1, у 8168 - BAR2) */
     UINT64 bar = 0;
 

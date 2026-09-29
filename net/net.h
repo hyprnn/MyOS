@@ -163,6 +163,7 @@ void arp_timer(void);
 void arp_forget_if(NETIF *nif);
 void arp_print(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void arp_announce(NETIF *nif);
+BOOLEAN arp_busy(void);
 
 /* --- net/ip.c --- */
 void ip_input(NETIF *nif, const UINT8 *pkt, UINTN len);
@@ -204,6 +205,7 @@ typedef struct TCB TCB;
 void tcp_input(NETIF *nif, UINT32 src, UINT32 dst, const UINT8 *p, UINTN len);
 void tcp_timer(void);
 void tcp_print(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+BOOLEAN tcp_busy(void);
 
 /* --- net/socket.c --- */
 BOOLEAN sock_udp_input(UINT32 src, UINT16 sport, UINT32 dst, UINT16 dport,
@@ -217,6 +219,8 @@ void e1000_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void rtl8169_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void usbnet_sync(void);
 void wifi_scan_pci(void);
+void wifi_boot_report(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void net_pci_wake(UINT8 bus, UINT8 dev, UINT8 fn);
 
 /* Общая помощь драйверам PCI: прерывание от карты - MSI, если
    умеет, иначе старая линия INTx через I/O APIC (с проверкой, что
