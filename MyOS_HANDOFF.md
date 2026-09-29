@@ -30,8 +30,9 @@ Linux, fish; беспроводная мышь Onikuma через USB-донгл
 в стиле Win95) и 7 (оконная система: композитор, перекрывающиеся
 окна, окна у программ, сглаженный шрифт с кириллицей, раскладка
 EN/РУ) и 8 (сеть: свой TCP/IP, e1000/e1000e, Realtek, USB-модемы,
-программы ping/wget/ifconfig/nslookup/nc/httpd, HTTPS на BearSSL, слой
-безопасности Wi-Fi WPA2 без радиодрайвера) выполнены.** На ноутбуке
+программы ping/wget/ifconfig/nslookup/nc/httpd, HTTPS на BearSSL, exFAT,
+Wi-Fi: WPA2-клиент 802.11 + драйвер Realtek RTL8821CE — последний пока
+не проверен на живом чипе) выполнены.** На ноутбуке
 (HP 250 G7) проверено: USB-модем телефона даёт интернет (ping
 archlinux.org), Wi-Fi — Realtek RTL8821CE (10ec:c821). Следующий по плану — этап 9
 (реальное железо и повседневность). Из этапа 7
@@ -67,10 +68,12 @@ make test       # tools/autotest.py: 17 запусков QEMU (~6 мин): ос�
                 # hostfwd; ручной адрес; wifi selftest), net-rtl8139,
                 # net-e1000e (q35, MSI), usb-tether (usb-net: RNDIS и ECM,
                 # подключение/отключение на лету) и crash write / crash
-                # stack / crash null (экраны паники)
+                # stack / crash null (экраны паники), exfat/exfat-reboot,
+                # wifi-sim (802.11 + WPA2 с программной точкой доступа)
 ```
 `--internet` - ещё и настоящий DNS + `wget http://example.com/`.
-Опции автотеста: `--quick` (без crash-запусков), `--mem 5G`,
+Опции автотеста: `--quick` (без crash-запусков), `--only wifi-sim,network`
+(только эти запуски), `--mem 5G`,
 `--extra "-machine q35"` / `"-cpu qemu64,-nx,-pat"` — всё это проверено.
 `./build.sh` вызывает `make`. OVMF по умолчанию
 `/usr/share/edk2/x64/OVMF.4m.fd`. Два набора флагов (см. Makefile):
@@ -89,10 +92,11 @@ make test       # tools/autotest.py: 17 запусков QEMU (~6 мин): ос�
 | `myos.h` | общий заголовок; `P2V()`/`V2P()` (физ. адрес <-> указатель прямого отображения), `mmio_read32/write32` берут ФИЗИЧЕСКИЙ адрес и сами переводят |
 | `lib/` | `libc.c` (memcpy/memset), `string.c` (+`kstreq`), `kprintf.c` (`kprintf`, `ksnprintf`, `klog` — только COM1; `%S` = CHAR16*), `serial.c` |
 | `kernel/` | `kmain.c` порядок запуска; `kernel.ld`; `vmm.c` таблицы страниц (код RX, rodata R, данные RW+NX, RAM WB, не-RAM ниже 4 ГиБ UC, экран WC через PAT, нижняя половина пуста), стеки с защитными страницами; `pmm.c` страницы (свободны также BootServices*/Loader*); `kmalloc.c` слабы 16..1024 + крупные страницами; `cpu.c` GDT+TSS (IST1 #DF, IST2 NMI, IST3 #MC), IDT, экран паники с разбором #PF/#DF; `acpi.c` разбор ACPI (RSDP→XSDT/RSDT, контрольные суммы, MADT: ядра/I/O APIC/переназначения IRQ, FADT: порты PM, таймер PM, регистр сброса, век RTC, MCFG: ECAM, HPET: запуск и замер TSC; команда `acpi`); `tz.c` часовые пояса: CMOS хранит UTC, `krt_get_time` отдаёт местное время Москвы (UTC+3) или Иерусалима (UTC+2/+3, израильские правила летнего времени; проверено против zoneinfo на 2015–2035), переключение `tz msk|jer|toggle`, клик по часам в GUI или T; по умолчанию Москва, выбор не сохраняется (диска нет); `power.c` CMOS-часы (век из FADT), reboot (регистр FADT → 0xCF9 → 8042 → triple fault), shutdown (`_S5_` из DSDT/SSDT, QEMU-порты); `shim.c` таблица `g_kst` для шелла/GUI (свои BootServices/RuntimeServices, без прошивки); `kcon.c`, `time.c`, `kcmds.c` (kinfo/usb/mousetest/mem/boot/vm/crash) |
-| `drivers/` | `pci.c` (порты или ECAM после `pci_use_ecam` со сверкой), `xhci_common.c` (общие с загрузчиком), `usb.c` (ядро xHCI: кольца, `kx_pump`, синхронные операции под замком, перечисление с route string/TT, горячее подключение, `kx_service`, MSI), `usbhid.c` (клавиатуры/мыши, трубы прерываний, светодиоды), `usbhub.c` (хабы USB2/USB3), `usbmsd.c` (флешки: Bulk-Only + SCSI, `usb_disk_read`, команда `disk`), `hid.c`, `keyboard.c` (+NumLock/ScrollLock), `ps2.c` (IRQ 1/12, PS/2-мышь/тачпад с колесом, светодиоды) |
+| `drivers/` | `pci.c` (порты или ECAM после `pci_use_ecam` со сверкой), `xhci_common.c` (общие с загрузчиком), `usb.c` (ядро xHCI: кольца, `kx_pump`, синхронные операции под замком, перечисление с route string/TT, горячее подключение, `kx_service`, MSI), `usbhid.c` (клавиатуры/мыши, трубы прерываний, светодиоды), `usbhub.c` (хабы USB2/USB3), `usbmsd.c` (флешки: Bulk-Only + SCSI, `usb_disk_read`, команда `disk`), `hid.c`, `keyboard.c` (+NumLock/ScrollLock), `ps2.c` (IRQ 1/12, PS/2-мышь/тачпад с колесом, светодиоды); сеть: `e1000.c`, `rtl8169.c`, `usbnet.c`; Wi-Fi: `rtw8821c.c` + `rtw8821c_table.c` (Realtek RTL8821CE) |
+| `firmware/` | прошивки, вклеенные в ядро (`firmware.S`): `rtw88/rtw8821c_fw.bin` + `LICENCE.rtlwifi_firmware.txt` |
 | `gui/` | `gui.c` цикл `start`, `desktop.c` (вывод кадра без мигания: `gui_present_frame`/`gui_present_cursor`), `draw.c`, `minesweeper*.c`, `terminal.c` (+`gui_term_exec`) |
 | `shell/` | `commands.c`, `console.c`, `readline.c`, `fs.c`, `fetch.c`, `editor.c`, `calc.c`, `history.c` |
-| `net/` | этап 8: `net.h` (типы стека, NETIF), `net.c` (интерфейсы, очередь приёма, поток net, прерывания карт, `lo`), `arp.c`, `ip.c` (+ICMP), `udp.c`, `tcp.c`/`tcp.h`, `dhcp.c`, `dns.c`, `socket.c`, `netcmd.c` (`net`, SYS_NETINFO/NETCTL, индикатор GUI), `wpa.c`/`wifi.h` (WPA2), `wifi.c` (`wifi`) |
+| `net/` | этап 8: `net.h` (типы стека, NETIF), `net.c` (интерфейсы, очередь приёма, поток net, прерывания карт, `lo`), `arp.c`, `ip.c` (+ICMP), `udp.c`, `tcp.c`/`tcp.h`, `dhcp.c`, `dns.c`, `socket.c`, `netcmd.c` (`net`, SYS_NETINFO/NETCTL, индикатор GUI), `wpa.c`/`wifi.h` (WPA2), `wifi.c` (`wifi`), `wlan.c`/`wlan.h` (802.11-клиент, `WLAN_HW`), `wlan_sim.c` (программная точка доступа) |
 | `drivers/e1000.c`, `rtl8169.c`, `usbnet.c` | сетевые карты: Intel, Realtek, USB-модемы |
 | `tools/` | `autotest.py` (свой FAT16-образ с обоими файлами, QMP, проверки по COM1, HTTP-сервер на хосте для сетевых тестов), `split_main.py` |
 
@@ -364,15 +368,53 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   MessageLength, иначе QEMU/устройство сбивается). NCM — только по
   спецификации.
 * **Wi-Fi**: `wifi.c` находит адаптер (PCI класс 0x0280 и известные
-  USB-свистки, таблица с драйвером Linux для ориентира). `wpa.c` —
-  SHA-1, HMAC, PBKDF2, PRF-512, AES-128 (+расшифровка), Key Wrap,
-  AES-CCM, CCMP (AAD/nonce по 802.11), клиент 4-стороннего рукопожатия
-  (`wpa_supp_rx`). `wifi selftest` — 11 проверок (FIPS 180/197,
-  RFC 2202/3394/3610, IEEE 802.11i H.3/H.4, рукопожатие с программной
-  AP, неверный пароль). **Радиодрайвера нет** — это отдельный большой
-  проект; самые реалистичные цели: ath9k-чипы (AR9485/AR9565, без
-  прошивки) или USB-свисток AR9271 (открытая прошивка). Встроенные в
-  HP 250 G7 RTL8821CE / Intel 9560 — самые трудные.
+  USB-свистки, таблица с драйвером Linux для ориентира) и разбирает
+  команду `wifi` (scan / connect / disconnect / debug / sim / selftest /
+  psk). `wpa.c` — SHA-1, HMAC, PBKDF2, PRF-512, AES-128 (+расшифровка),
+  Key Wrap, AES-CCM, CCMP (AAD/nonce по 802.11), клиент 4-стороннего
+  рукопожатия и группового (смена GTK) (`wpa_supp_rx`; свой RSN IE в
+  `WPA_SUPP.rsn_ie` — тот же, что в association). `wifi selftest` — 12
+  проверок (FIPS 180/197, RFC 2202/3394/3610, IEEE 802.11i H.3/H.4,
+  рукопожатие с программной AP, смена GTK, неверный пароль).
+  * **802.11-клиент** `net/wlan.c` (не зависит от чипа, интерфейс к
+    драйверу — `WLAN_HW` в `net/wlan.h`: set_channel, tx кадра 802.11,
+    set_scan, set_bssid, set_link, poll, info). Поток `wlan` делает всё,
+    что ждёт ответа (поиск: каналы 1–13, 36–165, на DFS 52–144 только
+    слушаем; подключение: auth open → assoc (скорости 802.11a/g, RSN IE
+    с шифром группы как у точки) → 4-way; переподключение, если 10 с нет
+    маяков или пришёл deauth), кадры разбирает поток net (`wlan_rx` из
+    `hw->poll`). Ждёт через `net_wait` (замок отпущен). Данные: Ethernet
+    ↔ 802.11 + LLC/SNAP, CCMP программно (`ccmp_encrypt/decrypt`), своя
+    защита от повторов (PN), A-MSDU, отражённые точкой свои
+    широковещательные кадры выбрасываются. Команда `wifi connect`
+    печатает журнал попытки (`g_wl.log`) и ждёт адрес DHCP. Неверный
+    пароль = 1/4 пришло, 3/4 нет → не повторять. Нет: SAE (WPA3-only),
+    PMF (сеть с MFPR отказываемся), TKIP (общий ключ TKIP у старых
+    роутеров — широковещательные не расшифруем), 802.11n/ac.
+  * **Драйвер RTL8821CE** `drivers/rtw8821c.c` — перенос rtw88
+    (BSD-3-Clause), таблицы `rtw8821c_table.c` без изменений чисел,
+    прошивка `firmware/rtw88/rtw8821c_fw.bin` (24.11) вклеена в ядро
+    (`firmware/firmware.S`, `g_fw_rtw8821c`). Включается по первой
+    команде `wifi scan/connect/debug` и печатает шаги 1/6..6/6 (PCI и
+    версия → питание (card_enable_flow) → прошивка (куски по 4 КиБ через
+    маячную очередь в буфер чипа + DDMA в IMEM/DMEM/EMEM, ждать
+    FW_READY 0xC078) → eFuse (MAC, RFE, калибровка мощности) → MAC
+    (очереди, LLT, H2C) + таблицы MAC/BB/AGC/RF с условиями по RFE →
+    wlan0). Кольца: 8 очередей отправки (используются MGMT, BE, H2C,
+    BCN), приём 64×12 КиБ; прерываний нет — опрос каждые 2 мс
+    (`poll_fast`). Прошивке: RA info (скорости точки; скорость данных
+    выбирает она), media status, RSSI, IQK перед подключением. DIG по
+    ложным тревогам раз в 2 с. Bluetooth-часть не используется: антенна
+    всегда у Wi-Fi (GNT_WL=1, GNT_BT=0 через LTE-coex 0x38, DPDT по RFE).
+    Мощность: база eFuse + таблица PG, не выше самого строгого предела
+    LMT из всех стран. Ширина канала только 20 МГц. **Проверить можно
+    только на ноутбуке** — `wifi debug` печатает регистры для фото.
+  * **Программная точка доступа** `net/wlan_sim.c` (`wifi sim`, только
+    если настоящего адаптера нет): "MyOS-Test" на канале 6, пароль
+    `myos-wifi-test`, сторона точки WPA2 (hostapd-подобно: неверный
+    пароль → 3 раза 1/4 → deauth 15), DHCP 192.168.77.2 (ответ
+    широковещательный — через GTK), ARP и ping 192.168.77.1; отражает
+    широковещательные кадры клиента. Автотест `wifi-sim`.
 * **HTTPS / TLS** (после этапа 8; пользователь разрешил брать готовые
   библиотеки, «чтобы не мучиться»): BearSSL 0.6 в `third_party/bearssl`
   (из пакета Ubuntu, MIT; `third_party/README.md`), собирается для

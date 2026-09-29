@@ -456,6 +456,7 @@ def main():
     ap.add_argument('--quick', action='store_true', help='skip the crash runs')
     ap.add_argument('--mem', default='256M', help='RAM for the VM, e.g. 8G')
     ap.add_argument('--extra', default='', help='extra QEMU args, e.g. "-machine q35"')
+    ap.add_argument('--only', default='', help='run only these runs (comma-separated names)')
     ap.add_argument('--internet', action='store_true',
                     help='also check real DNS and HTTP (needs Internet on the host)')
     a = ap.parse_args()
@@ -801,6 +802,25 @@ def main():
         else:
             print('(no mkfs.exfat/fsck.exfat or gcc on this machine - exFAT runs skipped;'
                   ' install exfatprogs)')
+        # Wi-Fi: 802.11 + WPA2 с программной точкой доступа "MyOS-Test"
+        # (net/wlan_sim.c): поиск, неверный пароль, подключение, ключи,
+        # DHCP (ответ - широковещательный, общим ключом), ping через
+        # зашифрованный канал, отключение
+        runs.append(('wifi-sim', [
+            (None, "Type 'help'", 90),
+            ('wifi sim\n', 'interface wlan0 ready', 20),
+            ('wifi scan\n', 're:WPA2 +MyOS-Test', 30),
+            ('wifi connect MyOS-Test wrong-pass\n', 'WRONG PASSWORD', 60),
+            ('wifi connect MyOS-Test myos-wifi-test\n',
+             'Wi-Fi is up: wlan0 address 192.168.77.2', 60),
+            ('ping -c 3 192.168.77.1\n', '3 packets transmitted, 3 received', 20),
+            ('ifconfig wlan0\n', 'inet 192.168.77.2/24  gateway 192.168.77.1', 15),
+            ('wifi debug\n', 're:DHCP [1-9]', 15),
+            ('', 're:echoed broadcasts [1-9]', 5),
+            ('', 're:group-key ARP [1-9]', 5),
+            ('wifi disconnect\n', 'Wi-Fi disconnected', 10),
+            ('wifi\n', 'not connected', 10),
+        ]))
         # часовые пояса: часы машины - 15 января 10:00 UTC (зима):
         # Москва 13:00 (UTC+3), Иерусалим 12:00 (IST, UTC+2)
         runs.append(('timezone-winter', [
@@ -834,6 +854,9 @@ def main():
     make_test_disk(os.path.join(work, 'netstick.img'), 64, 32, 'mbr', 'NETSTICK',
                    {'ca.pem': open(os.path.join(TLS_DIR, 'ca.pem'), 'rb').read()})
 
+    if a.only:
+        runs = [r for r in runs if r[0] in a.only.split(',')]
+
     for run in runs:
         name, steps = run[0], run[1]
         extra = run[2] if len(run) > 2 else []
@@ -845,7 +868,7 @@ def main():
             break
 
     # диски после запусков storage: проверка "как в Linux"
-    if ok and not a.quick:
+    if ok and not a.quick and not a.only:
         for img, expect in (
                 ('stick.img', {'/myos/hello.txt': b'Hello from MyOS\nsecond line\n',
                                '/myos/Mixed Case Name.txt': b'mixed\n',
@@ -868,7 +891,7 @@ def main():
             if problems:
                 ok = False
 
-    if ok and not a.quick and exfat_tool:
+    if ok and not a.quick and not a.only and exfat_tool:
         problems = check_exfat(os.path.join(work, 'ventoy.img'), exfat_tool, work, {
             '/myos/note.txt': b'Hello exFAT from MyOS\nsecond line\n',
             '/myos/moved.bin': BIG_DATA, '/myos/dl.bin': BIG_DATA,

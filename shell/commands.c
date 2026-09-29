@@ -118,7 +118,7 @@ void run_command(
 
     } else if (streq(line, "wifi") || starts_with(line, "wifi ")) {
 
-        char arg[48];
+        char arg[160];                  /* "connect <имя до 32> <пароль до 63>" */
         UINTN k = 0;
 
         if (line[4] == ' ')
@@ -366,7 +366,8 @@ void run_command(
             "  httpd [port] [folder] - a small web server\n"
             "  nettest       - TCP/UDP self-test over 127.0.0.1\n"
             "  net           - network internals: ARP, TCP connections, sockets, DNS\n"
-            "  wifi          - Wi-Fi adapter and status; wifi selftest - WPA2 crypto\n"
+            "  wifi          - Wi-Fi adapter and status; wifi scan - networks around\n"
+            "  wifi connect <name> <password> - Wi-Fi (Realtek RTL8821CE); wifi disconnect\n"
             "  (no cable? connect a phone by USB and turn on 'USB tethering')\n"
         );
 

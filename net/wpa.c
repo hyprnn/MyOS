@@ -718,7 +718,53 @@ void wpa_supp_init(WPA_SUPP *s, const UINT8 pmk[32], const UINT8 own_mac[6], con
     memcpy(s->pmk, pmk, 32);
     memcpy(s->spa, own_mac, 6);
     memcpy(s->aa, ap_mac, 6);
+    memcpy(s->rsn_ie, g_wpa_rsn_ie, sizeof(g_wpa_rsn_ie));
+    s->rsn_ie_len = (UINT8)sizeof(g_wpa_rsn_ie);
     s->state = WPA_WAIT_M1;
+}
+
+/* Key Data: элементы (RSN IE AP, KDE). GTK KDE: dd len 00-0F-AC 01
+   [номер ключа] [резерв] GTK. Нашли - в s->gtk */
+static BOOLEAN wpa_find_gtk(WPA_SUPP *s, const UINT8 *kd, UINTN n)
+{
+    BOOLEAN found = FALSE;
+
+    for (UINTN i = 0; i + 2 <= n; ) {
+
+        UINT8 t = kd[i], l = kd[i + 1];
+
+        if (t == 0xDD && l == 0)
+            break;                        /* добивка */
+
+        if (i + 2u + l > n)
+            break;
+
+        if (t == 0xDD && l >= 6 + 16 && kd[i + 2] == 0x00 && kd[i + 3] == 0x0F &&
+            kd[i + 4] == 0xAC && kd[i + 5] == 1) {
+            s->gtk_id = (UINT8)(kd[i + 6] & 3u);
+            s->gtk_len = (UINT8)(l - 6 > 32 ? 32 : l - 6);
+            memcpy(s->gtk, kd + i + 8, s->gtk_len);
+            found = TRUE;
+        }
+
+        i += 2u + l;
+    }
+
+    return found;
+}
+
+/* Заголовок ответа EAPOL-Key (2/4, 4/4, 2/2) */
+static void wpa_reply_head(UINT8 *out, UINTN n, UINT16 info, const UINT8 *replay)
+{
+    memset(out, 0, n);
+    out[0] = 2;
+    out[1] = 3;
+    out[2] = (UINT8)((n - 4) >> 8);
+    out[3] = (UINT8)(n - 4);
+    out[4] = 2;
+    out[EK_INFO] = (UINT8)(info >> 8);
+    out[EK_INFO + 1] = (UINT8)info;
+    memcpy(out + EK_REPLAY, replay, 8);
 }
 
 /*
@@ -734,12 +780,44 @@ BOOLEAN wpa_supp_rx(WPA_SUPP *s, const UINT8 *f, UINTN len, UINT8 *out, UINTN *o
     UINT16 info = be16(f + EK_INFO);
     UINTN dlen = be16(f + EK_DLEN);
 
-    if (EK_DATA + dlen > len || !(info & KI_PAIRWISE) || !(info & KI_ACK))
+    if (EK_DATA + dlen > len || !(info & KI_ACK))
         return FALSE;
 
     /* счётчик повторов должен расти (защита от повторения старых кадров) */
     if (s->have_replay && memcmp(f + EK_REPLAY, s->replay, 8) <= 0)
         return FALSE;
+
+    if (!(info & KI_PAIRWISE)) {
+
+        /* --- групповое рукопожатие 1/2: точка раздаёт новый общий
+               ключ (GTK) - обычно раз в час. Ответ 2/2 --- */
+        if (s->state != WPA_DONE || !(info & KI_MIC) || !(info & KI_ENC_DATA))
+            return FALSE;
+
+        if (!wpa_mic_ok(s->ptk, f, len)) {
+            s->mic_failures++;
+            return FALSE;
+        }
+
+        if (dlen < 24 || dlen % 8 != 0 || dlen > 256)
+            return FALSE;
+
+        UINT8 kd[256];
+
+        if (!aes_unwrap(s->ptk + 16, dlen / 8 - 1, f + EK_DATA, kd) ||
+            !wpa_find_gtk(s, kd, dlen - 8))
+            return FALSE;
+
+        UINTN n = EK_DATA;
+
+        wpa_reply_head(out, n, KI_MIC | KI_SECURE | KI_VER_2, f + EK_REPLAY);
+        wpa_mic(s->ptk, out, n);
+
+        memcpy(s->replay, f + EK_REPLAY, 8);
+        s->gtk_new = TRUE;
+        *olen = n;
+        return TRUE;
+    }
 
     if (!(info & KI_MIC)) {
 
@@ -753,21 +831,13 @@ BOOLEAN wpa_supp_rx(WPA_SUPP *s, const UINT8 *f, UINTN len, UINT8 *out, UINTN *o
 
         wpa_derive_ptk(s->pmk, s->aa, s->spa, s->anonce, s->snonce, s->ptk);
 
-        UINTN n = EK_DATA + sizeof(g_wpa_rsn_ie);
+        UINTN n = EK_DATA + s->rsn_ie_len;
 
-        memset(out, 0, n);
-        out[0] = 2;
-        out[1] = 3;
-        out[2] = (UINT8)((n - 4) >> 8);
-        out[3] = (UINT8)(n - 4);
-        out[4] = 2;
-        out[EK_INFO] = (UINT8)((KI_PAIRWISE | KI_MIC | KI_VER_2) >> 8);
-        out[EK_INFO + 1] = (UINT8)(KI_PAIRWISE | KI_MIC | KI_VER_2);
-        memcpy(out + EK_REPLAY, f + EK_REPLAY, 8);
+        wpa_reply_head(out, n, KI_PAIRWISE | KI_MIC | KI_VER_2, f + EK_REPLAY);
         memcpy(out + EK_NONCE, s->snonce, 32);
         out[EK_DLEN] = 0;
-        out[EK_DLEN + 1] = (UINT8)sizeof(g_wpa_rsn_ie);
-        memcpy(out + EK_DATA, g_wpa_rsn_ie, sizeof(g_wpa_rsn_ie));
+        out[EK_DLEN + 1] = s->rsn_ie_len;
+        memcpy(out + EK_DATA, s->rsn_ie, s->rsn_ie_len);
         wpa_mic(s->ptk, out, n);
 
         memcpy(s->replay, f + EK_REPLAY, 8);
@@ -795,43 +865,16 @@ BOOLEAN wpa_supp_rx(WPA_SUPP *s, const UINT8 *f, UINTN len, UINT8 *out, UINTN *o
     if (!aes_unwrap(s->ptk + 16, dlen / 8 - 1, f + EK_DATA, kd))
         return FALSE;
 
-    /* Key Data: элементы (RSN IE AP, KDE). GTK KDE: dd len 00-0F-AC 01
-       [номер ключа] [резерв] GTK */
-    for (UINTN i = 0; i + 2 <= dlen - 8; ) {
-
-        UINT8 t = kd[i], l = kd[i + 1];
-
-        if (t == 0xDD && l == 0)
-            break;                        /* добивка */
-
-        if (i + 2u + l > dlen - 8)
-            break;
-
-        if (t == 0xDD && l >= 6 + 16 && kd[i + 2] == 0x00 && kd[i + 3] == 0x0F &&
-            kd[i + 4] == 0xAC && kd[i + 5] == 1) {
-            s->gtk_id = (UINT8)(kd[i + 6] & 3u);
-            s->gtk_len = (UINT8)(l - 6 > 32 ? 32 : l - 6);
-            memcpy(s->gtk, kd + i + 8, s->gtk_len);
-        }
-
-        i += 2u + l;
-    }
+    wpa_find_gtk(s, kd, dlen - 8);
 
     UINTN n = EK_DATA;
 
-    memset(out, 0, n);
-    out[0] = 2;
-    out[1] = 3;
-    out[2] = (UINT8)((n - 4) >> 8);
-    out[3] = (UINT8)(n - 4);
-    out[4] = 2;
-    out[EK_INFO] = (UINT8)((KI_PAIRWISE | KI_MIC | KI_SECURE | KI_VER_2) >> 8);
-    out[EK_INFO + 1] = (UINT8)(KI_PAIRWISE | KI_MIC | KI_SECURE | KI_VER_2);
-    memcpy(out + EK_REPLAY, f + EK_REPLAY, 8);
+    wpa_reply_head(out, n, KI_PAIRWISE | KI_MIC | KI_SECURE | KI_VER_2, f + EK_REPLAY);
     wpa_mic(s->ptk, out, n);
 
     memcpy(s->replay, f + EK_REPLAY, 8);
     s->state = WPA_DONE;
+    s->gtk_new = TRUE;
     *olen = n;
 
     return TRUE;

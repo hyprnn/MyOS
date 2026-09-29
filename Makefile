@@ -55,7 +55,7 @@ FATFS_CFLAGS := $(KCFLAGS) -U_FORTIFY_SOURCE -Wno-extra -Wno-unused-parameter \
              -Ithird_party/fatfs/myos -Ithird_party/fatfs -DFFCONF_H='"ffconf.h"'
 
 LOBJS   := $(LSRCS:%.c=build/loader/%.o)
-KOBJS   := $(KSRCS:%.c=build/kernel/%.o) build/kernel/apps.o \
+KOBJS   := $(KSRCS:%.c=build/kernel/%.o) build/kernel/apps.o build/kernel/firmware.o \
            $(FATFS_SRCS:%.c=build/kernel/%.o)
 DEPS    := $(LOBJS:.o=.d) $(KSRCS:%.c=build/kernel/%.d)
 
@@ -153,6 +153,12 @@ build/apps.S: $(APP_ELFS) Makefile
 	   echo '  .quad 0, 0, 0'; echo '.section .note.GNU-stack,"",@progbits'; } > $@
 
 build/kernel/apps.o: build/apps.S
+	@mkdir -p $(dir $@)
+	@echo "  AS  $<"
+	@$(CC) $(KCFLAGS) -c $< -o $@
+
+# Прошивки устройств (firmware/): вклеиваются в ядро как есть
+build/kernel/firmware.o: firmware/firmware.S $(wildcard firmware/*/*.bin)
 	@mkdir -p $(dir $@)
 	@echo "  AS  $<"
 	@$(CC) $(KCFLAGS) -c $< -o $@

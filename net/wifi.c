@@ -3,28 +3,25 @@
  * можно сделать; самопроверка безопасности WPA2. Часть MyOS; общие
  * объявления - в net/wifi.h.
  *
- * Почему в MyOS пока нет своего драйвера Wi-Fi. Проводная карта -
- * это кольца дескрипторов и десяток регистров (drivers/e1000.c). Чип
- * Wi-Fi - маленький компьютер со своей программой: драйвер должен
- *   * загрузить в чип закрытую прошивку производителя (файл на
- *     100-1500 КиБ: rtw8821c_fw.bin, iwlwifi-9000-*.ucode, ...);
- *   * прописать тысячи регистров радиочасти из таблиц калибровки;
- *   * сам делать всё 802.11: искать сети (scan), подключаться
- *     (authentication, association), шифровать (WPA2).
- * Для каждого семейства чипов это отдельный большой драйвер (в Linux -
- * 20-100 тысяч строк), и проверить его можно только на живом чипе.
+ * Wi-Fi в MyOS - три части:
+ *   * этот файл: какой адаптер стоит в компьютере (таблица известных
+ *     чипов) и команда wifi;
+ *   * net/wpa.c - вся "безопасность" Wi-Fi, не зависящая от чипа:
+ *     ключ из пароля (PBKDF2), 4-стороннее рукопожатие WPA2, шифрование
+ *     кадров CCMP (AES); "wifi selftest" гоняет официальные тестовые
+ *     векторы и рукопожатие с программной точкой доступа;
+ *   * net/wlan.c + драйвер чипа (пока один: drivers/rtw8821c.c, Realtek
+ *     RTL8821CE) - поиск сетей, подключение, интерфейс wlan0.
  *
- * Что уже есть и проверено (net/wpa.c): вся "безопасность" Wi-Fi,
- * не зависящая от чипа - ключ из пароля (PBKDF2), 4-стороннее
- * рукопожатие WPA2, шифрование кадров CCMP (AES). Команда
- * "wifi selftest" гоняет официальные тестовые векторы и полное
- * рукопожатие с программной точкой доступа.
- *
- * А пока выход в Интернет без кабеля - через телефон: "USB-модем"
- * (drivers/usbnet.c) - телефон сам держит Wi-Fi или мобильную сеть.
+ * Чип Wi-Fi - маленький компьютер со своей программой: драйвер грузит в
+ * него прошивку производителя и тысячи регистров радиочасти из таблиц
+ * калибровки, поэтому для каждого семейства чипов нужен свой большой
+ * драйвер. Для остальных адаптеров выход в Интернет без кабеля - через
+ * телефон: "USB-модем" (drivers/usbnet.c).
  */
 #include "net.h"
 #include "wifi.h"
+#include "wlan.h"
 
 /* Известные адаптеры Wi-Fi: PCI (встроенные) и USB (свистки) */
 typedef struct {
@@ -146,14 +143,27 @@ void wifi_scan_pci(void)
     }
 }
 
+static BOOLEAN wifi_has_driver(UINT16 vendor, UINT16 device)
+{
+    return vendor == 0x10EC && (device == 0xC821 || device == 0xB821);
+}
+
 /* Строка в журнал загрузки: какой Wi-Fi нашёлся */
 void wifi_boot_report(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
-    for (UINTN i = 0; i < g_wifi_n; i++)
-        kprintf(out, "  Wi-Fi: %s (%04x:%04x) - no radio driver yet, see 'wifi';\n"
-                     "         internet without a cable: USB tethering from a phone\n",
-                g_wifi_found[i].model ? g_wifi_found[i].model->name : "unknown adapter",
-                g_wifi_found[i].vendor, g_wifi_found[i].device);
+    for (UINTN i = 0; i < g_wifi_n; i++) {
+
+        const WIFI_FOUND *w = &g_wifi_found[i];
+
+        if (wifi_has_driver(w->vendor, w->device))
+            kprintf(out, "  Wi-Fi: %s (%04x:%04x) - 'wifi scan', then\n"
+                         "         'wifi connect <network> <password>'\n",
+                    w->model ? w->model->name : "adapter", w->vendor, w->device);
+        else
+            kprintf(out, "  Wi-Fi: %s (%04x:%04x) - no radio driver yet, see 'wifi';\n"
+                         "         internet without a cable: USB tethering from a phone\n",
+                    w->model ? w->model->name : "unknown adapter", w->vendor, w->device);
+    }
 }
 
 /* ================================================================
@@ -384,6 +394,23 @@ static void wifi_selftest(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
              s.gtk_len == 16 && memcmp(s.gtk, gtk, 16) == 0 && s.gtk_id == 1;
         st_report(out, "4-way handshake with a software access point", ok);
 
+        /* групповое рукопожатие: точка раздаёт новый GTK (номер 2) */
+        UINT8 gtk2[16];
+        for (UINTN i = 0; i < 16; i++) gtk2[i] = (UINT8)(0x11 * i + 3);
+        kl = 0;
+        kd[kl++] = 0xDD; kd[kl++] = 22;
+        kd[kl++] = 0x00; kd[kl++] = 0x0F; kd[kl++] = 0xAC; kd[kl++] = 0x01;
+        kd[kl++] = 0x02; kd[kl++] = 0x00;
+        memcpy(kd + kl, gtk2, 16);
+        kl += 16;
+        aes_wrap(ptk_ap + 16, kl / 8, kd, wk);
+        s.gtk_new = FALSE;
+        n = ap_build(m, 0x0002 | 0x0080 | 0x0100 | 0x0200 | 0x1000, 3, anonce, wk, kl + 8, ptk_ap);
+        BOOLEAN g = wpa_supp_rx(&s, m, n, r, &rl);
+        st_report(out, "group key update (GTK rekey, message 1/2 -> 2/2)",
+                  g && s.gtk_new && s.gtk_id == 2 && memcmp(s.gtk, gtk2, 16) == 0 &&
+                  ap_check_mic(ptk_ap, r, rl) && !(r[6] & 0x08));
+
         /* неверный пароль: подпись 3/4 не сходится - клиент молчит */
         WPA_SUPP bad;
         UINT8 wrong[32];
@@ -445,6 +472,29 @@ static void wifi_list(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     if (n == 0)
         print(out, "  none found (PCI class 0x0280 or a known USB Wi-Fi stick)\n");
 
+    BOOLEAN supported = FALSE;
+
+    for (UINTN i = 0; i < g_wifi_n; i++)
+        if (wifi_has_driver(g_wifi_found[i].vendor, g_wifi_found[i].device))
+            supported = TRUE;
+
+    if (wlan_present()) {
+        print(out, "\n");
+        wlan_cmd_status(out, FALSE);
+        print(out, "Commands: wifi scan | wifi connect <name> [password] | wifi disconnect |\n"
+                   "          wifi debug | wifi selftest\n");
+        return;
+    }
+
+    if (supported) {
+        print(out,
+              "\nMyOS has a radio driver for this adapter (Realtek RTL8821CE):\n"
+              "  wifi scan                        - list networks around\n"
+              "  wifi connect <name> <password>   - connect (WPA2 or open network)\n"
+              "  wifi disconnect | wifi debug | wifi selftest\n");
+        return;
+    }
+
     print(out,
           "\nStatus: MyOS has no radio driver for these chips yet. A Wi-Fi chip is a small\n"
           "computer of its own: it needs the vendor's closed firmware file loaded into it\n"
@@ -454,6 +504,40 @@ static void wifi_list(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
           "\nInternet without a cable TODAY: connect a phone by USB and turn on\n"
           "'USB tethering' (Android: Settings - Network - Hotspot - USB tethering).\n"
           "The phone's Wi-Fi or mobile data becomes interface usb0 (see ifconfig).\n");
+}
+
+/* Слово из строки: до пробела или в кавычках ("My Home WiFi").
+   Возвращает начало следующего слова */
+static const char *wifi_word(const char *s, char *out, UINTN cap)
+{
+    UINTN n = 0;
+
+    while (*s == ' ')
+        s++;
+
+    if (*s == '"') {
+        s++;
+        while (*s && *s != '"') {
+            if (n + 1 < cap)
+                out[n++] = *s;
+            s++;
+        }
+        if (*s == '"')
+            s++;
+    } else {
+        while (*s && *s != ' ') {
+            if (n + 1 < cap)
+                out[n++] = *s;
+            s++;
+        }
+    }
+
+    out[n] = '\0';
+
+    while (*s == ' ')
+        s++;
+
+    return s;
 }
 
 void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
@@ -499,8 +583,70 @@ void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
         return;
     }
 
+    if (kstreq(arg, "scan")) {
+        wlan_cmd_scan(out);
+        return;
+    }
+
+    if (arg[0] == 'c' && arg[1] == 'o' && arg[2] == 'n' && arg[3] == 'n' && arg[4] == 'e' &&
+        arg[5] == 'c' && arg[6] == 't' && (arg[7] == ' ' || arg[7] == '\0')) {
+
+        char name[64], pass[80];
+        const char *rest = wifi_word(arg + 7, name, sizeof(name));
+
+        wifi_word(rest, pass, sizeof(pass));
+
+        if (name[0] == '\0') {
+            print(out, "usage: wifi connect <network name> <password>\n"
+                       "       wifi connect \"name with spaces\" <password>\n"
+                       "       wifi connect <open network name>\n");
+            return;
+        }
+
+        wlan_cmd_connect(out, name, pass[0] ? pass : NULL);
+        return;
+    }
+
+    if (kstreq(arg, "sim")) {
+
+        /* программная точка доступа "MyOS-Test" - для автотеста в QEMU */
+        kmutex_lock(&g_net_mutex);
+
+        if (wlan_present()) {
+            print(out, "Wi-Fi is already running (see 'wifi').\n");
+        } else {
+            WLAN_HW *hw = NULL;
+            if (wlan_sim_attach(out, &hw))
+                wlan_use_hw(out, hw);
+        }
+
+        kmutex_unlock(&g_net_mutex);
+        return;
+    }
+
+    if (kstreq(arg, "disconnect") || kstreq(arg, "off")) {
+        wlan_cmd_disconnect(out);
+        return;
+    }
+
+    if (kstreq(arg, "debug") || kstreq(arg, "status")) {
+
+        if (!wlan_present()) {
+            /* ещё не включали - включить (шаги видны на экране) */
+            kmutex_lock(&g_net_mutex);
+            BOOLEAN ok = wlan_up(out);
+            kmutex_unlock(&g_net_mutex);
+            if (!ok)
+                return;
+        }
+
+        wlan_cmd_status(out, kstreq(arg, "debug"));
+        return;
+    }
+
     if (arg[0] != '\0') {
-        print(out, "usage: wifi | wifi selftest | wifi psk <network> <password>\n");
+        print(out, "usage: wifi | wifi scan | wifi connect <name> [password] | wifi disconnect\n"
+                   "       wifi debug | wifi selftest | wifi psk <network> <password>\n");
         return;
     }
 

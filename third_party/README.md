@@ -25,3 +25,36 @@
   `fatfs/myos/string.h`. Собирается в ядро (`FATFS_CFLAGS` в Makefile);
   прослойка к VFS — `fs/exfat.c`. Утилита хоста для автотеста —
   `tools/exfattool.c` (та же FatFs).
+
+## Драйвер Wi-Fi rtw88 (Linux) и прошивка Realtek
+
+* `drivers/rtw8821c.c` — перенос частей драйвера Linux rtw88
+  (`drivers/net/wireless/realtek/rtw88`: pci.c, mac.c, fw.c, efuse.c,
+  phy.c, coex.c, rtw8821c.c), Copyright © 2018–2019 Realtek Corporation,
+  двойная лицензия **GPL-2.0 OR BSD-3-Clause** — MyOS пользуется
+  BSD-3-Clause. Код переписан под MyOS (не копия), порядок регистров и
+  числа — как у Realtek.
+* `drivers/rtw8821c_table.c` — таблицы `rtw8821c_table.c` из того же
+  драйвера (та же лицензия), без изменений чисел; заменены только имена
+  типов. Взято из ветки master ядра Linux (сентябрь 2026).
+* Текст BSD-3-Clause для этих файлов:
+
+  > Redistribution and use in source and binary forms, with or without
+  > modification, are permitted provided that the following conditions are
+  > met: (1) Redistributions of source code must retain the above copyright
+  > notice, this list of conditions and the following disclaimer.
+  > (2) Redistributions in binary form must reproduce the above copyright
+  > notice, this list of conditions and the following disclaimer in the
+  > documentation and/or other materials provided with the distribution.
+  > (3) Neither the name of the copyright holder nor the names of its
+  > contributors may be used to endorse or promote products derived from
+  > this software without specific prior written permission.
+  > THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+  > IS" AND ANY EXPRESS OR IMPLIED WARRANTIES ... ARE DISCLAIMED.
+
+* `firmware/rtw88/rtw8821c_fw.bin` — прошивка процессора внутри чипа
+  (версия 24.11) из linux-firmware (gitlab.com/kernel-firmware, файл
+  `rtw88/rtw8821c_fw.bin`, sha256 2ef409bc…32f3f0). Realtek разрешает
+  распространять её только в двоичном виде и без изменений; условия —
+  `firmware/LICENCE.rtlwifi_firmware.txt` (копия LICENCE.rtlwifi_firmware.txt
+  из linux-firmware). Вклеивается в ядро файлом `firmware/firmware.S`.

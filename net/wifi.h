@@ -55,7 +55,10 @@ typedef struct {
     BOOLEAN have_replay;
     UINT8   gtk[32];
     UINT8   gtk_len, gtk_id;
+    BOOLEAN gtk_new;              /* пришёл новый GTK (3/4 или групповое 1/2) */
     UINT32  mic_failures;
+    UINT8   rsn_ie[64];           /* наш RSN IE (тот же, что в запросе association) */
+    UINT8   rsn_ie_len;
 } WPA_SUPP;
 
 extern const UINT8 g_wpa_rsn_ie[22];
