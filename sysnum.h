@@ -29,7 +29,15 @@
 #define SYS_YIELD    14   /* уступить процессор */
 #define SYS_STAT     15   /* stat(path, struct myos_dirent *) */
 #define SYS_GETKEY   16   /* getkey() -> символ, 0 - нет нажатия (не ждёт) */
-#define SYS_COUNT    17
+/* окна (этап 7) */
+#define SYS_WIN_CREATE 17 /* win_create(w, h, title) -> номер окна; его пиксели -
+                             по адресу MYOS_WIN_ADDR(номер), w x h, 0x00RRGGBB */
+#define SYS_WIN_UPDATE 18 /* win_update(номер, struct myos_rect * или 0 - всё) -
+                             "я перерисовал, покажи" */
+#define SYS_WIN_EVENT  19 /* win_event(номер, struct myos_event *, ждать мс) -> 1/0 */
+#define SYS_WIN_CLOSE  20 /* win_close(номер) */
+#define SYS_WIN_TITLE  21 /* win_title(номер, заголовок UTF-8) */
+#define SYS_COUNT    22
 
 /* флаги open - те же, что VFS_O_* в ядре */
 #define O_READ    0x01
@@ -54,6 +62,7 @@
 #define MYOS_EGONE     -14
 #define MYOS_EXDEV     -15
 #define MYOS_EFAULT    -16   /* плохой указатель от программы */
+#define MYOS_ENOGUI    -17   /* графика не запущена (нужно 'start') */
 
 struct myos_time {
     unsigned short year;
@@ -67,6 +76,48 @@ struct myos_dirent {
     unsigned int       is_dir;
     unsigned int       pad;
 };
+
+/* --- окна (этап 7) --- */
+struct myos_rect {
+    int x, y, w, h;
+};
+
+/* событие окна */
+#define EV_KEY    1   /* key - символ Unicode (0 - особая клавиша, см. scan) */
+#define EV_DOWN   2   /* кнопка мыши нажата: x, y - в окне, buttons: 1 левая, 2 правая */
+#define EV_UP     3
+#define EV_MOVE   4   /* мышь сдвинулась (над окном или с зажатой кнопкой) */
+#define EV_WHEEL  5   /* колесо: wheel > 0 - от себя */
+#define EV_CLOSE  6   /* нажали крестик окна */
+#define EV_FOCUS  7   /* key = 1 - окно стало активным, 0 - перестало */
+
+/* scan для особых клавиш (как в UEFI) */
+#define KEY_UP     0x01
+#define KEY_DOWN   0x02
+#define KEY_RIGHT  0x03
+#define KEY_LEFT   0x04
+#define KEY_HOME   0x05
+#define KEY_END    0x06
+#define KEY_DEL    0x08
+#define KEY_PGUP   0x09
+#define KEY_PGDN   0x0A
+#define KEY_ESC    0x17
+
+struct myos_event {
+    unsigned int type;
+    unsigned int key;
+    unsigned int scan;
+    int          x, y;
+    unsigned int buttons;
+    int          wheel;
+    unsigned int pad;
+};
+
+#define MYOS_WIN_BASE     0x0000600000000000ull
+#define MYOS_WIN_SPAN     0x0000000001000000ull      /* 16 МиБ на окно */
+#define MYOS_WIN_ADDR(id) (MYOS_WIN_BASE + ((unsigned long long)(id) - 1ull) * MYOS_WIN_SPAN)
+#define MYOS_WIN_MAX_W    1024
+#define MYOS_WIN_MAX_H    768
 
 /* Адреса программы (нижняя половина адресного пространства) */
 #define MYOS_USER_BASE       0x0000000000400000ull   /* сюда линкуются программы */

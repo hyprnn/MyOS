@@ -86,3 +86,16 @@ unsigned int rand(void);
 void srand(unsigned int seed);
 
 #endif
+
+/* --- окна (этап 7, user/lib/win.c) --- */
+int   win_create(int w, int h, const char *title); /* -> id окна, <0 ошибка */
+void *win_pixels(int id);                          /* буфер cw*ch, 0x00RRGGBB */
+int   win_update(int id);                          /* показать нарисованное */
+int   win_event(int id, struct myos_event *e, int wait_ms); /* 1 - есть событие */
+int   win_close(int id);
+int   win_title(int id, const char *title);
+/* рисование в буфер окна (буфер w*h пикселей, строка = w) */
+void  gpx(unsigned int *buf, int w, int h, int x, int y, unsigned int col);
+void  gfill(unsigned int *buf, int w, int h, int x, int y, int rw, int rh, unsigned int col);
+void  gtext(unsigned int *buf, int w, int h, int x, int y, const char *s, unsigned int col);
+int   gtextw(const char *s);

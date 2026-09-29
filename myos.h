@@ -1645,6 +1645,7 @@ extern EFI_INPUT_KEY g_kbd_queue[KBD_QUEUE_SIZE];
 extern UINTN g_kbd_q_head;
 extern UINTN g_kbd_q_tail;
 extern BOOLEAN g_kbd_caps;
+extern UINT8 g_kbd_layout;
 extern UINT8   g_kbd_usb_mods;
 extern UINT8   g_kbd_ps2_mods;
 extern UINT64  g_kbd_keys_total;
@@ -2103,6 +2104,121 @@ void gui_draw_minesweeper(
 );
 
 /* --- gui/minesweeper_draw.c --- */
+/* ================================================================
+ * Оконная система (этап 7): gui/gfx.c, gui/wm.c, gui/apps.c
+ * ================================================================ */
+
+#define FONT_W 8
+#define FONT_H 16
+
+/* Поверхность для рисования: пиксели 0x00RRGGBB, строка stride */
+typedef struct {
+    UINT32 *px;
+    UINT32  w, h, stride;
+    INT32   cx0, cy0, cx1, cy1;    /* отсечение (clip) */
+} GFX;
+
+void gfx_init(GFX *g, UINT32 *px, UINT32 w, UINT32 h, UINT32 stride);
+void gfx_noclip(GFX *g);
+void gfx_clip(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h);
+void gfx_fill(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, UINT32 col);
+void gfx_pixel(GFX *g, INT32 x, INT32 y, UINT32 col);
+void gfx_blit(GFX *g, INT32 x, INT32 y, const UINT32 *src, INT32 w, INT32 h, UINT32 src_stride);
+void gfx_bevel(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, BOOLEAN raised);
+void gfx_button(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, BOOLEAN pressed);
+void gfx_glyph(GFX *g, INT32 x, INT32 y, UINT32 cp, UINT32 col);
+void gfx_glyph_up(GFX *g, INT32 x, INT32 y, UINT32 cp, UINT32 col);
+INT32 gfx_text(GFX *g, INT32 x, INT32 y, const char *s, UINT32 col);
+INT32 gfx_text_fit(GFX *g, INT32 x, INT32 y, const char *s, UINT32 col, UINTN max_chars);
+INT32 gfx_text_bold(GFX *g, INT32 x, INT32 y, const char *s, UINT32 col);
+INT32 gfx_text_width(const char *s);
+void gfx_icon(GFX *g, INT32 x, INT32 y, const char *const *rows, UINT32 scale, BOOLEAN selected);
+UINT32 utf8_next(const char **s);
+UINTN utf8_put(UINT32 c, char *out);
+UINTN utf8_len(const char *s);
+INTN font_index(UINT32 cp);
+UINT32 font_alpha(INTN idx, UINT32 x, UINT32 y);
+const char *const *gui_icon(const char *name);
+
+/* Событие окну (в формате struct myos_event из sysnum.h) */
+#define WIN_TITLE_MAX  64
+#define WM_MAX_WINDOWS 16
+
+struct WIN;
+
+typedef struct {
+    const char *name;                       /* для панели задач и заголовка */
+    const char *const *icon;                /* значок 16x16 */
+    void  (*paint)(struct WIN *w, GFX *g);  /* нарисовать содержимое окна */
+    void  (*event)(struct WIN *w, struct myos_event *e);   /* нажатие/клик */
+    void  (*tick)(struct WIN *w);           /* раз в ~0.1 с (часы, таймер) */
+    void  (*close)(struct WIN *w);          /* окно закрывают */
+} WIN_CLASS;
+
+typedef struct WIN {
+    BOOLEAN         used;
+    UINT32          id;
+    INT32           x, y;                   /* левый верх ОКНА (с рамкой) */
+    INT32           cw, ch;                 /* размер содержимого */
+    char            title[WIN_TITLE_MAX];
+    UINT32          z;                      /* порядок: больше - выше */
+    BOOLEAN         minimized;
+    BOOLEAN         want_redraw;
+    volatile BOOLEAN dead;                   /* хозяин-программа ушёл: закрыть */
+
+    UINT32         *buf;                     /* пиксели содержимого cw x ch */
+    UINTN           buf_pages;
+    UINT64          buf_phys;                /* для окна программы (общее с ней) */
+
+    const WIN_CLASS *cls;                    /* родное окно ядра (иначе NULL) */
+    void           *state;                   /* данные родного окна */
+
+    struct KPROC   *proc;                    /* окно программы (иначе NULL) */
+    /* очередь событий окна программы */
+    struct myos_event evq[32];
+    volatile UINTN  ev_head, ev_tail;
+} WIN;
+
+/* Рамка окна */
+#define WIN_TITLE_H   20
+#define WIN_BORDER    3
+#define WIN_FRAME_W(cw) ((cw) + 2 * WIN_BORDER)
+#define WIN_FRAME_H(ch) ((ch) + WIN_TITLE_H + 2 * WIN_BORDER)
+
+extern WIN g_windows[WM_MAX_WINDOWS];
+extern volatile BOOLEAN g_wm_running;
+void wm_start(EFI_SYSTEM_TABLE *st);
+WIN *wm_open(const WIN_CLASS *cls, INT32 cw, INT32 ch, const char *title, void *state);
+void wm_close(WIN *w);
+void wm_invalidate(WIN *w);            /* содержимое изменилось - перерисовать */
+void wm_set_title(WIN *w, const char *title);
+GFX wm_client_gfx(WIN *w);
+void wm_focus(WIN *w);
+WIN *wm_focused(void);
+BOOLEAN wm_push_event(WIN *w, struct myos_event *e);
+void wm_request_stop(void);
+void wm_invalidate_desktop(void);
+
+/* родные приложения (gui/apps.c) */
+void app_open_terminal(void);
+void app_open_notepad(const char *path);
+void app_open_explorer(const char *path);
+void app_open_minesweeper(void);
+void app_open_about(void);
+void app_open_program(const char *name);
+void app_run_bare(const char *name);
+void apps_desktop_launch(const char *what);   /* ярлык рабочего стола */
+void apps_draw_shortcuts(GFX *g);
+void apps_shortcut_click(INT32 x, INT32 y);
+
+/* окна программ (kernel/winproc.c, из syscall.c) */
+INT64 win_sys_create(struct KPROC *p, UINT64 w, UINT64 h, UINT64 utitle);
+INT64 win_sys_update(struct KPROC *p, UINT64 id, UINT64 urect);
+INT64 win_sys_event(struct KPROC *p, UINT64 id, UINT64 uevent, UINT64 wait_ms);
+INT64 win_sys_close(struct KPROC *p, UINT64 id);
+INT64 win_sys_title(struct KPROC *p, UINT64 id, UINT64 utitle);
+void win_proc_cleanup(struct KPROC *p);
+
 /* Ярлыки рабочего стола (gui/shortcuts.c) */
 typedef struct {
     const char        *label;

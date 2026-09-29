@@ -849,7 +849,7 @@ void run_command(
 
     } else if (streq(line, "start")) {
 
-        gui_start(st);
+        wm_start(st);
 
 
     /* --------------------------------------------------------

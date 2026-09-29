@@ -508,6 +508,26 @@ INT64 kx_syscall_dispatch(UINT64 *f)
         r = 0;
         break;
 
+    case SYS_WIN_CREATE:
+        r = win_sys_create(p, a1, a2, a3);
+        break;
+
+    case SYS_WIN_UPDATE:
+        r = win_sys_update(p, a1, a2);
+        break;
+
+    case SYS_WIN_EVENT:
+        r = win_sys_event(p, a1, a2, a3);
+        break;
+
+    case SYS_WIN_CLOSE:
+        r = win_sys_close(p, a1);
+        break;
+
+    case SYS_WIN_TITLE:
+        r = win_sys_title(p, a1, a2);
+        break;
+
     case SYS_GETKEY: {
         EFI_INPUT_KEY key;
         r = 0;

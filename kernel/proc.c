@@ -45,6 +45,7 @@ void (*g_proc_gui_sink)(const char *line) = NULL;   /* куда программ
 #define UPTE_U     (1ull << 2)
 #define UPTE_PS    (1ull << 7)
 #define UPTE_NX    (1ull << 63)
+#define UPTE_SHARED (1ull << 9)     /* страница чужая (буфер окна) - не освобождать */
 #define UPTE_ADDR  0x000FFFFFFFFFF000ull
 
 #define MAX_ELF_SIZE   (8u * 1024u * 1024u)
@@ -149,6 +150,24 @@ BOOLEAN proc_map_heap_page(KPROC *p, UINT64 va)
     return uvm_map_new(p, va, TRUE, FALSE);
 }
 
+/* Отобразить готовые физические страницы (буфер окна) в память
+   программы: тот же буфер видят и ядро, и она (этап 7) */
+BOOLEAN proc_map_shared(KPROC *p, UINT64 va, UINT64 phys, UINTN pages)
+{
+    for (UINTN i = 0; i < pages; i++) {
+
+        UINT64 *e = uvm_pte(p->pml4, va + i * 4096u, TRUE);
+
+        if (e == NULL)
+            return FALSE;
+
+        *e = (phys + i * 4096u) | UPTE_P | UPTE_U | UPTE_W | UPTE_SHARED |
+             (g_vmm_nx ? UPTE_NX : 0);
+    }
+
+    return TRUE;
+}
+
 /* Физический адрес страницы программы (0 - не отображена) */
 static UINT64 uvm_phys(KPROC *p, UINT64 va)
 {
@@ -247,7 +266,7 @@ static void uvm_free(UINT64 pml4)
                 UINT64 *l1 = (UINT64 *)P2V(l2[k] & UPTE_ADDR);
 
                 for (UINTN m = 0; m < 512; m++)
-                    if (l1[m] & UPTE_P)
+                    if ((l1[m] & UPTE_P) && !(l1[m] & UPTE_SHARED))
                         pmm_free_pages(l1[m] & UPTE_ADDR, 1);
 
                 pmm_free_pages(l2[k] & UPTE_ADDR, 1);
@@ -744,6 +763,8 @@ void proc_exit_current(INT64 code)
 
         if (g_fg_proc == p)
             g_fg_proc = NULL;
+
+        win_proc_cleanup(p);
 
         klog("proc: pid %u '%s' exited with code %lld%s%s\n", p->pid, p->name, code,
              p->why[0] ? " - " : "", p->why);

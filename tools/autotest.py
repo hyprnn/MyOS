@@ -391,39 +391,33 @@ def main():
             ('cpu\n', 're:PS/2 keyboard \\(IRQ 1\\) +[1-9]', 15),
             ('', 're:PS/2 mouse / touchpad \\(IRQ 12\\) +[1-9]', 5),
         ], [], ['qemu-xhci']))
-        # GUI + потоки: долгая команда терминала работает в своём
-        # потоке, а GUI живёт (часы идут, мышь двигается)
-        runs.append(('gui-threads', [
+        # Рабочий стол (этап 7): композитор, окна, окно программы.
+        # Экран теста 1280x800; панель задача снизу, кнопка "Пуск" слева.
+        # Меню "Пуск" открывается вверх; пункт "Часы" - 5-й (clock),
+        # запускает программу, у неё своё окно (winproc в COM1).
+        runs.append(('desktop', [
             (None, "Type 'help'", 90),
-            ('start\n', 'Press any key', 15),
-            (' ', 'gui: started', 10),
-            ('c', 'gui: terminal opened', 10),
-            ('sleep 4\n', "gui: job 'SLEEP 4' started", 10),
-            ({'mouse': 20}, "gui: mouse moved while 'SLEEP 4' runs", 5),
-            ('ps\n', 're:gui: ps: .*TERM-JOB +SLEEPING', 10),
-            ('', "re:gui: clock [0-9:]+ [A-Z]+ while 'SLEEP 4' runs", 5),
-            ('', 'gui: term: WOKE UP - 4 S', 10),
-            ('spin 2\n', "gui: job 'SPIN 2' started", 10),
-            ({'mouse': 20}, "gui: mouse moved while 'SPIN 2' runs", 5),
-            ('', 're:gui: term: SPUN 2 S', 10),
-            # программы в терминале GUI
-            ('hello\n', 'gui: term: HELLO FROM RING 3!', 15),
-            ('crash\n', 'gui: term: *** CRASH WAS STOPPED', 15),
-            ('calc\n', 'gui: term: CALC>', 15),
-            ('6*7\n', 'gui: term: 42', 10),
-            ('\n', "gui: job 'CALC' finished", 10),
-            ({'key': 'esc'}, '', 0.5),
-            # ярлыки рабочего стола: CALC - шестой (y = 22+10+5*66+16)
-            ({'goto': (46, 372)}, '', 0.2),
-            ({'click': 1}, '', 0.3),
-            ({'click': 1}, 'gui: shortcut CALC opened', 10),
-            ('', 'gui: term: CALCULATOR.', 10),
-            ('2+2\n', 'gui: term: 4', 10),
-            ('\n', "gui: job 'CALC' finished", 10),
-            ('sleep 30\n', "gui: job 'SLEEP 30' started", 10),
-            ({'key': 'esc'}, '', 0.5),
-            ({'key': 'esc'}, 'gui: left', 10),
-            ('', 'SLEEP CANCELLED', 1),
+            ('start\n', 're:wm: started', 20),
+            ('', "re:wm: window 1 .* opened", 5),
+            # открыть меню "Пуск"
+            ({'goto': (20, 786)}, '', 0.3),
+            ({'click': 1}, '', 0.4),
+            # пункт "Терминал" (1-й, y=569): курсор в (60,575)
+            ({'goto': (60, 575)}, '', 0.3),
+            ({'click': 1}, "re:wm: window .* opened", 8),
+            # снова меню -> "Часы" (5-й пункт, y=569+4*20=649)
+            ({'goto': (20, 786)}, '', 0.3),
+            ({'click': 1}, '', 0.4),
+            ({'goto': (60, 649)}, '', 0.3),
+            ({'click': 1}, 're:wm: launch clock', 8),
+            ('', 're:winproc: pid [0-9]+ got window', 10),
+            # мышь двигается - композитор жив
+            ({'mouse': 15}, '', 1),
+            # выход из рабочего стола: меню "Пуск" -> "Выход" (10-й, y=569+9*20=749)
+            ({'goto': (20, 786)}, '', 0.3),
+            ({'click': 1}, '', 0.4),
+            ({'goto': (60, 749)}, '', 0.3),
+            ({'click': 1}, 'Left the desktop', 10),
         ]))
         # диски и файлы (этап 5): флешка (MBR+FAT32), SATA-диск через
         # AHCI (GPT+FAT16), NVMe (GPT+FAT32); файлы с длинными именами,
@@ -496,9 +490,12 @@ def main():
             (None, "Type 'help'", 90),
             ('cat /usb0p1/myos/hello.txt\n', 'Hello from MyOS', 20),
             ('ls /nvme0p1/a/b\n', 'copy.bin', 15),
-            ('start\n', 'Press any key', 15),
-            (' ', 'gui: started', 10),
-            ('e', 'gui: explorer row: USB0P1/', 10),
+            # рабочий стол видит флешку: открыть Проводник и зайти в /usb0p1
+            ('start\n', 're:wm: started', 20),
+            ({'goto': (20, 786)}, '', 0.3),
+            ({'click': 1}, '', 0.4),
+            ({'goto': (60, 609)}, '', 0.3),
+            ({'click': 1}, 're:wm: launch explorer', 8),
         ], disks, ddev))
         # чипсет q35: PCIe через ECAM (MCFG), перезагрузка через FADT
         runs.append(('q35', [

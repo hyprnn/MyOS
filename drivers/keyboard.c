@@ -9,6 +9,7 @@ UINTN g_kbd_q_head = 0;   /* откуда читать */
 UINTN g_kbd_q_tail = 0;   /* куда писать */
 
 BOOLEAN g_kbd_caps = FALSE;
+UINT8   g_kbd_layout = 0;      /* 0 - английская, 1 - русская (ЙЦУКЕН) */
 BOOLEAN g_kbd_num = TRUE;       /* NumLock: цифровой блок - цифры */
 BOOLEAN g_kbd_scroll = FALSE;
 
@@ -93,9 +94,66 @@ BOOLEAN kbd_shift_down(void)
 
 /* Главное: одно нажатие клавиши (HID Usage) -> EFI_INPUT_KEY
    в очередь */
+/*
+ * Русская раскладка ЙЦУКЕН: по HID Usage клавиши (её "латинскому"
+ * знаку) - строчная кириллическая буква (U+0430..) или Ё (U+0451).
+ * 0 - у этой клавиши в русской раскладке буквы нет.
+ */
+static CHAR16 cyr_letter(UINT8 u)
+{
+    /* буквы a..z (usage 0x04..0x1D) -> кириллица ЙЦУКЕН */
+    static const CHAR16 ltr[26] = {
+        /* a */ 0x444,/* b */ 0x438,/* c */ 0x441,/* d */ 0x432,/* e */ 0x443,
+        /* f */ 0x430,/* g */ 0x43F,/* h */ 0x440,/* i */ 0x448,/* j */ 0x43E,
+        /* k */ 0x43B,/* l */ 0x434,/* m */ 0x44C,/* n */ 0x442,/* o */ 0x449,
+        /* p */ 0x437,/* q */ 0x439,/* r */ 0x43A,/* s */ 0x44B,/* t */ 0x435,
+        /* u */ 0x433,/* v */ 0x43C,/* w */ 0x446,/* x */ 0x447,/* y */ 0x43D,
+        /* z */ 0x44F
+    };
+
+    if (u >= 0x04 && u <= 0x1D)
+        return ltr[u - 0x04];
+
+    switch (u) {
+    case 0x33: return 0x436;   /* ; -> ж */
+    case 0x34: return 0x44D;   /* ' -> э */
+    case 0x2F: return 0x445;   /* [ -> х */
+    case 0x30: return 0x44A;   /* ] -> ъ */
+    case 0x36: return 0x431;   /* , -> б */
+    case 0x37: return 0x44E;   /* . -> ю */
+    case 0x35: return 0x451;   /* ` -> ё */
+    default:   return 0;
+    }
+}
+
 void kbd_press_usage(UINT8 u)
 {
     BOOLEAN shift = kbd_shift_down();
+
+    /* Ctrl+Space - переключить раскладку EN <-> RU */
+    {
+        UINT8 mods = (UINT8)(g_kbd_usb_mods | g_kbd_ps2_mods);
+        if ((mods & 0x11u) && u == 0x2C) {
+            g_kbd_layout ^= 1u;
+            return;
+        }
+    }
+
+    /* русская раскладка: буква/знак -> кириллица (кроме Ctrl-сочетаний) */
+    {
+        UINT8 mods = (UINT8)(g_kbd_usb_mods | g_kbd_ps2_mods);
+        if (g_kbd_layout == 1u && !(mods & 0x11u)) {
+            CHAR16 c = cyr_letter(u);
+            if (c != 0) {
+                BOOLEAN up = shift ? !g_kbd_caps : g_kbd_caps;
+                /* заглавные: ё(0x451)->Ё(0x401); а(0x430..)->А(0x410..) */
+                if (up)
+                    c = (c == 0x451) ? 0x401 : (CHAR16)(c - 0x20);
+                kbd_enqueue(0, c);
+                return;
+            }
+        }
+    }
 
     if (u >= 0x04 && u <= 0x1D) {
 
