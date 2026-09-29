@@ -613,7 +613,8 @@ INT64 kx_syscall_dispatch(UINT64 *f)
         EFI_TIME now;
         if (!uptr_ok(p, a1, sizeof(t), TRUE)) { r = MYOS_EFAULT; break; }
         if (!rtc_read(&now)) { r = MYOS_EIO; break; }
-        tz_to_local(&now);
+        if (a2 != 1)
+            tz_to_local(&now);          /* CMOS хранит UTC; программам - местное */
         t.year = now.Year; t.month = now.Month; t.day = now.Day;
         t.hour = now.Hour; t.minute = now.Minute; t.second = now.Second; t.pad = 0;
         memcpy((void *)(UINTN)a1, &t, sizeof(t));
@@ -712,6 +713,13 @@ INT64 kx_syscall_dispatch(UINT64 *f)
     case SYS_NETCTL:
         r = sys_net(p, nr, a1, a2, a3, a4);
         break;
+
+    case SYS_GETRANDOM: {
+        if (a2 > 4096 || !uptr_ok(p, a1, a2, TRUE)) { r = MYOS_EFAULT; break; }
+        krandom_fill((void *)(UINTN)a1, (UINTN)a2);
+        r = (INT64)a2;
+        break;
+    }
 
     default:
         r = MYOS_ENOSYS;

@@ -21,7 +21,8 @@
 #define SYS_UPTIME    6   /* uptime()                           -> мс со старта */
 #define SYS_SBRK      7   /* sbrk(прибавка)                     -> старый конец кучи */
 #define SYS_GETPID    8   /* getpid() */
-#define SYS_TIME      9   /* time(struct myos_time *)           - местное время */
+#define SYS_TIME      9   /* time(struct myos_time *, utc)      - местное время
+                             (utc = 1 - всемирное, UTC: для сертификатов TLS) */
 #define SYS_READDIR  10   /* readdir(path, номер, struct myos_dirent *) -> 1 / 0 (конец) */
 #define SYS_MKDIR    11   /* mkdir(path) */
 #define SYS_UNLINK   12   /* unlink(path)  - файл или пустая папка */
@@ -49,7 +50,8 @@
 #define SYS_RESOLVE  30   /* resolve(имя, unsigned int *ip)        - DNS */
 #define SYS_NETINFO  31   /* netinfo(номер, struct myos_netif *)   -> 1 есть / 0 конец */
 #define SYS_NETCTL   32   /* netctl(struct myos_netctl *)          - настроить адрес */
-#define SYS_COUNT    33
+#define SYS_GETRANDOM 33  /* getrandom(buf, n)  - случайные байты для ключей (TLS) */
+#define SYS_COUNT    34
 
 /* флаги open - те же, что VFS_O_* в ядре */
 #define O_READ    0x01

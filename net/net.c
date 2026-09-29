@@ -63,6 +63,8 @@ void net_rx_frame(NETIF *nif, const UINT8 *frame, UINTN len)
     if (len < ETH_HLEN || len > NET_FRAME_MAX)
         return;
 
+    krandom_stir(len);          /* время прихода кадра - в "шум" для ключей */
+
     UINT64 fl = kspin_lock(&g_rxq_lock);
     UINTN next = (g_rxq_head + 1u) % NET_RXQ;
 

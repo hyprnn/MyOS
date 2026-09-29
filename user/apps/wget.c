@@ -1,18 +1,21 @@
 /*
- * wget - скачать файл по HTTP.
+ * wget - скачать файл по HTTP или HTTPS.
  *
  *   wget http://example.com/            -> файл index.html в текущей папке
+ *   wget https://archlinux.org/         -> по HTTPS (шифрование TLS)
  *   wget http://host:8080/file.bin      -> file.bin
  *   wget -O - http://example.com/       -> на экран
  *   wget -O /usb0p1/page.htm http://... -> в этот файл
  *   wget -O null http://...             -> никуда (проверка скорости)
+ *   --ca-certificate файл.pem           -> доверять ещё и этому корню
+ *   --no-check-certificate              -> не проверять сертификат (опасно)
  * В конце печатается CRC-32 скачанного - сверить с оригиналом.
  *
  * Как это работает: DNS (имя -> адрес), соединение TCP с портом 80,
- * запрос "GET /путь HTTP/1.0" + заголовки, ответ: строка статуса
+ * запрос "GET /путь HTTP/1.1" + заголовки (Connection: close), ответ: строка статуса
  * ("HTTP/1.1 200 OK"), заголовки, пустая строка, данные. Переадресации
- * (301/302...) - следуем, но только на http://: HTTPS (шифрование TLS)
- * в MyOS пока нет, а многие сайты требуют именно его.
+ * (301/302...) - следуем. HTTPS: то же самое внутри TLS (порт 443) -
+ * tls_open проверяет сертификат сайта по корням Mozilla (user/tls/).
  * Поддерживается "Transfer-Encoding: chunked" (данные кусками).
  */
 #include "myos.h"
@@ -22,15 +25,21 @@
 static char g_host[128];
 static char g_path[512];
 static int  g_port;
+static int  g_https;
 
-/* Разобрать URL в g_host / g_port / g_path. 0 - не понял, -1 - https */
+/* Разобрать URL в g_host / g_port / g_path / g_https. 0 - не понял */
 static int parse_url(const char *url)
 {
-    if (strncmp(url, "https://", 8) == 0)
-        return -1;
+    g_https = 0;
 
-    if (strncmp(url, "http://", 7) == 0)
+    if (strncmp(url, "https://", 8) == 0) {
+        g_https = 1;
+        url += 8;
+    } else if (strncmp(url, "http://", 7) == 0) {
         url += 7;
+    } else if (strstr(url, "://")) {
+        return 0;                         /* ftp:// и прочее */
+    }
 
     int k = 0;
 
@@ -38,7 +47,7 @@ static int parse_url(const char *url)
         g_host[k++] = *url++;
 
     g_host[k] = '\0';
-    g_port = 80;
+    g_port = g_https ? 443 : 80;
 
     if (*url == ':') {
         url++;
@@ -94,6 +103,39 @@ static const char *header(const char *hdrs, const char *name, char *out, int cap
     }
 
     return NULL;
+}
+
+/* ---- соединение: обычный сокет или TLS поверх него ---- */
+static TLS *g_tls = NULL;
+
+static long c_send(int s, const void *d, size_t n)
+{
+    return g_tls ? tls_send(g_tls, d, n) : send_all(s, d, n);
+}
+
+static long c_recv(int s, void *d, size_t n)
+{
+    return g_tls ? tls_recv(g_tls, d, n) : recv(s, d, n);
+}
+
+static void c_close(int s)
+{
+    if (g_tls) {
+        tls_close(g_tls);
+        g_tls = NULL;
+    }
+    close(s);
+}
+
+static const char *c_err(long r)
+{
+    static char e[160];
+
+    if (g_tls) {
+        tls_error(g_tls, e, sizeof(e));
+        return e;
+    }
+    return strerror((int)r);
 }
 
 /* ---- вывод: файл, экран или никуда ---- */
@@ -210,12 +252,16 @@ static const char *base_name(const char *path)
 
 int main(int argc, char **argv)
 {
-    const char *url = NULL, *outname = NULL;
-    int quiet = 0;
+    const char *url = NULL, *outname = NULL, *ca_file = NULL;
+    int quiet = 0, tls_flags = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-O") == 0 && i + 1 < argc)
             outname = argv[++i];
+        else if (strcmp(argv[i], "--ca-certificate") == 0 && i + 1 < argc)
+            ca_file = argv[++i];
+        else if (strcmp(argv[i], "--no-check-certificate") == 0)
+            tls_flags |= TLS_NO_VERIFY;
         else if (strcmp(argv[i], "-q") == 0)
             quiet = 1;
         else
@@ -223,7 +269,8 @@ int main(int argc, char **argv)
     }
 
     if (url == NULL) {
-        printf("usage: wget [-q] [-O file | -O -] http://host[:port]/path\n");
+        printf("usage: wget [-q] [-O file | -O - | -O null] [--ca-certificate file.pem]\n"
+               "            [--no-check-certificate] http[s]://host[:port]/path\n");
         return 1;
     }
 
@@ -242,11 +289,6 @@ int main(int argc, char **argv)
 
         int pu = parse_url(cur_url);
 
-        if (pu < 0) {
-            printf("wget: %s - HTTPS needs encryption (TLS), MyOS has no TLS yet.\n"
-                   "      Try the http:// address of the site, if it has one.\n", cur_url);
-            return 1;
-        }
         if (pu == 0) {
             printf("wget: cannot understand the address '%s'\n", cur_url);
             return 1;
@@ -276,28 +318,50 @@ int main(int argc, char **argv)
 
         if (r < 0) {
             printf("%s\n", strerror(r));
-            close(s);
+            c_close(s);
             return 1;
         }
 
         if (!quiet)
             printf("connected.\n");
 
+        if (g_https) {
+
+            char err[160], info[96];
+
+            if (!quiet)
+                printf("TLS handshake%s... ", (tls_flags & TLS_NO_VERIFY) ?
+                       " (certificate NOT checked!)" : "");
+
+            g_tls = tls_open(s, g_host, tls_flags, ca_file, err, sizeof(err));
+
+            if (g_tls == NULL) {
+                printf("failed:\nwget: %s\n", err);
+                c_close(s);
+                return 1;
+            }
+
+            if (!quiet) {
+                tls_info(g_tls, info, sizeof(info));
+                printf("%s\n", info);
+            }
+        }
+
         char req[800];
         int rl;
 
-        if (g_port == 80)
-            rl = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\n"
+        if (g_port == (g_https ? 443 : 80))
+            rl = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\n"
                           "User-Agent: MyOS-wget/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
                           g_path, g_host);
         else
-            rl = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s:%d\r\n"
+            rl = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s:%d\r\n"
                           "User-Agent: MyOS-wget/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
                           g_path, g_host, g_port);
 
-        if (send_all(s, req, (size_t)rl) != rl) {
+        if (c_send(s, req, (size_t)rl) != rl) {
             printf("wget: cannot send the request\n");
-            close(s);
+            c_close(s);
             return 1;
         }
 
@@ -306,11 +370,11 @@ int main(int argc, char **argv)
 
         while (body_at < 0) {
 
-            long n = recv(s, hdr + hl, (size_t)(HDR_MAX - hl));
+            long n = c_recv(s, hdr + hl, (size_t)(HDR_MAX - hl));
 
             if (n <= 0) {
-                printf("wget: %s\n", n < 0 ? strerror((int)n) : "the server closed the connection");
-                close(s);
+                printf("wget: %s\n", n < 0 ? c_err(n) : "the server closed the connection");
+                c_close(s);
                 return 1;
             }
 
@@ -325,7 +389,7 @@ int main(int argc, char **argv)
 
             if (body_at < 0 && hl >= HDR_MAX) {
                 printf("wget: the answer headers are too long\n");
-                close(s);
+                c_close(s);
                 return 1;
             }
         }
@@ -346,11 +410,12 @@ int main(int argc, char **argv)
 
         if (code >= 300 && code < 400 && header(hdr, "Location", val, sizeof(val))) {
 
-            close(s);
+            c_close(s);
 
             if (val[0] == '/') {
                 char tmp[640];
-                snprintf(tmp, sizeof(tmp), "http://%s:%d%s", g_host, g_port, val);
+                snprintf(tmp, sizeof(tmp), "%s://%s:%d%s", g_https ? "https" : "http",
+                         g_host, g_port, val);
                 strcpy(cur_url, tmp);
             } else {
                 strncpy(cur_url, val, sizeof(cur_url) - 1);
@@ -382,7 +447,7 @@ int main(int argc, char **argv)
             g_out = open(fname, O_WRITE | O_CREATE | O_TRUNC);
             if (g_out < 0) {
                 printf("wget: cannot create '%s': %s\n", fname, strerror(g_out));
-                close(s);
+                c_close(s);
                 return 1;
             }
             if (!quiet) {
@@ -406,13 +471,13 @@ int main(int argc, char **argv)
 
         while (!fail && (total < 0 || (long long)got < total) && g_chunk_state != 3) {
 
-            long n = recv(s, buf, 8192);
+            long n = c_recv(s, buf, 8192);
 
             if (n == 0)
                 break;
 
             if (n < 0) {
-                printf("\nwget: %s\n", strerror((int)n));
+                printf("\nwget: %s\n", c_err(n));
                 fail = 1;
                 break;
             }
@@ -431,7 +496,7 @@ int main(int argc, char **argv)
             }
         }
 
-        close(s);
+        c_close(s);
 
         if (!g_screen && !g_null)
             close(g_out);

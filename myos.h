@@ -2738,6 +2738,11 @@ void run_command(
 );
 
 
+/* --- kernel/random.c --- */
+void krandom_stir(UINT64 v);
+void krandom_fill(void *buf, UINTN n);
+BOOLEAN krandom_hw(void);
+
 /* --- net/ (этап 8: сеть) - подробности в net/net.h --- */
 void net_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 BOOLEAN net_running(void);

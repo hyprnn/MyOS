@@ -34,6 +34,8 @@ UINT64 g_kbd_rep_next_tsc = 0;
 
 void kbd_enqueue(UINT16 scan, CHAR16 uc)
 {
+    krandom_stir(((UINT64)scan << 16) | uc);   /* момент нажатия - в "шум" */
+
     UINTN next = (g_kbd_q_tail + 1u) % KBD_QUEUE_SIZE;
 
     if (next == g_kbd_q_head)

@@ -33,6 +33,8 @@ int  sleep_ms(unsigned long ms)               { return (int)syscall3(SYS_SLEEP, 
 unsigned long uptime_ms(void)                 { return (unsigned long)syscall3(SYS_UPTIME, 0, 0, 0); }
 int  getpid(void)                             { return (int)syscall3(SYS_GETPID, 0, 0, 0); }
 int  gettime(struct myos_time *t)             { return (int)syscall3(SYS_TIME, (long)t, 0, 0); }
+int  gettime_utc(struct myos_time *t)         { return (int)syscall3(SYS_TIME, (long)t, 1, 0); }
+long getrandom(void *buf, size_t n)           { return syscall3(SYS_GETRANDOM, (long)buf, (long)n, 0); }
 int  readdir(const char *p, int i, struct myos_dirent *d) { return (int)syscall3(SYS_READDIR, (long)p, i, (long)d); }
 int  stat(const char *p, struct myos_dirent *d) { return (int)syscall3(SYS_STAT, (long)p, (long)d, 0); }
 int  mkdir(const char *path)                  { return (int)syscall3(SYS_MKDIR, (long)path, 0, 0); }

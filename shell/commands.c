@@ -361,7 +361,7 @@ void run_command(
             "                  ifconfig eth0 192.168.1.50/24 gw 192.168.1.1 dns 1.1.1.1\n"
             "  ping <host>   - are you there? (ping -c N, ping -t)\n"
             "  nslookup <n>  - name -> address (DNS)\n"
-            "  wget <url>    - download over HTTP (wget -O - url: to the screen)\n"
+            "  wget <url>    - download over HTTP or HTTPS (wget -O - url: to the screen)\n"
             "  nc <h> <port> - raw TCP connection; nc -l <port> - wait for one\n"
             "  httpd [port] [folder] - a small web server\n"
             "  nettest       - TCP/UDP self-test over 127.0.0.1\n"

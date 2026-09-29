@@ -37,6 +37,8 @@ unsigned long uptime_ms(void);
 void *sbrk(long inc);
 int  getpid(void);
 int  gettime(struct myos_time *t);
+int  gettime_utc(struct myos_time *t);     /* всемирное время (UTC) */
+long getrandom(void *buf, size_t n);       /* случайные байты (до 4096) */
 int  readdir(const char *path, int index, struct myos_dirent *d);
 int  stat(const char *path, struct myos_dirent *d);
 int  mkdir(const char *path);
@@ -100,6 +102,20 @@ int  netinfo(int index, struct myos_netif *ni);         /* 1 - есть, 0 - к�
 int  netctl(struct myos_netctl *c);
 char *ip_to_str(unsigned int ip, char *buf);            /* buf >= 16 байт */
 int  str_to_ip(const char *s, unsigned int *ip);        /* 1 - разобрали */
+
+/* --- TLS / HTTPS (user/tls/, на BearSSL) --- */
+typedef struct myos_tls TLS;
+#define TLS_NO_VERIFY 1        /* не проверять сертификат (--no-check-certificate) */
+/* рукопожатие поверх соединённого TCP-сокета fd; host - имя сайта (для
+   проверки сертификата); ca_file - PEM с доп. корнями или NULL.
+   NULL - не вышло, причина - в err */
+TLS  *tls_open(int fd, const char *host, int flags, const char *ca_file,
+               char *err, size_t errcap);
+long  tls_send(TLS *t, const void *buf, size_t n);
+long  tls_recv(TLS *t, void *buf, size_t n);          /* 0 - конец, <0 - ошибка */
+void  tls_error(TLS *t, char *err, size_t cap);
+void  tls_info(TLS *t, char *buf, size_t cap);        /* версия и шифр */
+void  tls_close(TLS *t);
 
 /* --- разное --- */
 unsigned int rand(void);

@@ -64,6 +64,24 @@ APPS    := $(sort $(basename $(notdir $(wildcard user/apps/*.c))))
 ULIB    := $(patsubst user/lib/%,build/user/lib/%.o,$(basename $(wildcard user/lib/*.c user/lib/*.S)))
 APP_ELFS:= $(APPS:%=build/user/%)
 
+# TLS (HTTPS) для программ: BearSSL (third_party/bearssl, MIT) + обёртка
+# MyOS и корневые сертификаты (user/tls/). Всё - в архив libtls.a:
+# компоновщик берёт из него только нужное, поэтому программы без TLS
+# не растут. Настройки BearSSL: ни времени, ни случайных чисел ОС (их
+# даёт ядро MyOS через системные вызовы), без интринсиков AES-NI/SSE2
+# (им нужны заголовки libc хоста).
+BSSL_DIR   := third_party/bearssl
+BSSL_SRCS  := $(sort $(wildcard $(BSSL_DIR)/src/*.c $(BSSL_DIR)/src/*/*.c))
+BSSL_OBJS  := $(BSSL_SRCS:$(BSSL_DIR)/src/%.c=build/user/bearssl/%.o)
+BSSL_CFLAGS:= -O2 -ffreestanding -fno-stack-protector -fno-stack-check -fno-pic -fno-pie \
+              -fno-builtin -fno-asynchronous-unwind-tables -fno-ident -U_FORTIFY_SOURCE \
+              -I$(BSSL_DIR)/myos -I$(BSSL_DIR)/inc -I$(BSSL_DIR)/src \
+              -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0 -DBR_USE_URANDOM=0 \
+              -DBR_USE_WIN32_RAND=0 -DBR_RDRAND=0 -DBR_AES_X86NI=0 -DBR_SSE2=0 \
+              -DBR_POWER8=0 -DBR_64=1 -DBR_LE_UNALIGNED=1
+TLS_OBJS   := build/user/tls/tls.o build/user/tls/roots.o
+TLS_LIB    := build/user/libtls.a
+
 QEMU_DEV := -device qemu-xhci -device usb-mouse -device usb-kbd
 # сеть в QEMU: по умолчанию карта e1000 + "user"-сеть (DHCP, шлюз 10.0.2.2
 # = хост, DNS 10.0.2.3). Например, открыть httpd из браузера хоста:
@@ -97,9 +115,24 @@ build/user/apps/%.o: user/apps/%.c user/include/myos.h sysnum.h
 	@echo "  CC  [user] $<"
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
-build/user/%: build/user/apps/%.o $(ULIB) user/user.ld
+build/user/bearssl/%.o: $(BSSL_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  [bearssl] $<"
+	@$(CC) $(BSSL_CFLAGS) -c $< -o $@
+
+build/user/tls/%.o: user/tls/%.c user/tls/tls.h sysnum.h
+	@mkdir -p $(dir $@)
+	@echo "  CC  [user] $<"
+	@$(CC) $(BSSL_CFLAGS) -Wall -Wextra -Iuser/tls -I. -c $< -o $@
+
+$(TLS_LIB): $(TLS_OBJS) $(BSSL_OBJS)
+	@echo "  AR  $@"
+	@rm -f $@
+	@ar rcs $@ $^
+
+build/user/%: build/user/apps/%.o $(ULIB) $(TLS_LIB) user/user.ld
 	@echo "  LD  [user] $@"
-	@$(LD) $(ULDFLAGS) -o $@ build/user/lib/crt0.o $(filter-out build/user/lib/crt0.o,$(ULIB)) $<
+	@$(LD) $(ULDFLAGS) -o $@ build/user/lib/crt0.o $(filter-out build/user/lib/crt0.o,$(ULIB)) $< $(TLS_LIB)
 
 # Вклеить программы в ядро: таблица {имя, начало, конец}
 build/apps.S: $(APP_ELFS) Makefile

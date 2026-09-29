@@ -182,7 +182,7 @@ class VM:
 BIG_DATA = bytes((i * 7) & 255 for i in range(300000))
 
 
-def make_test_disk(path, mib, bits, scheme, label):
+def make_test_disk(path, mib, bits, scheme, label, extra=None):
     """Диск с FAT и файлами "как с Linux": короткое и длинное имя,
     папка, большой файл (300 000 байт, много кластеров)"""
     b = fatimg.FatBuilder(mib * 2048 - 4096, bits, label)
@@ -194,6 +194,8 @@ def make_test_disk(path, mib, bits, scheme, label):
     if os.path.exists('build/user/hello'):
         a = b.mkdir(b.root, 'apps')
         b.add_file(a, 'hello', open('build/user/hello', 'rb').read())
+    for name, data in (extra or {}).items():
+        b.add_file(b.root, name, data)
     fatimg.make_disk(path, mib, b.build(), scheme)
 
 
@@ -246,7 +248,42 @@ def start_host_http(folder):
         def log_message(self, *args):
             pass
 
+        def do_GET(self):
+            # /to-https -> переадресация на HTTPS-сервер (как делают сайты)
+            if self.path == '/to-https':
+                self.send_response(301)
+                self.send_header('Location', 'https://10.0.2.2:%d/hello.txt' % HTTPS_PORT[0])
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            super().do_GET()
+
     srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Quiet)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
+
+
+HTTPS_PORT = [0]
+TLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tls-test')
+
+
+def start_host_https(folder):
+    """HTTPS-сервер на хосте с тестовым сертификатом (tools/tls-test,
+    ECDSA, для 10.0.2.2) - те же файлы, что у HTTP-сервера. На него
+    ведёт переадресация /to-https HTTP-сервера."""
+    import ssl
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, directory=folder, **kw)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Quiet)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(os.path.join(TLS_DIR, 'server.pem'), os.path.join(TLS_DIR, 'server.key'))
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv.server_address[1]
 
@@ -564,6 +601,7 @@ def main():
         # файл проверяется), httpd внутри MyOS (хост скачивает у него),
         # адрес вручную и снова DHCP, самопроверка WPA2
         hp = start_host_http(os.path.join(work, 'www'))
+        HTTPS_PORT[0] = hsp = start_host_https(os.path.join(work, 'www'))
         fwd = free_port()
         crc = 'CRC-32 %08x' % zlib.crc32(BIG_DATA)
         url = 'http://10.0.2.2:%d' % hp
@@ -578,6 +616,19 @@ def main():
             ('nslookup localhost\n', 'Address: 127.0.0.1', 15),
             ('wget -O - %s/hello.txt\n' % url, 'Hello from the host over HTTP!', 20),
             ('wget -O /usb0p1/dl.bin %s/big.bin\n' % url, crc, 40),
+            # HTTPS (TLS на BearSSL): чужой сертификат - отказ; с корнем
+            # тестового центра - проверка проходит, файл - на флешку;
+            # переадресация http -> https; режим без проверки
+            ('wget -O - https://10.0.2.2:%d/hello.txt\n' % hsp,
+             'not signed by a known authority', 30),
+            ('wget --ca-certificate /usb0p1/ca.pem -O /usb0p1/tls.bin https://10.0.2.2:%d/big.bin\n'
+             % hsp, crc, 60),
+            ('', 're:TLS 1\\.2, ECDHE-ECDSA', 5),
+            ('wget --ca-certificate /usb0p1/ca.pem -O - %s/to-https\n' % url,
+             'Hello from the host over HTTP!', 60),
+            ('', 'Redirected to https://', 5),
+            ('wget --no-check-certificate -O - https://10.0.2.2:%d/hello.txt\n' % hsp,
+             'Hello from the host over HTTP!', 60),
             ('net drop 10\n', 'every 10-th received frame', 10),
             ('wget -O null %s/big.bin\n' % url, crc, 90),
             ('net drop 0\n', 'Test mode off', 10),
@@ -597,6 +648,7 @@ def main():
             net_steps += [
                 ('nslookup example.com\n', 're:Address: +[0-9]+\\.', 20),
                 ('wget -O null http://example.com/\n', 'Done:', 40),
+                ('wget -O null https://example.com/\n', 'Done:', 60),
             ]
         runs.append(('network', net_steps,
                      ['-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:%d-:80' % fwd,
@@ -670,7 +722,8 @@ def main():
     make_test_disk(os.path.join(work, 'stick2.img'), 40, 16, 'none', 'STICK2')
     make_test_disk(os.path.join(work, 'sata.img'), 40, 16, 'gpt', 'SATADISK')
     make_test_disk(os.path.join(work, 'nvme.img'), 80, 32, 'gpt', 'NVME')
-    make_test_disk(os.path.join(work, 'netstick.img'), 64, 32, 'mbr', 'NETSTICK')
+    make_test_disk(os.path.join(work, 'netstick.img'), 64, 32, 'mbr', 'NETSTICK',
+                   {'ca.pem': open(os.path.join(TLS_DIR, 'ca.pem'), 'rb').read()})
 
     for run in runs:
         name, steps = run[0], run[1]
@@ -697,7 +750,7 @@ def main():
                               '/a/x/inner.txt': b'deep\n', '/x': None,
                               '/BIG.BIN': BIG_DATA}),
                 ('stick2.img', {'/HOST.TXT': b'Hello from the host!\n'}),
-                ('netstick.img', {'/dl.bin': BIG_DATA})):
+                ('netstick.img', {'/dl.bin': BIG_DATA, '/tls.bin': BIG_DATA})):
             problems = check_disk(os.path.join(work, img), expect)
             print('%-4s %-14s -> %s' % ('PASS' if not problems else 'FAIL', '[fsck ' + img + ']',
                                         'consistent, files as expected' if not problems else ''))
