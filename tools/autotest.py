@@ -1027,6 +1027,29 @@ def main():
             ('wifi disconnect\n', 'Wi-Fi disconnected', 10),
             ('wifi\n', 'not connected', 10),
         ]))
+        # запомнить сеть (этап 9): wifi save пишет EFI/MyOS/wifi.cfg на
+        # диск загрузки (q35: он виден как /sata0); после "перезагрузки"
+        # с того же диска сеть известна, 'wifi connect' без имени
+        # подключается к ней; wifi forget стирает файл
+        runs.append(('wifi-save', [
+            (None, "Type 'help'", 90),
+            ('wifi sim\n', 'interface wlan0 ready', 20),
+            ('wifi save\n', 'Connect first', 10),
+            ('wifi connect MyOS-Test myos-wifi-test\n',
+             'Wi-Fi is up: wlan0 address 192.168.77.2', 60),
+            ('wifi save\n', "Saved network 'MyOS-Test' to /sata0/EFI/MyOS/wifi.cfg", 15),
+            ('cat /sata0/efi/myos/wifi.cfg\n', 're:psk=[0-9a-f]{64}', 15),
+        ], ['-machine', 'q35']))
+        CUSTOM_BOOT_DISKS['wifi-save-reboot'] = os.path.join(work, 'wifi-save.img')
+        runs.append(('wifi-save-reboot', [
+            (None, "saved Wi-Fi network 'MyOS-Test' - but no Wi-Fi adapter", 90),
+            ('', "Type 'help'", 30),
+            ('wifi sim\n', 'interface wlan0 ready', 20),
+            ('wifi\n', "Saved network: 'MyOS-Test'", 15),
+            ('wifi connect\n', 'Wi-Fi is up: wlan0 address 192.168.77.2', 60),
+            ('wifi forget\n', 'Forgot the saved network', 15),
+            ('wifi connect\n', 'usage: wifi connect', 15),
+        ], ['-machine', 'q35']))
         # часовые пояса: часы машины - 15 января 10:00 UTC (зима):
         # Москва 13:00 (UTC+3), Иерусалим 12:00 (IST, UTC+2)
         runs.append(('timezone-winter', [

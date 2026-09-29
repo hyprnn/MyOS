@@ -1351,6 +1351,64 @@ void wlan_cmd_connect(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *ssid, const
     if (pass)
         pbkdf2_sha1((const UINT8 *)pass, pl, (const UINT8 *)ssid, sl, 4096, pmk, 32);
 
+    wlan_cmd_connect_key(out, ssid, pass ? pmk : NULL, TRUE);
+}
+
+/* Что сейчас выбрано для подключения (для wifi save): имя сети и
+   ключ PMK (не пароль - его мы не храним). FALSE - никуда не
+   подключаемся. */
+BOOLEAN wlan_current(char *ssid, UINTN cap, UINT8 pmk[32], BOOLEAN *has_pass)
+{
+    BOOLEAN ok = FALSE;
+
+    kmutex_lock(&g_net_mutex);
+
+    if (g_wl.want && g_wl.ssid_len > 0 && (UINTN)g_wl.ssid_len + 1 <= cap) {
+        memcpy(ssid, g_wl.ssid, g_wl.ssid_len);
+        ssid[g_wl.ssid_len] = '\0';
+        memcpy(pmk, g_wl.pmk, 32);
+        *has_pass = g_wl.has_pass;
+        ok = TRUE;
+    }
+
+    kmutex_unlock(&g_net_mutex);
+    return ok;
+}
+
+/* Есть ли адаптер, для которого у нас есть драйвер (не включая его) */
+BOOLEAN wlan_hw_available(void)
+{
+    if (g_wl.hw != NULL)
+        return TRUE;
+
+    for (UINTN nth = 0; nth < 8; nth++) {
+
+        UINT8 b, d, f;
+
+        if (!pci_find_class(0x02, 0x80, -1, nth, &b, &d, &f))
+            break;
+
+        UINT32 id = pci_config_read32(b, d, f, 0);
+
+        if ((UINT16)id == 0x10EC && ((id >> 16) == 0xC821 || (id >> 16) == 0xB821))
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+/* Подключиться по готовому ключу (pmk = NULL - открытая сеть).
+   wait - ждать результата, печатая журнал (команда); FALSE - только
+   включить адаптер и попросить поток wlan подключаться (при загрузке:
+   он сам будет пробовать, пока сеть не найдётся). */
+void wlan_cmd_connect_key(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *ssid, const UINT8 *pmk,
+                          BOOLEAN wait)
+{
+    UINTN sl = wl_strlen(ssid);
+
+    if (sl == 0 || sl > 32)
+        return;
+
     kmutex_lock(&g_net_mutex);
 
     if (!wlan_up(out) || !g_wl.started) {
@@ -1372,11 +1430,17 @@ void wlan_cmd_connect(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *ssid, const
     memcpy(g_wl.ssid, ssid, sl);
     g_wl.ssid[sl] = '\0';
     g_wl.ssid_len = (UINT8)sl;
-    g_wl.has_pass = pass != NULL;
-    if (pass)
+    g_wl.has_pass = pmk != NULL;
+    if (pmk)
         memcpy(g_wl.pmk, pmk, 32);
     g_wl.want = TRUE;
     g_wl.next_try_ms = 0;
+
+    if (!wait) {
+        net_wake(&g_wl);
+        kmutex_unlock(&g_net_mutex);
+        return;
+    }
 
     UINT32 seq = g_wl.log_seq;
     UINT32 att = g_wl.attempt;

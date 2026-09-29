@@ -2868,6 +2868,12 @@ INTN net_sys_info(UINTN idx, struct myos_netif *out);
 INTN net_sys_ctl(const struct myos_netctl *c);
 void kernel_cmd_net(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
+void wifi_boot_autoconnect(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
+/* --- kernel/settings.c (настройки в EFI/MyOS тома загрузки, этап 9) --- */
+BOOLEAN settings_boot_volume(char *vol, UINTN cap);
+BOOLEAN settings_path(const char *name, char *out, UINTN cap);
+INTN settings_write(const char *name, const void *data, UINTN n, char *where, UINTN cap);
 BOOLEAN net_status_line(char *buf, UINTN cap);
 void net_gui_indicator(char *buf, UINTN cap);
 

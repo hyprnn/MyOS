@@ -433,6 +433,8 @@ static void wifi_selftest(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
  * Команда wifi
  * ================================================================ */
 
+static void wifi_show_saved(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
 static void wifi_list(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
     UINTN n = 0;
@@ -481,8 +483,9 @@ static void wifi_list(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     if (wlan_present()) {
         print(out, "\n");
         wlan_cmd_status(out, FALSE);
+        wifi_show_saved(out);
         print(out, "Commands: wifi scan | wifi connect <name> [password] | wifi disconnect |\n"
-                   "          wifi debug | wifi selftest\n");
+                   "          wifi save | wifi forget | wifi debug | wifi selftest\n");
         return;
     }
 
@@ -491,7 +494,9 @@ static void wifi_list(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
               "\nMyOS has a radio driver for this adapter (Realtek RTL8821CE):\n"
               "  wifi scan                        - list networks around\n"
               "  wifi connect <name> <password>   - connect (WPA2 or open network)\n"
-              "  wifi disconnect | wifi debug | wifi selftest\n");
+              "  wifi save                        - remember it: connect at every start\n"
+              "  wifi disconnect | wifi forget | wifi debug | wifi selftest\n");
+        wifi_show_saved(out);
         return;
     }
 
@@ -540,8 +545,204 @@ static const char *wifi_word(const char *s, char *out, UINTN cap)
     return s;
 }
 
+/* ================================================================
+ * Запомненная сеть (этап 9): файл wifi.cfg в папке EFI/MyOS тома, с
+ * которого загрузились (kernel/settings.c). Пишется ТОЛЬКО командой
+ * wifi save. Хранится не пароль, а ключ PMK (64 шестнадцатеричные
+ * цифры, как psk= у wpa_supplicant): пароль из него не восстановить,
+ * но к этой сети по нему подключиться можно - файл надо беречь так же,
+ * как пароль.
+ * ================================================================ */
+
+#define WIFI_CFG "wifi.cfg"
+
+typedef struct {
+    char    ssid[33];
+    BOOLEAN has_pass;
+    UINT8   pmk[32];
+} WIFI_SAVED;
+
+static INT32 hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Прочитать wifi.cfg: строки "ssid=..." и "psk=<64 hex>" или "psk=open" */
+static BOOLEAN wifi_load_saved(WIFI_SAVED *w, char *where, UINTN cap)
+{
+    char buf[512];
+    UINTN got = 0;
+
+    if (!settings_path(WIFI_CFG, where, cap))
+        return FALSE;
+
+    if (vfs_read_file(where, buf, sizeof(buf) - 1, &got) != VFS_OK)
+        return FALSE;
+
+    buf[got] = '\0';
+
+    BOOLEAN have_ssid = FALSE, have_psk = FALSE;
+    char *line = buf;
+
+    w->ssid[0] = '\0';
+    w->has_pass = FALSE;
+
+    while (*line) {
+
+        char *end = line;
+        while (*end && *end != '\n' && *end != '\r')
+            end++;
+        char save = *end;
+        *end = '\0';
+
+        if (line[0] == 's' && line[1] == 's' && line[2] == 'i' && line[3] == 'd' && line[4] == '=') {
+            UINTN n = 0;
+            for (const char *c = line + 5; *c && n < 32; c++)
+                w->ssid[n++] = *c;
+            w->ssid[n] = '\0';
+            have_ssid = n > 0;
+        } else if (line[0] == 'p' && line[1] == 's' && line[2] == 'k' && line[3] == '=') {
+            const char *h = line + 4;
+            if (kstreq(h, "open")) {
+                have_psk = TRUE;
+            } else {
+                UINTN i = 0;
+                for (; i < 32; i++) {
+                    INT32 a = hexval(h[2 * i]), b = (a >= 0) ? hexval(h[2 * i + 1]) : -1;
+                    if (a < 0 || b < 0)
+                        break;
+                    w->pmk[i] = (UINT8)(a * 16 + b);
+                }
+                if (i == 32) {
+                    w->has_pass = TRUE;
+                    have_psk = TRUE;
+                }
+            }
+        }
+
+        *end = save;
+        line = end;
+        while (*line == '\n' || *line == '\r')
+            line++;
+    }
+
+    return have_ssid && have_psk;
+}
+
+static void wifi_show_saved(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    WIFI_SAVED w;
+    char where[96];
+
+    if (wifi_load_saved(&w, where, sizeof(where)))
+        kprintf(out, "Saved network: '%s' (%s) - connects at start; 'wifi connect' alone\n"
+                     "uses it now.\n", w.ssid, where);
+}
+
+static void wifi_cmd_save(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    WIFI_SAVED w;
+
+    if (!wlan_current(w.ssid, sizeof(w.ssid), w.pmk, &w.has_pass)) {
+        print(out, "Connect first ('wifi connect <name> <password>'), then 'wifi save'.\n");
+        return;
+    }
+
+    char text[256];
+    UINTN n = ksnprintf(text, sizeof(text),
+                        "# MyOS: saved Wi-Fi network ('wifi save'; 'wifi forget' deletes this file)\n"
+                        "ssid=%s\npsk=", w.ssid);
+
+    if (w.has_pass) {
+        for (UINTN i = 0; i < 32 && n + 3 < sizeof(text); i++)
+            n += ksnprintf(text + n, sizeof(text) - n, "%02x", w.pmk[i]);
+    } else {
+        n += ksnprintf(text + n, sizeof(text) - n, "open");
+    }
+
+    n += ksnprintf(text + n, sizeof(text) - n, "\n");
+
+    char where[96];
+    INTN r = settings_write(WIFI_CFG, text, n, where, sizeof(where));
+
+    if (r == -1) {
+        print(out, "Cannot find the disk MyOS booted from (MyOS keeps settings next to its\n"
+                   "kernel, in EFI/MyOS). Nothing was written.\n");
+        return;
+    }
+
+    if (r != VFS_OK) {
+        kprintf(out, "Could not write %s: %s\n", where, vfs_strerror(r));
+        return;
+    }
+
+    kprintf(out, "Saved network '%s' to %s\n", w.ssid, where);
+    print(out, "MyOS will connect to it by itself at every start. The file holds the WPA\n"
+               "key, not the password text - keep it private. 'wifi forget' deletes it.\n");
+}
+
+static void wifi_cmd_forget(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    char where[96];
+
+    if (!settings_path(WIFI_CFG, where, sizeof(where))) {
+        print(out, "No saved network.\n");
+        return;
+    }
+
+    INTN r = vfs_remove(where);
+
+    if (r == VFS_OK)
+        kprintf(out, "Forgot the saved network (%s deleted).\n", where);
+    else
+        print(out, "No saved network.\n");
+}
+
+/* При загрузке (kmain, после сети): есть запомненная сеть - включить
+   Wi-Fi и подключаться в фоне, не задерживая загрузку */
+void wifi_boot_autoconnect(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    WIFI_SAVED w;
+    char where[96];
+
+    if (!wifi_load_saved(&w, where, sizeof(where)))
+        return;
+
+    if (!wlan_hw_available()) {
+        kprintf(out, "  saved Wi-Fi network '%s' - but no Wi-Fi adapter to use it\n", w.ssid);
+        return;
+    }
+
+    kprintf(out, "  saved Wi-Fi network '%s' - connecting in the background\n", w.ssid);
+    wlan_cmd_connect_key(out, w.ssid, w.has_pass ? w.pmk : NULL, FALSE);
+}
+
 void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
 {
+    if (kstreq(arg, "save")) {
+        wifi_cmd_save(out);
+        return;
+    }
+
+    if (kstreq(arg, "forget")) {
+        wifi_cmd_forget(out);
+        return;
+    }
+
+    /* wifi connect без имени - к запомненной сети */
+    if (kstreq(arg, "connect")) {
+        WIFI_SAVED w;
+        char where[96];
+        if (wifi_load_saved(&w, where, sizeof(where))) {
+            kprintf(out, "Saved network '%s' (%s)\n", w.ssid, where);
+            wlan_cmd_connect_key(out, w.ssid, w.has_pass ? w.pmk : NULL, TRUE);
+            return;
+        }
+    }
+
     if (kstreq(arg, "selftest") || kstreq(arg, "test")) {
         wifi_selftest(out);
         return;
@@ -646,6 +847,7 @@ void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
 
     if (arg[0] != '\0') {
         print(out, "usage: wifi | wifi scan | wifi connect <name> [password] | wifi disconnect\n"
+                   "       wifi save | wifi forget | wifi connect   (the saved network)\n"
                    "       wifi debug | wifi selftest | wifi psk <network> <password>\n");
         return;
     }

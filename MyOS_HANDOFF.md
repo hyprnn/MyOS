@@ -528,6 +528,16 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   на узле с `_BCM` (обработчик на корне) — шаг ±10% / соседний уровень.
   Минимум 5%. Проверка: `LCD0` в `tools/test-battery.asl`, прогон
   `acpi-power`.
+* **Настройки** (`kernel/settings.c`): том загрузки = диск FAT, где по пути
+  `g_boot.kernel_path` лежит файл размером `g_boot.kernel_file_size`;
+  настройки — в его `EFI/MyOS/` (папка создаётся при первой записи).
+  Wi-Fi (`net/wifi.c`): `wifi save` → `wifi.cfg` (`ssid=`, `psk=` 64 hex
+  PMK или `open`), `wifi forget`, `wifi connect` без имени;
+  `wifi_boot_autoconnect` в `kmain` после `net_init`: есть адаптер →
+  `wlan_cmd_connect_key(..., wait=FALSE)` (поток wlan пробует сам). Пишется
+  только по команде. Проверка: прогоны `wifi-save` и `wifi-save-reboot`
+  (q35 — диск загрузки виден как `/sata0`; второй прогон грузится с того же
+  образа).
 * **Установка на диск** (`tools/install-arch.sh`, запуск из Arch): копирует
   загрузчик и ядро в `<ESP>/EFI/MyOS/`, пишет `<ESP>/loader/entries/myos.conf`
   (`efi /EFI/MyOS/BOOTX64.EFI`); `--menu` = `bootctl set-timeout 3`

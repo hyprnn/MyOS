@@ -68,6 +68,10 @@ BOOLEAN wlan_up(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 BOOLEAN wlan_use_hw(SIMPLE_TEXT_OUTPUT_INTERFACE *out, WLAN_HW *hw);
 void    wlan_cmd_scan(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void    wlan_cmd_connect(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *ssid, const char *pass);
+void    wlan_cmd_connect_key(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *ssid, const UINT8 *pmk,
+                             BOOLEAN wait);
+BOOLEAN wlan_current(char *ssid, UINTN cap, UINT8 pmk[32], BOOLEAN *has_pass);
+BOOLEAN wlan_hw_available(void);
 void    wlan_cmd_disconnect(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void    wlan_cmd_status(SIMPLE_TEXT_OUTPUT_INTERFACE *out, BOOLEAN debug);
 BOOLEAN wlan_present(void);
