@@ -44,6 +44,7 @@ typedef struct SOCKET {
     UINT8   qh, qn;
     UINT16  icmp_id;
     UINT64  timeout_ms;        /* 0 - ждать сколько угодно */
+    BOOLEAN nonblock;          /* не ждать вовсе (MYOS_SO_NONBLOCK) */
     UINT64  dropped;
 } SOCKET;
 
@@ -117,6 +118,11 @@ static INTN sock_wait(SOCKET *k, UINT64 deadline, const char *what)
 {
     if (sock_interrupted())
         return MYOS_EINTR;
+
+    /* неблокирующий сокет: "пока нельзя" - сразу, программа спросит
+       снова, когда poll скажет, что можно */
+    if (k->nonblock)
+        return MYOS_EAGAIN;
 
     UINT64 now = net_now_ms();
     UINT64 slice = 100;
@@ -371,6 +377,13 @@ INTN sock_connect(INTN s, UINT32 ip, UINT16 port)
             break;
         }
 
+        if (k->nonblock) {
+            /* соединение устанавливается дальше само; готовность -
+               poll (можно писать), итог - MYOS_SO_ERROR */
+            kmutex_unlock(&g_net_mutex);
+            return MYOS_EINPROGRESS;
+        }
+
         INTN w = sock_wait(k, dl, "tcp connect");
 
         if (w != 0) {
@@ -520,6 +533,12 @@ INTN sock_sendto(INTN s, const void *buf, UINTN n, UINT32 ip, UINT16 port)
         }
 
         while (done < n) {
+
+            /* неблокирующий connect ещё идёт - писать пока некуда */
+            if (k->nonblock && (t->state == TCP_SYN_SENT || t->state == TCP_SYN_RCVD)) {
+                r = MYOS_EAGAIN;
+                break;
+            }
 
             if (t->state != TCP_ESTABLISHED && t->state != TCP_CLOSE_WAIT) {
                 r = t->error ? t->error : MYOS_ENOTCONN;
@@ -727,12 +746,101 @@ INTN sock_setopt(INTN s, UINT32 opt, UINT64 val)
         r = MYOS_EBADF;
     else if (opt == MYOS_SO_TIMEOUT)
         k->timeout_ms = val;
-    else
+    else if (opt == MYOS_SO_NONBLOCK)
+        k->nonblock = (val != 0);
+    else if (opt == MYOS_SO_ERROR) {
+        /* как идёт соединение (неблокирующий connect) */
+        TCB *t = k->tcb;
+        if (k->type != MYOS_SOCK_STREAM || t == NULL)
+            r = 0;
+        else if (t->state == TCP_SYN_SENT || t->state == TCP_SYN_RCVD)
+            r = MYOS_EINPROGRESS;
+        else if (t->state == TCP_CLOSED && !k->connected)
+            r = t->error ? t->error : MYOS_ECONNREFUSED;
+        else {
+            k->connected = TRUE;
+            r = 0;
+        }
+    } else if (opt == MYOS_SO_LOCALADDR) {
+        UINT32 ip = k->lip;
+        if (ip == 0 && k->tcb != NULL)
+            ip = k->tcb->lip;
+        r = (INTN)(((UINT64)ip << 16) | k->lport);
+    } else
         r = MYOS_EINVAL;
 
     kmutex_unlock(&g_net_mutex);
 
     return r;
+}
+
+/*
+ * Что с сокетом можно сделать без ожидания (для poll): MYOS_POLLIN -
+ * есть данные или конец потока (recv не будет ждать), MYOS_POLLOUT -
+ * есть место для send (или неблокирующий connect закончился),
+ * MYOS_POLLHUP/ERR - соединение закрыто / не удалось.
+ */
+UINT32 sock_poll(INTN s)
+{
+    kmutex_lock(&g_net_mutex);
+
+    SOCKET *k = sock_get(s);
+    UINT32 ev = 0;
+
+    if (k == NULL)
+        ev = MYOS_POLLNVAL;
+    else if (k->type != MYOS_SOCK_STREAM) {
+        if (k->qn > 0)
+            ev |= MYOS_POLLIN;
+        ev |= MYOS_POLLOUT;
+    } else if (k->tcb == NULL) {
+        ev = MYOS_POLLHUP;
+    } else if (k->tcb->state == TCP_LISTEN) {
+        for (UINTN i = 0; i < TCB_MAX; i++) {
+            TCB *t = &g_tcb[i];
+            if (t->used && t->listener == k->tcb && !t->accepted &&
+                (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT)) {
+                ev |= MYOS_POLLIN;
+                break;
+            }
+        }
+    } else {
+        TCB *t = k->tcb;
+        if (t->rbuf_len > 0 || t->rcv_fin)
+            ev |= MYOS_POLLIN;
+        if ((t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) &&
+            t->sbuf_len < TCP_SBUF)
+            ev |= MYOS_POLLOUT;
+        if (t->state == TCP_CLOSED) {
+            ev |= MYOS_POLLIN | MYOS_POLLHUP;
+            if (t->error || !k->connected)
+                ev |= MYOS_POLLERR | MYOS_POLLOUT;
+        }
+    }
+
+    kmutex_unlock(&g_net_mutex);
+
+    return ev;
+}
+
+/*
+ * Ожидание для poll: check (проверка всех fd программы) - под замком
+ * сети, и сон - сразу после неё, не отпуская замка до net_wait: так
+ * событие, случившееся между проверкой и сном, не потеряется (его
+ * net_wake придёт, когда мы уже ждём). TRUE - check сказал "готово".
+ */
+BOOLEAN sock_poll_wait(BOOLEAN (*check)(void *ctx), void *ctx, UINT64 slice_ms)
+{
+    kmutex_lock(&g_net_mutex);
+
+    BOOLEAN ready = check(ctx);
+
+    if (!ready)
+        net_wait(&g_net_any_event, "poll", slice_ms);
+
+    kmutex_unlock(&g_net_mutex);
+
+    return ready;
 }
 
 /* Сколько байт можно прочитать без ожидания; <0 - ошибка/закрыт */

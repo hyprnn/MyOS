@@ -123,8 +123,50 @@ PCFLAGS    := -O2 -fno-stack-protector -fno-stack-check -fno-pic -fno-pie \
 PLDFLAGS   := -nostdlib -static -z noexecstack -z max-page-size=0x1000 --gc-sections \
               -T user/posix/posix.ld
 PAPPS      := $(sort $(basename $(notdir $(wildcard user/posix/apps/*.c))))
-POSIX_RT   := build/user/posix/crt0.o build/user/posix/os.o
-ALL_APPS   := $(sort $(APPS) $(PAPPS))
+# crt0 - всегда; остальное - из архива: программа без сети не тащит socket.o
+POSIX_CRT0 := build/user/posix/crt0.o
+POSIX_LIB  := build/user/posix/libposix.a
+POSIX_OBJS := build/user/posix/os.o build/user/posix/socket.o
+# Сеть для программ на полной libc (этап 9):
+# * BearSSL ещё раз - с picolibc: время - time(), случайные числа -
+#   getentropy() (своя правка sysrng.c), AES-NI/SSE2 включены;
+# * zlib 1.3.1 (third_party/zlib, лицензия zlib) - сжатие gzip;
+# * curl 8.14.1 (third_party/curl, лицензия curl/MIT) - HTTP/HTTPS для
+#   браузера; настройки - third_party/curl/myos/curl_config.h. Своя правка:
+#   без файла корней curl верит встроенным корням MyOS (user/tls/roots.c).
+#   Заодно - программа curl.
+PBSSL_CFLAGS:= -O2 -fno-stack-protector -fno-pic -fno-pie -fno-asynchronous-unwind-tables \
+              -fno-ident $(PICO_INC) -I$(BSSL_DIR)/inc -I$(BSSL_DIR)/src \
+              -DBR_USE_UNIX_TIME=1 -DBR_USE_WIN32_TIME=0 -DBR_USE_URANDOM=0 \
+              -DBR_USE_WIN32_RAND=0 -DBR_USE_GETENTROPY=1 -DBR_RDRAND=0 -DBR_AES_X86NI=1 \
+              -DBR_SSE2=1 -DBR_POWER8=0 -DBR_64=1 -DBR_LE_UNALIGNED=1
+PBSSL_OBJS := $(BSSL_SRCS:$(BSSL_DIR)/src/%.c=build/user/posix/bearssl/%.o) \
+              build/user/posix/bearssl/roots.o
+PBSSL_LIB  := build/user/posix/libbearssl.a
+
+ZLIB_DIR   := third_party/zlib
+ZLIB_SRCS  := $(addprefix $(ZLIB_DIR)/,adler32.c crc32.c deflate.c infback.c inffast.c \
+              inflate.c inftrees.c trees.c zutil.c compress.c uncompr.c gzclose.c gzlib.c \
+              gzread.c gzwrite.c)
+ZLIB_OBJS  := $(ZLIB_SRCS:$(ZLIB_DIR)/%.c=build/user/zlib/%.o)
+ZLIB_LIB   := build/user/libz.a
+ZLIB_CFLAGS:= $(PCFLAGS) -DHAVE_UNISTD_H -DHAVE_STDARG_H
+
+CURL_DIR   := third_party/curl
+include $(CURL_DIR)/files.mk
+CURL_BASE  := -O2 -fno-stack-protector -fno-pic -fno-pie -fno-asynchronous-unwind-tables \
+              -fno-ident -DHAVE_CONFIG_H -D_GNU_SOURCE -DCURL_STATICLIB \
+              -I$(CURL_DIR)/include -I$(CURL_DIR)/myos -I$(CURL_DIR)/lib \
+              -Iuser/posix/include $(PICO_INC) -I$(BSSL_DIR)/inc -I$(ZLIB_DIR)
+CURL_LIB_CFLAGS := $(CURL_BASE) -DBUILDING_LIBCURL
+CURL_TOOL_CFLAGS:= $(CURL_BASE) -I$(CURL_DIR)/lib/curlx -I$(CURL_DIR)/src
+CURL_LIB_OBJS := $(CURL_LIB_SRCS:$(CURL_DIR)/%.c=build/user/curlobj/%.o)
+CURL_TOOL_OBJS:= $(CURL_TOOL_SRCS:$(CURL_DIR)/%.c=build/user/curlobj/%.o)
+CURL_LIB   := build/user/libcurl.a
+# всё сетевое для программы на полной libc - в таком порядке при линковке
+NET_LIBS   := $(CURL_LIB) $(PBSSL_LIB) $(ZLIB_LIB)
+
+ALL_APPS   := $(sort $(APPS) $(PAPPS) curl)
 ALL_ELFS   := $(ALL_APPS:%=build/user/%)
 
 QEMU_DEV := -device qemu-xhci -device usb-mouse -device usb-kbd
@@ -189,7 +231,7 @@ $(PICO_LIB): $(PICO_OBJS)
 	@rm -f $@
 	@ar rcs $@ $^
 
-build/user/posix/%.o: user/posix/%.c user/posix/include/myos_sys.h sysnum.h
+build/user/posix/%.o: user/posix/%.c $(wildcard user/posix/include/*.h user/posix/include/*/*.h) sysnum.h
 	@mkdir -p $(dir $@)
 	@echo "  CC  [posix] $<"
 	@$(CC) $(PCFLAGS) -c $< -o $@
@@ -204,9 +246,58 @@ build/user/posix/apps/%.o: user/posix/apps/%.c user/posix/include/myos_sys.h sys
 	@echo "  CC  [posix] $<"
 	@$(CC) $(PCFLAGS) -c $< -o $@
 
-$(PAPPS:%=build/user/%): build/user/%: build/user/posix/apps/%.o $(POSIX_RT) $(PICO_LIB) user/posix/posix.ld
+$(POSIX_LIB): $(POSIX_OBJS)
+	@echo "  AR  $@"
+	@rm -f $@
+	@ar rcs $@ $^
+
+$(PAPPS:%=build/user/%): build/user/%: build/user/posix/apps/%.o $(POSIX_CRT0) $(POSIX_LIB) $(PICO_LIB) user/posix/posix.ld
 	@echo "  LD  [posix] $@"
-	@$(LD) $(PLDFLAGS) -o $@ $(POSIX_RT) $< $(PICO_LIB) $(LIBGCC) $(PICO_LIB)
+	@$(LD) $(PLDFLAGS) -o $@ $(POSIX_CRT0) $< $(POSIX_LIB) $(PICO_LIB) $(LIBGCC) $(POSIX_LIB) $(PICO_LIB)
+
+build/user/posix/bearssl/%.o: $(BSSL_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  [bearssl-posix] $<"
+	@$(CC) $(PBSSL_CFLAGS) -c $< -o $@
+
+build/user/posix/bearssl/roots.o: user/tls/roots.c user/tls/tls.h
+	@mkdir -p $(dir $@)
+	@echo "  CC  [bearssl-posix] $<"
+	@$(CC) $(PBSSL_CFLAGS) -Iuser/tls -I. -c $< -o $@
+
+$(PBSSL_LIB): $(PBSSL_OBJS)
+	@echo "  AR  $@"
+	@rm -f $@
+	@ar rcs $@ $^
+
+build/user/zlib/%.o: $(ZLIB_DIR)/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  [zlib] $<"
+	@$(CC) $(ZLIB_CFLAGS) -c $< -o $@
+
+$(ZLIB_LIB): $(ZLIB_OBJS)
+	@echo "  AR  $@"
+	@rm -f $@
+	@ar rcs $@ $^
+
+build/user/curlobj/lib/%.o: $(CURL_DIR)/lib/%.c $(CURL_DIR)/myos/curl_config.h
+	@mkdir -p $(dir $@)
+	@echo "  CC  [curl] $<"
+	@$(CC) $(CURL_LIB_CFLAGS) -c $< -o $@
+
+build/user/curlobj/src/%.o: $(CURL_DIR)/src/%.c $(CURL_DIR)/myos/curl_config.h
+	@mkdir -p $(dir $@)
+	@echo "  CC  [curl] $<"
+	@$(CC) $(CURL_TOOL_CFLAGS) -c $< -o $@
+
+$(CURL_LIB): $(CURL_LIB_OBJS)
+	@echo "  AR  $@"
+	@rm -f $@
+	@ar rcs $@ $^
+
+build/user/curl: $(CURL_TOOL_OBJS) $(NET_LIBS) $(POSIX_CRT0) $(POSIX_LIB) $(PICO_LIB) user/posix/posix.ld
+	@echo "  LD  [posix] $@"
+	@$(LD) $(PLDFLAGS) -o $@ $(POSIX_CRT0) $(CURL_TOOL_OBJS) $(NET_LIBS) $(POSIX_LIB) $(PICO_LIB) $(LIBGCC) $(POSIX_LIB) $(PICO_LIB)
 
 # Вклеить программы в ядро: таблица {имя, начало, конец}
 build/apps.S: $(ALL_ELFS) Makefile

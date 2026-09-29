@@ -333,9 +333,13 @@ BOOLEAN net_wait(const void *obj, const char *what, UINT64 timeout_ms)
     return woken;
 }
 
+/* "что-то случилось с каким-то сокетом" - этого ждёт poll */
+UINT8 g_net_any_event;
+
 void net_wake(const void *obj)
 {
     sched_wake_all(obj);
+    sched_wake_all(&g_net_any_event);
 }
 
 /* ================================================================

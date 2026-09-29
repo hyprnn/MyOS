@@ -8,6 +8,9 @@
   `inc/` без изменений; файлы `.t0` (исходники генератора) не нужны — сгенерированные
   `.c` уже в `src/`.
 * Своё: `bearssl/myos/string.h` — заглушка системного `<string.h>`.
+* Изменено (этап 9): `src/rand/sysrng.c` — источник случайных чисел
+  `getentropy()` при `BR_USE_GETENTROPY=1` (для второй сборки BearSSL — с
+  picolibc, для curl; см. `PBSSL_CFLAGS` в `Makefile`).
 * Собирается в `build/user/libtls.a` вместе с `user/tls/` (обёртка MyOS и
   корневые сертификаты) — только для программ, которым нужен TLS (`wget`).
   Настройки сборки (без времени/случайных чисел ОС, без AES-NI/SSE2-интринсиков)
@@ -78,3 +81,26 @@
   `_POSIX_MONOTONIC_CLOCK` и `_POSIX_TIMERS` (как для RTEMS).
 * Привязка к ядру MyOS — свой файл `user/posix/os.c` (read/write/open/lseek/
   fstat/sbrk/время/opendir...). Программы на ней — `user/posix/apps/`.
+
+## zlib/ — zlib 1.3.1 (сжатие gzip для curl и браузера)
+
+* Авторы: Jean-loup Gailly и Mark Adler, https://zlib.net/ — лицензия zlib
+  (`zlib/LICENSE`). Откуда: https://github.com/madler/zlib, тег `v1.3.1`;
+  взяты файлы библиотеки (`*.c` из списка `ZLIB_SRCS` в `Makefile` и все `*.h`)
+  без изменений.
+
+## curl/ — curl 8.14.1 (HTTP/HTTPS для программ)
+
+* Автор: Daniel Stenberg и участники, https://curl.se/ — лицензия curl
+  (MIT-подобная, `curl/COPYING`). Откуда: https://github.com/curl/curl, тег
+  `curl-8_14_1` — последняя версия с BearSSL (в 8.15 его убрали).
+* Как получено: CMake-сборка под MyOS (picolibc + `user/posix`; только HTTP и
+  HTTPS, BearSSL, zlib, без IPv6, потоков, cookies-файлов, HSTS, alt-svc);
+  скопированы ровно попавшие в сборку исходники и заголовки библиотеки
+  (`lib/`) и программы `curl` (`src/`), список — `curl/files.mk`.
+  `curl/myos/curl_config.h` — созданный CMake файл настроек (с правками,
+  описанными в его начале).
+* Изменено: `lib/vtls/bearssl.c` — если файла корней не дали, верить
+  встроенным корням Mozilla из `user/tls/roots.c` (как `wget`).
+* Особенность BearSSL-части curl: сертификат сверяется только с именем
+  сервера, не с IP-адресом (`https://1.2.3.4/` с проверкой не пройдёт).

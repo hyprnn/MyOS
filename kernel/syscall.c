@@ -310,6 +310,103 @@ static INTN fd_kernel(KPROC *p, INT64 fd)
     return p->fds[fd - 3];
 }
 
+/*
+ * poll: какие из fd программы готовы. Файлы и экран готовы всегда
+ * (чтение с диска не "ждёт" в смысле poll), клавиатура - никогда (её
+ * программы читают getkey/read), сокеты - как скажет sock_poll.
+ * Ждём событий сети (sock_poll_wait) кусками по 100 мс - чтобы
+ * заметить Ctrl+C и срок.
+ */
+#define POLL_MAX 64
+
+typedef struct {
+    KPROC              *p;
+    struct myos_pollfd *fds;
+    UINTN               n;
+    INTN                count;
+} POLL_CTX;
+
+static BOOLEAN poll_check(void *ctx)
+{
+    POLL_CTX *c = (POLL_CTX *)ctx;
+
+    c->count = 0;
+
+    for (UINTN i = 0; i < c->n; i++) {
+
+        struct myos_pollfd *f = &c->fds[i];
+        UINT32 ev;
+
+        if (f->fd < 0)
+            ev = 0;
+        else if (f->fd == 1 || f->fd == 2)
+            ev = MYOS_POLLOUT;
+        else if (f->fd == 0)
+            ev = 0;
+        else {
+            INTN kfd = fd_kernel(c->p, f->fd);
+            if (kfd < 0)
+                ev = MYOS_POLLNVAL;
+            else if (kfd & PROC_FD_SOCK)
+                ev = sock_poll(kfd & ~PROC_FD_SOCK);
+            else
+                ev = MYOS_POLLIN | MYOS_POLLOUT;
+        }
+
+        /* ошибки и закрытие сообщаются всегда, остальное - если спросили */
+        f->revents = (short)(ev & ((UINT32)(UINT16)f->events |
+                                   MYOS_POLLERR | MYOS_POLLHUP | MYOS_POLLNVAL));
+
+        if (f->revents)
+            c->count++;
+    }
+
+    return c->count > 0;
+}
+
+static INT64 sys_poll(KPROC *p, UINT64 ufds, UINT64 n, INT64 timeout_ms)
+{
+    struct myos_pollfd fds[POLL_MAX];
+    POLL_CTX c = { p, fds, (UINTN)n, 0 };
+
+    if (n > POLL_MAX)
+        return MYOS_EINVAL;
+    if (n > 0 && !uptr_ok(p, ufds, n * sizeof(fds[0]), TRUE))
+        return MYOS_EFAULT;
+
+    memcpy(fds, (const void *)(UINTN)ufds, n * sizeof(fds[0]));
+
+    UINT64 deadline = (timeout_ms >= 0) ? g_kticks + (UINT64)timeout_ms : 0;
+
+    for (;;) {
+
+        UINT64 slice = 100;
+
+        if (timeout_ms == 0) {
+            poll_check(&c);
+            break;
+        }
+
+        if (timeout_ms > 0) {
+            if (g_kticks >= deadline) {
+                poll_check(&c);
+                break;
+            }
+            if (deadline - g_kticks < slice)
+                slice = deadline - g_kticks;
+        }
+
+        if (sock_poll_wait(poll_check, &c, slice))
+            break;
+
+        if (p->killed)
+            return MYOS_EINTR;
+    }
+
+    memcpy((void *)(UINTN)ufds, fds, n * sizeof(fds[0]));
+    return c.count;
+}
+
 typedef struct {
     UINTN want, idx;
     struct myos_dirent *out;
@@ -785,6 +882,10 @@ INT64 kx_syscall_dispatch(UINT64 *f)
         r = 0;
         break;
     }
+
+    case SYS_POLL:
+        r = sys_poll(p, a1, a2, (INT64)a3);
+        break;
 
     default:
         r = MYOS_ENOSYS;

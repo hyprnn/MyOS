@@ -32,6 +32,24 @@
 #include <errno.h>
 #endif
 
+/* MyOS (изменение MyOS): случайные байты ядра через getentropy()
+   (user/posix/os.c) - для программ на полной libc (curl) */
+#if defined(BR_USE_GETENTROPY) && BR_USE_GETENTROPY
+#include <unistd.h>
+
+static int
+seeder_getentropy(const br_prng_class **ctx)
+{
+	unsigned char tmp[32];
+
+	if (getentropy(tmp, sizeof tmp) != 0) {
+		return 0;
+	}
+	(*ctx)->update(ctx, tmp, sizeof tmp);
+	return 1;
+}
+#endif
+
 #if BR_USE_WIN32_RAND
 #include <windows.h>
 #include <wincrypt.h>
@@ -143,6 +161,12 @@ seeder_win32(const br_prng_class **ctx)
 br_prng_seeder
 br_prng_seeder_system(const char **name)
 {
+#if defined(BR_USE_GETENTROPY) && BR_USE_GETENTROPY
+	if (name != NULL) {
+		*name = "getentropy";
+	}
+	return &seeder_getentropy;
+#endif
 #if BR_RDRAND
 	if (rdrand_supported()) {
 		if (name != NULL) {

@@ -30,7 +30,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <signal.h>
 #include <termios.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/times.h>
@@ -99,6 +101,7 @@ static int errno_of(long e)
     case MYOS_EHOSTNOTFOUND: return EHOSTUNREACH;
     case MYOS_EAGAIN:        return EAGAIN;
     case MYOS_EINTR:         return EINTR;
+    case MYOS_EINPROGRESS:   return EINPROGRESS;
     default:                 return EIO;
     }
 }
@@ -185,11 +188,123 @@ int dup2(int oldfd, int newfd)
 }
 
 /* ================================================================
+ * Сигналы
+ *
+ * Настоящих сигналов в MyOS нет (ядро не прерывает программу ради её
+ * обработчика). Но libc и чужие программы зовут raise/abort/signal:
+ * обработчик запоминаем и вызываем сами, когда программа делает
+ * raise(); "по умолчанию" - завершить программу с сообщением.
+ * ================================================================ */
+
+static _sig_func_ptr g_sig[_NSIG];
+static const char *g_progname = "program";     /* argv[0] - для сообщений */
+
+_sig_func_ptr signal(int sig, _sig_func_ptr h)
+{
+    if (sig <= 0 || sig >= _NSIG || sig == SIGKILL || sig == SIGSTOP) {
+        errno = EINVAL;
+        return SIG_ERR;
+    }
+
+    _sig_func_ptr old = g_sig[sig];
+
+    g_sig[sig] = h;
+    return old;
+}
+
+int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *restrict old)
+{
+    if (sig <= 0 || sig >= _NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (old != NULL) {
+        memset(old, 0, sizeof(*old));
+        old->sa_handler = g_sig[sig];
+    }
+
+    if (act != NULL)
+        g_sig[sig] = act->sa_handler;
+
+    return 0;
+}
+
+int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict old)
+{
+    (void)how; (void)set;
+
+    if (old != NULL)
+        *old = 0;              /* ничего не заблокировано */
+    return 0;
+}
+
+int raise(int sig)
+{
+    if (sig <= 0 || sig >= _NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    _sig_func_ptr h = g_sig[sig];
+
+    if (h == SIG_IGN)
+        return 0;
+
+    if (h != SIG_DFL) {
+        h(sig);
+        return 0;
+    }
+
+    /* действие по умолчанию: завершиться (как в Linux - код 128 + номер) */
+    fprintf(stderr, "%s: terminated by signal %d%s\n", g_progname, sig,
+            sig == SIGABRT ? " (abort)" : "");
+    fflush(NULL);
+    _exit(128 + sig);
+}
+
+int kill(pid_t pid, int sig)
+{
+    if (pid == getpid() || pid == 0)
+        return raise(sig);
+
+    errno = EPERM;             /* другим программам сигналы не шлём */
+    return -1;
+}
+
+unsigned alarm(unsigned seconds)
+{
+    (void)seconds;             /* таймерного сигнала нет */
+    return 0;
+}
+
+/* ================================================================
  * Файлы
  * ================================================================ */
 
+/*
+ * Сокеты (user/posix/socket.c) - "слабые" ссылки: программа без сети
+ * socket.c не подключает, и тогда эти указатели - NULL.
+ */
+int     __myos_is_socket(int fd) __attribute__((weak));
+void    __myos_sock_forget(int fd) __attribute__((weak));
+int     __myos_sock_nonblock(int fd, int set, int on) __attribute__((weak));
+ssize_t __myos_sock_read(int fd, void *buf, size_t n) __attribute__((weak));
+
+static int is_socket(int fd)
+{
+    return __myos_is_socket != NULL && __myos_is_socket(fd);
+}
+
 ssize_t read(int fd, void *buf, size_t n)
 {
+    /* у сокета могли остаться "подсмотренные" (MSG_PEEK) байты */
+    if (is_socket(fd)) {
+        ssize_t r = __myos_sock_read(fd, buf, n);
+        if (r != -2)
+            return r;
+    }
+
     return (ssize_t)ret_of(myos_syscall3(SYS_READ, fd, (long)buf, (long)n));
 }
 
@@ -251,6 +366,9 @@ int close(int fd)
 {
     if (fd >= 0 && fd <= 2)
         return 0;              /* экран и клавиатуру не закрываем */
+
+    if (is_socket(fd))
+        __myos_sock_forget(fd);
 
     return (int)ret_of(myos_syscall3(SYS_CLOSE, fd, 0, 0));
 }
@@ -392,6 +510,46 @@ int fsync(int fd)
     return 0;
 }
 
+/* fcntl: неблокирующий режим сокетов (O_NONBLOCK); флаги "закрыть
+   при exec" в MyOS ничего не значат */
+int fcntl(int fd, int cmd, ...)
+{
+    va_list ap;
+    int arg = 0;
+
+    va_start(ap, cmd);
+    if (cmd == F_SETFL || cmd == F_SETFD || cmd == F_DUPFD)
+        arg = va_arg(ap, int);
+    va_end(ap);
+
+    switch (cmd) {
+    case F_GETFD:
+    case F_SETFD:
+        return 0;
+    case F_GETFL:
+        if (is_socket(fd))
+            return O_RDWR | (__myos_sock_nonblock(fd, 0, 0) ? O_NONBLOCK : 0);
+        return O_RDWR;
+    case F_SETFL:
+        if (is_socket(fd))
+            return __myos_sock_nonblock(fd, 1, (arg & O_NONBLOCK) != 0);
+        return 0;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+/* ioctl: только FIONBIO (неблокирующий сокет) */
+int ioctl(int fd, unsigned long op, void *param)
+{
+    if (op == FIONBIO && is_socket(fd))
+        return __myos_sock_nonblock(fd, 1, param != NULL && *(int *)param != 0);
+
+    errno = ENOTTY;
+    return -1;
+}
+
 int ftruncate(int fd, off_t len)
 {
     (void)fd; (void)len;
@@ -399,8 +557,16 @@ int ftruncate(int fd, off_t len)
     return -1;
 }
 
-/* Терминал: 0, 1, 2 - это консоль, остальное - нет (isatty в
-   picolibc спрашивает именно tcgetattr) */
+/* Терминал: 0, 1, 2 - это консоль, остальное - нет */
+int isatty(int fd)
+{
+    if (fd >= 0 && fd <= 2)
+        return 1;
+
+    errno = ENOTTY;
+    return 0;
+}
+
 int tcgetattr(int fd, struct termios *t)
 {
     if (fd < 0 || fd > 2) {
@@ -673,6 +839,8 @@ void __myos_start(int argc, char **argv) __attribute__((noreturn));
 
 void __myos_start(int argc, char **argv)
 {
+    if (argc > 0 && argv[0] != NULL)
+        g_progname = argv[0];
     set_tz();
     __libc_init_array();       /* конструкторы (__attribute__((constructor))) */
     exit(main(argc, argv));    /* exit сбросит буферы stdio и закроет файлы */

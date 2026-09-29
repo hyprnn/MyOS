@@ -56,7 +56,8 @@
 #define SYS_FSTAT    35   /* fstat(fd, struct myos_dirent *)       - is_dir: MYOS_FT_* */
 #define SYS_GETCWD   36   /* getcwd(buf, размер)                   -> длина пути */
 #define SYS_CHDIR    37   /* chdir(path)                           - текущая папка программы */
-#define SYS_COUNT    38
+#define SYS_POLL     38   /* poll(struct myos_pollfd *, n, мс; -1 - сколько угодно) -> готовых */
+#define SYS_COUNT    39
 
 /* флаги open - те же, что VFS_O_* в ядре */
 #define MYOS_O_READ    0x01
@@ -102,6 +103,7 @@
 #define MYOS_EHOSTNOTFOUND -24   /* DNS: нет такого имени */
 #define MYOS_EAGAIN        -25   /* за отведённое время ничего не пришло */
 #define MYOS_EINTR         -26   /* прервано (Ctrl+C) */
+#define MYOS_EINPROGRESS   -27   /* неблокирующий connect: соединение устанавливается */
 
 struct myos_time {
     unsigned short year;
@@ -128,6 +130,23 @@ struct myos_dirent {
 #define MYOS_SOCK_PING    3   /* ICMP Echo (ping): программа даёт 8 байт заголовка
                                  ICMP + данные; номер id и сумму ставит ядро */
 #define MYOS_SO_TIMEOUT   1   /* сколько мс ждать connect/accept/recv (0 - сколько угодно) */
+#define MYOS_SO_NONBLOCK  2   /* 1 - не ждать вовсе: нет данных/места - MYOS_EAGAIN,
+                                 connect - MYOS_EINPROGRESS (итог - MYOS_SO_ERROR) */
+#define MYOS_SO_ERROR     3   /* (значение не нужно) -> 0 соединён, MYOS_EINPROGRESS
+                                 ещё соединяется, иначе - почему не вышло */
+#define MYOS_SO_LOCALADDR 4   /* (значение не нужно) -> свой адрес: ip << 16 | порт */
+
+/* poll: как struct pollfd в POSIX (и те же биты) */
+struct myos_pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
+#define MYOS_POLLIN    0x01   /* есть что прочитать (или конец потока) */
+#define MYOS_POLLOUT   0x04   /* можно писать */
+#define MYOS_POLLERR   0x08   /* ошибка соединения */
+#define MYOS_POLLHUP   0x10   /* соединение закрыто */
+#define MYOS_POLLNVAL  0x20   /* нет такого fd */
 
 /* адрес: IPv4 в порядке процессора (10.0.2.15 = 0x0A00020F) и порт */
 struct myos_sockaddr {

@@ -128,6 +128,7 @@ UINT32 net_csum_add(const void *data, UINTN len, UINT32 sum);
 UINT16 net_csum_fold(UINT32 sum);
 BOOLEAN net_wait(const void *obj, const char *what, UINT64 timeout_ms);
 void   net_wake(const void *obj);
+extern UINT8 g_net_any_event;   /* net_wake будит и ждущих этого (poll) */
 void   net_fmt_ip(char *buf, UINTN cap, UINT32 ip);
 BOOLEAN net_parse_ip(const char *s, UINT32 *ip);
 UINT32 net_random(void);

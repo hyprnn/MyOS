@@ -2771,6 +2771,8 @@ INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *
 INTN sock_recv(INTN s, void *buf, UINTN n);
 INTN sock_setopt(INTN s, UINT32 opt, UINT64 val);
 INTN sock_pending(INTN s);
+UINT32 sock_poll(INTN s);
+BOOLEAN sock_poll_wait(BOOLEAN (*check)(void *ctx), void *ctx, UINT64 slice_ms);
 INTN sock_close(INTN s);
 void sock_close_pid(UINT32 pid);
 const char *net_strerror(INTN e);

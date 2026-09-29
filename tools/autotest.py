@@ -707,6 +707,22 @@ def main():
              % hsp, 'keeps only small files', 60),
             ('', 'wget exited with code 1', 10),
             ('wget -0 - https://10.0.2.2:%d/hello.txt\n' % hsp, 'did you mean -O', 15),
+            # этап 9: curl (libcurl на picolibc: сокеты BSD, poll, неблокирующий
+            # connect, BearSSL) - HTTP, файл на флешку, HTTPS: чужой сертификат
+            # против встроенных корней MyOS, свой корень, без проверки,
+            # переадресация на https
+            ('curl -s %s/hello.txt\n' % url, 'Hello from the host over HTTP!', 30),
+            ('curl -s -o /usb0p1/c.bin %s/big.bin\n' % url, 'exited with code 0', 60),
+            ('ls /usb0p1\n', 're:%d +c\\.bin' % len(BIG_DATA), 15),
+            # (curl с BearSSL сверяет сертификат только с именем, не с
+            # IP-адресом - поэтому имя из сертификата через --resolve)
+            ('curl -sS --resolve myos-test.local:%d:10.0.2.2 https://myos-test.local:%d/hello.txt\n'
+             % (hsp, hsp), 'curl: (60)', 30),
+            ('curl -s --cacert /usb0p1/ca.pem --resolve myos-test.local:%d:10.0.2.2 '
+             'https://myos-test.local:%d/hello.txt\n' % (hsp, hsp),
+             'Hello from the host over HTTP!', 30),
+            ('curl -sk https://10.0.2.2:%d/hello.txt\n' % hsp, 'Hello from the host over HTTP!', 30),
+            ('curl -sLk %s/to-https\n' % url, 'Hello from the host over HTTP!', 30),
             ('net drop 10\n', 'every 10-th received frame', 10),
             ('wget -O null %s/big.bin\n' % url, crc, 90),
             ('net drop 0\n', 'Test mode off', 10),
@@ -727,6 +743,7 @@ def main():
                 ('nslookup example.com\n', 're:Address: +[0-9]+\\.', 20),
                 ('wget -O null http://example.com/\n', 'Done:', 40),
                 ('wget -O null https://example.com/\n', 'Done:', 60),
+                ('curl -sI https://example.com/\n', 're:HTTP/1\\.1 200', 60),
             ]
         runs.append(('network', net_steps,
                      ['-netdev', 'user,id=n0,hostfwd=tcp:127.0.0.1:%d-:80' % fwd,
