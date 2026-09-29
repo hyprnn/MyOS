@@ -1271,6 +1271,23 @@ typedef struct {
     char    last_msg[96];
 } ACPI_DEVS;
 
+/* Яркость экрана (kernel/backlight.c, этап 9) */
+typedef enum {
+    BL_NONE = 0,     /* управлять нечем */
+    BL_NATIVE,       /* регистры ШИМ видеокарты Intel */
+    BL_ACPI          /* методы _BCM/_BQC устройства экрана в AML */
+} BL_MODE;
+
+typedef struct {
+    BL_MODE mode;
+    UINT16  gpu_id;          /* PCI Device ID видеокарты Intel (0 - нет) */
+    BOOLEAN bxt;             /* регистры вида Apollo/Gemini Lake */
+    BOOLEAN inverted;        /* ШИМ инвертирован (бит 29) */
+    UINT32  pwm_max;         /* период ШИМ = 100% */
+    UINT32  acpi_last;       /* последний уровень _BCM (если нет _BQC) */
+    UINT32  hotkeys;         /* сколько раз нажали Fn+яркость */
+} BACKLIGHT_INFO;
+
 /* ACPI: то, что нужно для выключения (kernel/power.c) */
 typedef struct {
     BOOLEAN ok;
@@ -2449,6 +2466,14 @@ void acpi_dev_note_log(BOOLEAN error, const char *msg);
 void acpi_dev_poweroff(void);
 BOOLEAN acpi_battery_brief(char *buf, UINTN cap, BOOLEAN *charging);
 void kernel_cmd_battery(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
+/* --- kernel/backlight.c (яркость, этап 9) --- */
+extern BACKLIGHT_INFO g_backlight;
+void backlight_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+INT32 backlight_get(void);
+INT32 backlight_set(INT32 pct);
+INT32 backlight_step(INT32 dir);
+void kernel_cmd_brightness(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 
 /* --- kernel/tz.c --- */
 #define TZ_MOSCOW     0

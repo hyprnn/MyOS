@@ -895,6 +895,11 @@ def main():
             ('', 'AC adapter: unplugged', 3),
             ('', 'Lid: open', 3),
             ('', 'Power button: fixed event', 3),
+            # яркость через ACPI _BCM (запасной путь; у QEMU нет ШИМ Intel)
+            ('brightness\n', 'Brightness: 100% (ACPI _BCM', 10),
+            ('brightness 40\n', 'Brightness: 40%', 10),
+            ('brightness -\n', 'Brightness: 30%', 10),
+            ('brightness 1\n', 'Brightness: 10%', 10),
             # значок батареи на панели задач: зелёная заливка 80%
             ('start\n', 're:wm: started', 20),
             ({'screen': [((0x20, 0xA0, 0x20), 8, 40)]}, '', 15),

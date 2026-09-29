@@ -413,7 +413,7 @@ build/kernel/third_party/uacpi/%.o: third_party/uacpi/%.c
 	@$(CC) $(UACPI_CFLAGS) -MMD -MP -c $< -o $@
 
 # файлы ядра, которые говорят с uACPI, видят её заголовки
-build/kernel/kernel/acpi_os.o build/kernel/kernel/acpi_dev.o: KCFLAGS += -Ithird_party/uacpi/include $(UACPI_DEFS)
+build/kernel/kernel/acpi_os.o build/kernel/kernel/acpi_dev.o build/kernel/kernel/backlight.o: KCFLAGS += -Ithird_party/uacpi/include $(UACPI_DEFS)
 
 build/kernel/fs/exfat.o: fs/exfat.c
 	@mkdir -p $(dir $@)

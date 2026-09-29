@@ -105,6 +105,19 @@ void run_command(
 
         kernel_cmd_battery(out);
 
+    /* этап 9: яркость экрана ноутбука */
+    } else if (streq(line, "brightness") || starts_with(line, "brightness ")) {
+
+        char arg[16];
+        UINTN k = 0;
+
+        if (line[10] == ' ')
+            for (CHAR16 *c = line + 11; *c && k + 1 < sizeof(arg); c++)
+                arg[k++] = (*c < 128) ? (char)*c : '?';
+
+        arg[k] = '\0';
+        kernel_cmd_brightness(out, arg);
+
     /* сеть (этап 8): состояние стека; Wi-Fi - что за адаптер */
     } else if (streq(line, "net") || streq(line, "netstat")) {
 
@@ -274,6 +287,7 @@ void run_command(
             out,
             "  acpi          - ACPI tables: CPU cores, I/O APIC, HPET, PCIe, power\n"
             "  battery       - battery charge, AC adapter, lid (ACPI via uACPI)\n"
+            "  brightness [N|+|-] - screen brightness, 5..100% (also Fn keys)\n"
             "  cpu           - CPU load and interrupt counters\n"
             "  ps            - threads: state, CPU share, stack, what they wait for\n"
             "  threadtest    - live test: preemption, fair sharing, mutex\n"

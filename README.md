@@ -181,7 +181,7 @@ UTF-8 и windows-1251 / ISO-8859-*, HTTPS через curl + BearSSL (прове�
 Шрифты и стили вшиты в программу и видны ей как файлы `/embed/...`.
 Заодно появилась программа `curl` (`curl -s https://example.com/`).
 
-## Батарея и кнопка питания (этап 9)
+## Батарея, кнопка питания, яркость (этап 9)
 
 `battery` (или `power`) — заряд батареи, сколько осталось до разряда или
 до полной зарядки, ток, износ («health» — ёмкость сейчас против паспорта),
@@ -192,6 +192,11 @@ UTF-8 и windows-1251 / ISO-8859-*, HTTPS через curl + BearSSL (прове�
 прошивки (байт-код AML) исполняет библиотека uACPI
 (`third_party/uacpi`), батарею ноутбука она читает через контроллер EC —
 его драйвер свой (`kernel/acpi_dev.c`).
+
+`brightness` — яркость экрана ноутбука: `brightness 60` (5..100%),
+`brightness +` / `brightness -` — на 10%; клавиши яркости (Fn+F2/F3 у HP)
+тоже работают. Яркость меняется прямо в регистрах подсветки видеокарты
+Intel (`kernel/backlight.c`), а если их нет — через ACPI (`_BCM`).
 
 ## Установка на диск рядом с Arch (этап 9)
 
@@ -218,7 +223,7 @@ MyOS можно поставить на диск ноутбука, не трог
 | `bootinfo.h` | "паспорт загрузки" - что загрузчик передаёт ядру, раскладка адресов |
 | `myos.h` | общий заголовок: константы, типы, глобальные переменные, функции |
 | `lib/` | строки, `kprintf`, COM1, `memcpy`/`memset` |
-| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `acpi_os.c` + `acpi_dev.c` AML через uACPI (батарея, EC, кнопка питания), `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`) |
+| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `acpi_os.c` + `acpi_dev.c` AML через uACPI (батарея, EC, кнопка питания), `backlight.c` яркость экрана, `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`) |
 | `firmware/` | прошивки устройств, вклеенные в ядро: `rtw88/rtw8821c_fw.bin` (Realtek, только двоичная, условия — `LICENCE.rtlwifi_firmware.txt`) |
 | `drivers/` | PCI, USB (xHCI, клавиатуры/мыши, хабы, флешки — с горячим подключением), PS/2 (клавиатура, мышь/тачпад), разбор HID-дескрипторов; `blk.c` диски, разделы MBR/GPT, кэш секторов; `ahci.c` SATA; `nvme.c` NVMe; сеть: `e1000.c` (Intel), `rtl8169.c` (Realtek), `usbnet.c` (USB-модемы RNDIS/ECM/NCM); Wi-Fi: `rtw8821c.c` (Realtek RTL8821CE, по rtw88) и `rtw8821c_table.c` (таблицы Realtek) |
 | `net/` | стек TCP/IP: `net.c` интерфейсы и поток `net`, `arp.c`, `ip.c` (IPv4, ICMP), `udp.c`, `tcp.c`, `dhcp.c`, `dns.c`, `socket.c` сокеты, `netcmd.c` команда `net` и `ifconfig`; Wi-Fi: `wpa.c` (WPA2: SHA-1, PBKDF2, AES, CCMP, рукопожатие), `wifi.c` (адаптеры, `wifi`), `wlan.c` (802.11: поиск сетей, подключение, `wlan0`), `wlan_sim.c` (программная точка доступа для теста) |
