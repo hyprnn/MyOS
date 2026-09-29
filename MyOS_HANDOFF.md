@@ -497,6 +497,16 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   `browser`: рабочий стол -> терминал -> `browser URL`, затем снимок экрана
   QEMU и подсчёт точек трёх цветов страницы (`{'screen': ...}` в autotest.py).
 
+* **Установка на диск** (`tools/install-arch.sh`, запуск из Arch): копирует
+  загрузчик и ядро в `<ESP>/EFI/MyOS/`, пишет `<ESP>/loader/entries/myos.conf`
+  (`efi /EFI/MyOS/BOOTX64.EFI`); `--menu` = `bootctl set-timeout 3`
+  (переменная EFI, loader.conf не правится), `--remove`. Загрузчик ищет ядро
+  в `\EFI\BOOT\`, в корне, затем в `\EFI\MYOS\` (`l_kernel_paths`).
+  Прогон autotest `install`: образ FAT32 64 МБ с настоящим systemd-boot
+  (default myos.conf) + скрипт установки -> команда `boot` должна показать
+  `Kernel file: \EFI\MYOS\KERNEL.ELF`. Нужны пакеты systemd-boot-efi и
+  mtools, иначе прогон пропускается.
+
 ## Ранний запуск на железе (диагностика без COM-порта)
 
 После ExitBootServices загрузчик рисует серую полосу по верху

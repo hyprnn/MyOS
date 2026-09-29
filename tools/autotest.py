@@ -419,10 +419,52 @@ def count_colors(ppm, colors, tols):
     return counts
 
 
+# прогоны со своим загрузочным диском: имя прогона -> файл образа
+CUSTOM_BOOT_DISKS = {}
+
+SYSTEMD_BOOT = '/usr/lib/systemd/boot/efi/systemd-bootx64.efi'
+
+
+def make_install_disk(a, work):
+    """Диск "как у ноутбука с Arch" (этап 9): раздел EFI с systemd-boot
+    (меню скрыто, по умолчанию - MyOS), MyOS поставлена туда скриптом
+    tools/install-arch.sh - в EFI/MyOS/ и loader/entries/myos.conf.
+    Нужны systemd-boot и mtools; нет - None (прогон пропускается)."""
+    if not (os.path.exists(SYSTEMD_BOOT) and shutil_which('mformat') and shutil_which('mcopy')):
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    esp = os.path.join(work, 'install-esp')
+    src = os.path.join(work, 'install-src')
+    for d in (esp + '/EFI/BOOT', esp + '/EFI/systemd', esp + '/loader/entries', src):
+        os.makedirs(d, exist_ok=True)
+    boot = open(SYSTEMD_BOOT, 'rb').read()
+    open(esp + '/EFI/BOOT/BOOTX64.EFI', 'wb').write(boot)
+    open(esp + '/EFI/systemd/systemd-bootx64.efi', 'wb').write(boot)
+    open(esp + '/loader/loader.conf', 'w').write('default myos.conf\ntimeout 0\n')
+    open(esp + '/loader/entries/arch.conf', 'w').write('title Arch Linux\nlinux /vmlinuz-linux\n')
+    open(src + '/BOOTX64.EFI', 'wb').write(open(a.efi, 'rb').read())
+    open(src + '/KERNEL.ELF', 'wb').write(open(a.kernel, 'rb').read())
+    r = subprocess.run([os.path.join(root, 'tools/install-arch.sh'), '--esp', esp, '--from', src],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout, r.stderr)
+        return None
+    img = os.path.join(work, 'install.img')
+    with open(img, 'wb') as f:
+        f.truncate(64 * 1024 * 1024)
+    subprocess.run(['mformat', '-i', img, '-F', '-T', str(64 * 2048), '-h', '64', '-s', '32', '::'],
+                   check=True)
+    subprocess.run(['mcopy', '-s', '-i', img, esp + '/EFI', esp + '/loader', '::/'], check=True)
+    return img
+
+
 def run_steps(a, work, steps, name, extra=(), devices=None):
     """Один запуск ВМ: пройти шаги, вернуть (ok, текст лога)."""
     disk = os.path.join(work, name + '.img')
-    make_fat_image(a.efi, a.kernel, disk)
+    if name in CUSTOM_BOOT_DISKS:
+        disk = CUSTOM_BOOT_DISKS[name]      # свой загрузочный диск (install)
+    else:
+        make_fat_image(a.efi, a.kernel, disk)
 
     vmdir = os.path.join(work, name)
     os.makedirs(vmdir, exist_ok=True)
@@ -833,6 +875,18 @@ def main():
                       '-device', 'e1000,netdev=n0',
                       '-drive', 'if=none,id=nstick,format=raw,file=@WORK@/netstick.img'],
                      ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=nstick']))
+        # установка рядом с Arch (этап 9): диск с systemd-boot, куда MyOS
+        # поставлена tools/install-arch.sh; systemd-boot запускает
+        # \EFI\MyOS\BOOTX64.EFI, тот находит ядро рядом
+        inst = make_install_disk(a, work)
+        if inst:
+            CUSTOM_BOOT_DISKS['install'] = inst
+            runs.append(('install', [
+                (None, "Type 'help'", 90),
+                ('boot\n', re.escape('Kernel file: \\EFI\\MYOS\\KERNEL.ELF').join(['re:', '']), 15),
+            ]))
+        else:
+            print('(no systemd-boot or mtools on this machine - install run skipped)')
         # браузер NetSurf (этап 9): рабочий стол -> терминал -> browser;
         # страница с хоста (UTF-8, CSS, PNG, JPEG) - на снимке экрана
         # должны быть цвет заголовка, жёлтый круг из PNG и малиновый

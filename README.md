@@ -181,6 +181,23 @@ UTF-8 и windows-1251 / ISO-8859-*, HTTPS через curl + BearSSL (прове�
 Шрифты и стили вшиты в программу и видны ей как файлы `/embed/...`.
 Заодно появилась программа `curl` (`curl -s https://example.com/`).
 
+## Установка на диск рядом с Arch (этап 9)
+
+MyOS можно поставить на диск ноутбука, не трогая Arch: из Arch, после
+`make` (или с флешки MyOS — `--from /путь/к/флешке`):
+
+    sudo tools/install-arch.sh           # поставить
+    sudo tools/install-arch.sh --menu    # + меню загрузки на 3 секунды
+    sudo tools/install-arch.sh --remove  # убрать
+
+Скрипт кладёт `BOOTX64.EFI` и `KERNEL.ELF` в свою папку `EFI/MyOS/` на
+разделе EFI (у Arch это `/boot`) и добавляет пункт меню systemd-boot —
+один файл `loader/entries/myos.conf`. Файлы Arch и `loader.conf` не
+меняются. Меню systemd-boot обычно скрыто: при включении держи Пробел
+(или поставь с `--menu`; вернуть как было — `sudo bootctl set-timeout ''`).
+Загрузчик MyOS сам находит ядро в `\EFI\MYOS\` — команда `boot` в MyOS
+покажет, откуда оно загружено.
+
 ## Где что лежит
 
 | Папка | Что внутри |
@@ -200,7 +217,7 @@ UTF-8 и windows-1251 / ISO-8859-*, HTTPS через curl + BearSSL (прове�
 | `fs/` | `vfs.c` пути, тома, открытые файлы, RAM-диск как том `/ram`; `fat.c` FAT16/FAT32 чтение и запись (длинные имена) |
 | `gui/` | оконная система: `gfx.c` рисование и сглаженный шрифт, `wm.c` композитор и рабочий стол, `apps.c` родные приложения, `icons.c` значки, `minesweeper.c` логика Сапёра; `font8x16.h` (генерируется `tools/mkfont.py`) |
 | `shell/` | команды шелла, ввод строки, RAM-диск, `fetch`, редактор |
-| `tools/` | `autotest.py`, `split_main.py` (как был разрезан старый `main.c`) |
+| `tools/` | `autotest.py` проверки в QEMU, `install-arch.sh` установка на диск рядом с Arch, `split_main.py` (как был разрезан старый `main.c`) |
 
 До этапа 0 плана вся ОС была одним файлом `main.c` на ~19 000 строк;
 он лежит в первом коммите git-истории.
