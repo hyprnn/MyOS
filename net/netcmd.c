@@ -234,6 +234,16 @@ void kernel_cmd_net(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
         return;
     }
 
+    if (kstreq(arg, "usb rndis") || kstreq(arg, "usb auto")) {
+        /* какой протокол USB-модема выбирать, если устройство умеет
+           несколько (проверка RNDIS в QEMU; действует на следующее
+           подключение) */
+        g_usbnet_prefer_rndis = kstreq(arg, "usb rndis");
+        kprintf(out, "USB network devices: prefer %s (for the next device plugged in).\n",
+                g_usbnet_prefer_rndis ? "RNDIS" : "CDC-ECM");
+        return;
+    }
+
     if (!net_running()) {
         print(out, "The network is not running (no threads?).\n");
         return;

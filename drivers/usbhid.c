@@ -23,6 +23,7 @@ const char *kx_role_name(UINT8 r)
     case KX_ROLE_MOUSE_RPT:  return "mouse (report descriptor)";
     case KX_ROLE_MOUSE_BOOT: return "mouse (boot protocol)";
     case KX_ROLE_HUB:        return "hub status pipe";
+    case KX_ROLE_NET:        return "network data (bulk IN)";
     default:                 return "not used";
     }
 }
@@ -34,6 +35,10 @@ void kx_pipe_queue(KX_HID *h)
 
     if (len > 512u) len = 512u;
     if (len == 0) len = 8u;
+
+    /* USB-модем: целый кадр (или пачка кадров) за один запрос */
+    if (h->role == KX_ROLE_NET)
+        len = 4096u;
 
     h->req_len = len;
 
@@ -134,6 +139,10 @@ void kx_pipe_report(KX_HID *h, UINTN len)
     } else if (h->role == KX_ROLE_HUB) {
 
         kx_hub_report(h, rep, len);
+
+    } else if (h->role == KX_ROLE_NET) {
+
+        kx_net_report(h, rep, len);
     }
 }
 

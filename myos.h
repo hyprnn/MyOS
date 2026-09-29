@@ -1323,6 +1323,7 @@ typedef struct {
 #define KX_ROLE_MOUSE_RPT   2
 #define KX_ROLE_MOUSE_BOOT  3
 #define KX_ROLE_HUB         4   /* труба "изменились порты" хаба */
+#define KX_ROLE_NET         5   /* bulk IN USB-модема (drivers/usbnet.c) */
 
 #define KX_EP_RUN     0
 #define KX_EP_RESET   1    /* ждём завершения Reset Endpoint */
@@ -1366,6 +1367,7 @@ typedef struct {
     const char *status;
     INT8    hub;           /* индекс в g_kx_hubs или -1 */
     INT8    msd;           /* индекс в g_kx_msd или -1 */
+    INT8    net;           /* USB-модем: индекс в drivers/usbnet.c или -1 */
     UINT64  pages[KX_MAX_DEV_PAGES];   /* всё, что вернуть при
                                           отключении */
     UINT8   npages;
@@ -1413,6 +1415,7 @@ typedef struct {
                               (чужой Report ID, слишком короткие) */
     INT64   abs_last_x;
     INT64   abs_last_y;
+    UINT8   net_slot;      /* KX_ROLE_NET: какой USB-модем */
 } KX_HID;
 
 /* USB-хаб */
@@ -2664,6 +2667,13 @@ extern KX_MSD g_kx_msd[KX_MAX_MSD];
 INTN kx_msd_prepare(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di,
                     KX_MSD_CAND *c, KX_EPCFG *eps, UINTN *neps);
 void kx_msd_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN mi);
+
+/* --- drivers/usbnet.c (USB-модемы: RNDIS, CDC-ECM, CDC-NCM) --- */
+BOOLEAN kx_net_probe(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINTN di, UINT8 ncfg);
+void kx_net_removed(INTN mi);
+void kx_net_report(KX_HID *h, volatile UINT8 *buf, UINTN len);
+void kx_net_print(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+extern BOOLEAN g_usbnet_prefer_rndis;
 
 /* --- kernel/shim.c --- */
 EFI_STATUS EFIAPI kbs_unsupported(void);

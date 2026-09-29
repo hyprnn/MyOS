@@ -495,6 +495,8 @@ static void kernel_cmd_usb_locked(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     if (shown == 0)
         print(out, "No USB devices. Plug something in - it is picked up automatically.\n");
 
+    kx_net_print(out);
+
     print(out, "\nPlug / unplug log:\n");
     kx_print_event_log(out);
 }

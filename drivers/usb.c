@@ -917,6 +917,7 @@ INTN kx_enum_device(SIMPLE_TEXT_OUTPUT_INTERFACE *out,
     d->parent_port = parent_port;
     d->hub = -1;
     d->msd = -1;
+    d->net = -1;
     d->status = "setup failed";
 
     if (parent >= 0) {
@@ -1192,7 +1193,13 @@ INTN kx_enum_device(SIMPLE_TEXT_OUTPUT_INTERFACE *out,
     }
 
     if (ncand == 0 && !(msd.found && msd.in_addr && msd.out_addr)) {
-        kx_out(out, "    not a keyboard, mouse, hub or USB drive - left unconfigured\n");
+
+        /* сеть через USB (телефон в режиме "USB-модем", переходник
+           USB-Ethernet) - этап 8. Смотрит все конфигурации сам. */
+        if (kx_net_probe(out, (UINTN)di, b[17]))
+            return di;
+
+        kx_out(out, "    not a keyboard, mouse, hub, USB drive or network adapter - left unconfigured\n");
         d->status = "unused (unsupported class)";
         return di;
     }
@@ -1289,6 +1296,9 @@ void kx_remove_device(UINTN di)
 
     if (d->msd >= 0)
         g_kx_msd[d->msd].used = FALSE;
+
+    if (d->net >= 0)
+        kx_net_removed(d->net);
 
     /* у родителя-хаба забыть этого ребёнка */
     if (d->parent >= 0) {
@@ -1672,7 +1682,7 @@ void kx_usb_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
             kbds++;
         else if (g_kx_hid[i].role == KX_ROLE_HUB)
             hubs++;
-        else if (g_kx_hid[i].role != KX_ROLE_NONE)
+        else if (g_kx_hid[i].role != KX_ROLE_NONE && g_kx_hid[i].role != KX_ROLE_NET)
             mice++;
     }
 
