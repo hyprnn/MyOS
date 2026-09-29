@@ -629,6 +629,12 @@ def main():
             ('', 'Redirected to https://', 5),
             ('wget --no-check-certificate -O - https://10.0.2.2:%d/hello.txt\n' % hsp,
              'Hello from the host over HTTP!', 60),
+            # запись не удалась посреди HTTPS (RAM-диск мал) - wget обязан
+            # сразу завершиться (на ноутбуке он зависал в br_sslio_close)
+            ('wget --ca-certificate /usb0p1/ca.pem -O /ram/big.bin https://10.0.2.2:%d/big.bin\n'
+             % hsp, 'keeps only small files', 60),
+            ('', 'wget exited with code 1', 10),
+            ('wget -0 - https://10.0.2.2:%d/hello.txt\n' % hsp, 'did you mean -O', 15),
             ('net drop 10\n', 'every 10-th received frame', 10),
             ('wget -O null %s/big.bin\n' % url, crc, 90),
             ('net drop 0\n', 'Test mode off', 10),

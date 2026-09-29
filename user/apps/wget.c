@@ -142,6 +142,7 @@ static const char *c_err(long r)
 static int g_out = -1;
 static int g_screen = 0;
 static int g_null = 0;
+static const char *g_fname = "";
 static unsigned long long g_written = 0;
 static unsigned int g_crc = 0xFFFFFFFFu;
 
@@ -171,6 +172,11 @@ static int out_write(const char *d, long n)
 
     if (r != n) {
         printf("\nwget: cannot write: %s\n", r < 0 ? strerror((int)r) : "disk full?");
+        /* RAM-диск /ram - маленький (файлы до 2 КиБ): подсказать.
+           Относительный путь - скорее всего тоже /ram (шелл стартует там) */
+        if (g_fname[0] != '/' || strncmp(g_fname, "/ram", 4) == 0)
+            printf("      (the RAM disk /ram keeps only small files. Show the page on the\n"
+                   "       screen: wget -O - URL, or save to a USB stick: wget -O /usb0p1/page.htm URL)\n");
         return -1;
     }
 
@@ -264,7 +270,12 @@ int main(int argc, char **argv)
             tls_flags |= TLS_NO_VERIFY;
         else if (strcmp(argv[i], "-q") == 0)
             quiet = 1;
-        else
+        else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            printf("wget: unknown option '%s'%s\n", argv[i],
+                   strcmp(argv[i], "-0") == 0 || strcmp(argv[i], "-o") == 0 ?
+                   " - did you mean -O (capital letter O)?" : "");
+            return 1;
+        } else
             url = argv[i];
     }
 
@@ -440,6 +451,7 @@ int main(int argc, char **argv)
         /* --- куда писать --- */
         const char *fname = outname ? outname : base_name(g_path);
 
+        g_fname = fname;
         g_screen = (strcmp(fname, "-") == 0);
         g_null = (strcmp(fname, "null") == 0);
 

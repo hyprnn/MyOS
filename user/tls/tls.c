@@ -477,8 +477,28 @@ void tls_close(struct myos_tls *t)
     if (t == 0)
         return;
 
-    if (br_ssl_engine_current_state(&t->sc.eng) != BR_SSL_CLOSED)
-        br_sslio_close(&t->io);
+    /* Закрыть: отправить своё close_notify и НЕ ждать ответного.
+       br_sslio_close ждёт его и при недочитанных данных (общий буфер
+       приёма/отправки) может крутиться вечно - так было на ноутбуке,
+       когда wget бросил загрузку. HTTP-клиенту ответ не нужен. */
+    br_ssl_engine_close(&t->sc.eng);
+
+    for (int i = 0; i < 8; i++) {
+
+        unsigned st = br_ssl_engine_current_state(&t->sc.eng);
+
+        if (!(st & BR_SSL_SENDREC))
+            break;
+
+        size_t len;
+        unsigned char *b = br_ssl_engine_sendrec_buf(&t->sc.eng, &len);
+        int w = sock_write(&t->fd, b, len);
+
+        if (w <= 0)
+            break;
+
+        br_ssl_engine_sendrec_ack(&t->sc.eng, (size_t)w);
+    }
 
     /* корни, прочитанные из файла, - наши копии */
     for (size_t i = g_tls_roots_num; i < t->ntas; i++) {
