@@ -41,8 +41,8 @@ archlinux.org), Wi-Fi — Realtek RTL8821CE (10ec:c821). Следующий по
 программа» нужен вынос шелла в ring 3, отложено).
 Не сделаны: SMP (этап 4, «позже»), virtio-blk (не нужен: QEMU-тесты
 идут через AHCI и NVMe), exFAT/NTFS/ext4 (не монтируются). AML (байт-код
-DSDT/SSDT) не исполняется: решение — взять библиотеку uACPI, когда
-понадобятся батарея/крышка/кнопка питания (этап 9).
+DSDT/SSDT) исполняет библиотека uACPI (этап 9): батарея, зарядка, крышка,
+кнопка питания, выключение через S5.
 
 ## Сборка, запуск, тест
 
@@ -497,6 +497,28 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   `browser`: рабочий стол -> терминал -> `browser URL`, затем снимок экрана
   QEMU и подсчёт точек трёх цветов страницы (`{'screen': ...}` в autotest.py).
 
+* **ACPI через uACPI** (`third_party/uacpi`, MIT; этап 9). Ядро даёт ей
+  функции `uacpi_kernel_*` — `kernel/acpi_os.c`: память (`P2V`, страницы
+  вне RAM — `vmm_ensure_writable` c UC), порты, конфигурация PCI (сегмент 0,
+  256 байт), свои мьютекс/событие с таймаутом на `sched_block`, спин-замки
+  (`KSPINLOCK`), SCI на вектор `KX_VEC_ACPI` (0x29; режим линии — из ISO
+  MADT, по умолчанию уровень/низкий), очередь работы из прерываний →
+  поток `acpi`. `kernel/acpi_dev.c`: порядок `uacpi_initialize` →
+  `namespace_load` → `\_PIC(1)` → EC → `namespace_initialize` → поиск
+  устройств → фиксированное событие кнопки → `finalize_gpe_initialization`
+  (в `kmain` — раздел `[power]`, после сети). Драйвер EC (PNP0C09, порты из
+  `_CRS` или ECDT; команды 0x80/0x81/0x84, `_GLK` → глобальный замок; GPE
+  из `_GPE` → запрос → `_Qxx` в потоке acpi). Батарея PNP0C0A: `_STA`,
+  `_BIX`/`_BIF`, `_BST`; блок питания ACPI0003 `_PSR`; крышка PNP0C0D
+  `_LID`; кнопка — фиксированное событие или PNP0C0C (Notify 0x80). Поток
+  `power`: опрос раз в 15 с и сразу после Notify; кнопка питания →
+  `kx_shutdown`, который сначала пробует `acpi_dev_poweroff` (`_PTS` + S5
+  через uACPI), затем старый путь power.c. Команда `battery` (`power`),
+  значок на панели задач (`acpi_battery_brief`). Проверка: прогон
+  `acpi-power` — QEMU с лишней SSDT `tools/test-battery.aml` (поддельные
+  BAT0/ADP1/LID0; исходник `.asl`, собирается `iasl`), `battery`, снимок
+  панели (зелёная заливка), `system_powerdown` → QEMU выключается сам.
+  У QEMU нет EC — драйвер EC проверяется только на ноутбуке.
 * **Установка на диск** (`tools/install-arch.sh`, запуск из Arch): копирует
   загрузчик и ядро в `<ESP>/EFI/MyOS/`, пишет `<ESP>/loader/entries/myos.conf`
   (`efi /EFI/MyOS/BOOTX64.EFI`); `--menu` = `bootctl set-timeout 3`

@@ -163,3 +163,14 @@
 * DejaVu Sans / Serif / Sans Mono (обычный и жирный) — лицензия Bitstream
   Vera + public domain (`fonts/dejavu/LICENSE`); из пакета Ubuntu
   `fonts-dejavu-core`. Кириллица есть. Вшиваются в браузер.
+
+## uacpi/ — uACPI: интерпретатор AML (ACPI) в ядре
+
+* Автор: Daniil Tatianin и участники, https://github.com/uACPI/uACPI —
+  лицензия MIT (`uacpi/LICENSE`). Коммит — в `uacpi/VERSION`.
+* Взяты `source/`, `include/`, `README.md`, `LICENSE` без изменений
+  (без тестов и файлов сборки CMake/meson).
+* Собирается в ядро (`UACPI_CFLAGS` в `Makefile`, настройка
+  `UACPI_NATIVE_ALLOC_ZEROED`). Функции ядра, которые она зовёт
+  (`uacpi_kernel_*`), — `kernel/acpi_os.c`; батарея, EC, кнопка питания —
+  `kernel/acpi_dev.c` (этап 9).

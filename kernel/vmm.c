@@ -330,6 +330,43 @@ BOOLEAN vmm_ensure_mapped(UINT64 phys, UINT64 size, UINT32 cache)
     return TRUE;
 }
 
+/*
+ * То же, но страницы должны быть доступны для ЗАПИСИ (uACPI пишет в
+ * поля AML и в FACS). Страница, уже отображённая только для чтения
+ * (так kernel/acpi.c отображает таблицы вне RAM), переотображается с
+ * записью, сохраняя свой режим кэша; новая - получает cache
+ * (для регистров устройств - VMM_UC).
+ */
+BOOLEAN vmm_ensure_writable(UINT64 phys, UINT64 size, UINT32 cache)
+{
+    UINT64 p = phys & ~4095ull;
+    UINT64 end = (phys + size + 4095u) & ~4095ull;
+
+    while (p < end) {
+
+        UINT64 e = vmm_query(MYOS_HHDM_BASE + p);
+
+        if (e == 0) {
+            if (!vmm_map_page(MYOS_HHDM_BASE + p, p, VMM_W | cache))
+                return FALSE;
+        } else if (!(e & PTE_W)) {
+            /* большие страницы - только RAM ядра, они всегда с записью */
+            if (e & PTE_PS)
+                return FALSE;
+            if (!vmm_map_page(MYOS_HHDM_BASE + p, p,
+                              VMM_W | ((e & PTE_PCD) ? VMM_UC : 0)))
+                return FALSE;
+        } else if (e & PTE_PS) {
+            p = (p & ~0x1FFFFFull) + 0x200000u;
+            continue;
+        }
+
+        p += 4096u;
+    }
+
+    return TRUE;
+}
+
 /* ---------------------------------------------------------------- */
 
 static BOOLEAN vmm_ram_type(UINT32 t)

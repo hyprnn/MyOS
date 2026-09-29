@@ -284,24 +284,17 @@ void acpi_power_init(void)
     ap->why = "no _S5_ object in DSDT/SSDT";
 }
 
-static void io_out16(UINT16 port, UINT16 v)
-{
-    __asm__ __volatile__("outw %0, %1" : : "a"(v), "Nd"(port));
-}
-
-static UINT16 io_in16(UINT16 port)
-{
-    UINT16 v;
-    __asm__ __volatile__("inw %1, %0" : "=a"(v) : "Nd"(port));
-    return v;
-}
-
 void kx_shutdown(void)
 {
     ACPI_POWER *ap = &g_acpi_power;
 
     kcon_flush();
     klog("shutdown requested (ACPI: %s)\n", ap->why ? ap->why : "?");
+
+    /* Этап 9: если работает uACPI - выключаемся по правилам (метод
+       _PTS прошивки, потом S5). Вернулись - не вышло, дальше старый
+       путь. */
+    acpi_dev_poweroff();
 
     kx_cli();
 

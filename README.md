@@ -181,6 +181,18 @@ UTF-8 и windows-1251 / ISO-8859-*, HTTPS через curl + BearSSL (прове�
 Шрифты и стили вшиты в программу и видны ей как файлы `/embed/...`.
 Заодно появилась программа `curl` (`curl -s https://example.com/`).
 
+## Батарея и кнопка питания (этап 9)
+
+`battery` (или `power`) — заряд батареи, сколько осталось до разряда или
+до полной зарядки, ток, износ («health» — ёмкость сейчас против паспорта),
+подключена ли зарядка, открыта ли крышка. На рабочем столе заряд виден
+значком на панели задач (обновляется раз в 15 секунд и сразу, когда
+прошивка сообщит о переменах). Кнопка питания выключает компьютер
+правильно — как в Linux и Windows. Работает через ACPI: программы
+прошивки (байт-код AML) исполняет библиотека uACPI
+(`third_party/uacpi`), батарею ноутбука она читает через контроллер EC —
+его драйвер свой (`kernel/acpi_dev.c`).
+
 ## Установка на диск рядом с Arch (этап 9)
 
 MyOS можно поставить на диск ноутбука, не трогая Arch: из Arch, после
@@ -206,18 +218,18 @@ MyOS можно поставить на диск ноутбука, не трог
 | `bootinfo.h` | "паспорт загрузки" - что загрузчик передаёт ядру, раскладка адресов |
 | `myos.h` | общий заголовок: константы, типы, глобальные переменные, функции |
 | `lib/` | строки, `kprintf`, COM1, `memcpy`/`memset` |
-| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`) |
+| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `acpi_os.c` + `acpi_dev.c` AML через uACPI (батарея, EC, кнопка питания), `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`) |
 | `firmware/` | прошивки устройств, вклеенные в ядро: `rtw88/rtw8821c_fw.bin` (Realtek, только двоичная, условия — `LICENCE.rtlwifi_firmware.txt`) |
 | `drivers/` | PCI, USB (xHCI, клавиатуры/мыши, хабы, флешки — с горячим подключением), PS/2 (клавиатура, мышь/тачпад), разбор HID-дескрипторов; `blk.c` диски, разделы MBR/GPT, кэш секторов; `ahci.c` SATA; `nvme.c` NVMe; сеть: `e1000.c` (Intel), `rtl8169.c` (Realtek), `usbnet.c` (USB-модемы RNDIS/ECM/NCM); Wi-Fi: `rtw8821c.c` (Realtek RTL8821CE, по rtw88) и `rtw8821c_table.c` (таблицы Realtek) |
 | `net/` | стек TCP/IP: `net.c` интерфейсы и поток `net`, `arp.c`, `ip.c` (IPv4, ICMP), `udp.c`, `tcp.c`, `dhcp.c`, `dns.c`, `socket.c` сокеты, `netcmd.c` команда `net` и `ifconfig`; Wi-Fi: `wpa.c` (WPA2: SHA-1, PBKDF2, AES, CCMP, рукопожатие), `wifi.c` (адаптеры, `wifi`), `wlan.c` (802.11: поиск сетей, подключение, `wlan0`), `wlan_sim.c` (программная точка доступа для теста) |
 | `user/` | программы для ring 3: `apps/` (hello, calc, edit, guess, primes, crash, сетевые ping, ifconfig, nslookup, wget, nc, httpd, nettest + оконные clock, paint, life), `lib/` мини-libc (crt0, syscall, printf, malloc, окна `win.c`, сеть `net.c`), `user.ld` |
 | `user/posix/` | полная libc для программ (этап 9): `os.c`, `socket.c`, `fs.c` — POSIX поверх системных вызовов MyOS, свои заголовки (`sys/socket.h`, `netdb.h`...), `crt0.S`, `posix.ld`; программы на ней — `apps/` (`libctest`) |
-| `third_party/` | чужой код с лицензиями (см. `third_party/README.md`): BearSSL, FatFs, picolibc, zlib, curl, NetSurf и его библиотеки, FreeType, libpng, libjpeg-turbo, utf8proc, шрифты DejaVu |
+| `third_party/` | чужой код с лицензиями (см. `third_party/README.md`): BearSSL, FatFs, picolibc, zlib, curl, NetSurf и его библиотеки, FreeType, libpng, libjpeg-turbo, utf8proc, шрифты DejaVu, uACPI |
 | `sysnum.h` | номера системных вызовов — общие для ядра и программ |
 | `fs/` | `vfs.c` пути, тома, открытые файлы, RAM-диск как том `/ram`; `fat.c` FAT16/FAT32 чтение и запись (длинные имена) |
 | `gui/` | оконная система: `gfx.c` рисование и сглаженный шрифт, `wm.c` композитор и рабочий стол, `apps.c` родные приложения, `icons.c` значки, `minesweeper.c` логика Сапёра; `font8x16.h` (генерируется `tools/mkfont.py`) |
 | `shell/` | команды шелла, ввод строки, RAM-диск, `fetch`, редактор |
-| `tools/` | `autotest.py` проверки в QEMU, `install-arch.sh` установка на диск рядом с Arch, `split_main.py` (как был разрезан старый `main.c`) |
+| `tools/` | `autotest.py` проверки в QEMU (`test-battery.asl` — поддельная батарея для них), `install-arch.sh` установка на диск рядом с Arch, `split_main.py` (как был разрезан старый `main.c`) |
 
 До этапа 0 плана вся ОС была одним файлом `main.c` на ~19 000 строк;
 он лежит в первом коммите git-истории.

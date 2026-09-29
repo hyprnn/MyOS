@@ -464,6 +464,10 @@ void kmain_stage2(void)
     kmain_section(out, "[network]");
     net_init(out);
 
+    /* --- батарея, кнопка питания, крышка: AML через uACPI (этап 9) --- */
+    kmain_section(out, "[power]");
+    acpi_dev_init(out);
+
     /* --- таблица функций ядра для шелла и GUI --- */
     kx_install_shims();
 

@@ -414,7 +414,7 @@ static void draw_taskbar(void)
         gfx_text_fit(g, bx + 22, y + 7, w->title, D_BLACK, 15);
 
         bx += bw + 4;
-        if (bx + bw > (INT32)SCR_W - 200)
+        if (bx + bw > (INT32)SCR_W - 280)
             break;
     }
 
@@ -424,6 +424,49 @@ static void draw_taskbar(void)
     INT32 nw = gfx_text_width(net);
     gfx_button(g, (INT32)SCR_W - 96 - nw - 12, y + 4, nw + 12, TASK_H - 8, FALSE);
     gfx_text(g, (INT32)SCR_W - 96 - nw - 6, y + 7, net, D_BLACK);
+
+    /* батарея (этап 9, ACPI): значок-"батарейка" и проценты - левее
+       сети; у компьютера без батареи (и в QEMU) значка нет. Сами
+       числа раз в 15 секунд обновляет поток power (acpi_dev.c). */
+    char bat[8];
+    BOOLEAN charging = FALSE;
+
+    if (acpi_battery_brief(bat, sizeof(bat), &charging)) {
+
+        INT32 tw = gfx_text_width(bat);
+        INT32 bw2 = 22 + 4 + tw + 12;
+        INT32 bx2 = (INT32)SCR_W - 96 - nw - 12 - 4 - bw2;
+        INT32 iy = y + 9;
+        UINT32 pct = 0;
+
+        for (const char *c = bat; *c >= '0' && *c <= '9'; c++)
+            pct = pct * 10u + (UINT32)(*c - '0');
+
+        gfx_button(g, bx2, y + 4, bw2, TASK_H - 8, FALSE);
+
+        /* корпус 18x10 с "носиком" справа, внутри - заливка по заряду:
+           зелёная, красная если мало (15% и меньше) */
+        INT32 ix = bx2 + 6;
+        gfx_fill(g, ix, iy, 18, 1, D_BLACK);
+        gfx_fill(g, ix, iy + 9, 18, 1, D_BLACK);
+        gfx_fill(g, ix, iy, 1, 10, D_BLACK);
+        gfx_fill(g, ix + 17, iy, 1, 10, D_BLACK);
+        gfx_fill(g, ix + 18, iy + 3, 2, 4, D_BLACK);
+
+        INT32 fill = (INT32)(pct > 100u ? 100u : pct) * 14 / 100;
+        if (fill < 1)
+            fill = 1;
+        gfx_fill(g, ix + 2, iy + 2, fill, 6, pct <= 15u ? 0xD02020u : 0x20A020u);
+
+        /* заряжается - "молния" поверх: жёлтый зигзаг */
+        if (charging) {
+            gfx_fill(g, ix + 8, iy + 1, 2, 4, 0xF0D000u);
+            gfx_fill(g, ix + 7, iy + 4, 4, 2, 0xF0D000u);
+            gfx_fill(g, ix + 8, iy + 5, 2, 4, 0xF0D000u);
+        }
+
+        gfx_text(g, ix + 22 + 4, y + 7, bat, D_BLACK);
+    }
 
     /* часы справа + индикатор раскладки */
     EFI_TIME t;

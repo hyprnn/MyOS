@@ -558,6 +558,14 @@ def run_steps(a, work, steps, name, extra=(), devices=None):
         if expect == '':
             time.sleep(timeout)
             found = True
+        elif expect == '@exit':
+            # машина должна выключиться сама (QEMU завершается)
+            t0 = time.time()
+            while vm.p.poll() is None and time.time() - t0 < timeout:
+                time.sleep(0.2)
+            found = vm.p.poll() is not None
+            expect = '(QEMU powered off)'
+
         else:
             found = vm.wait_for(expect, timeout, since=mark if keys else 0)
         print('%-4s %-14s -> %s' % ('PASS' if found else 'FAIL', label,
@@ -875,6 +883,26 @@ def main():
                       '-device', 'e1000,netdev=n0',
                       '-drive', 'if=none,id=nstick,format=raw,file=@WORK@/netstick.img'],
                      ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=nstick']))
+        # ACPI через uACPI (этап 9): поддельная батарея из своей таблицы
+        # SSDT (tools/test-battery.asl), потом "нажать кнопку питания"
+        # (system_powerdown) - MyOS должна выключиться сама (_PTS, S5)
+        bat = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test-battery.aml')
+        runs.append(('acpi-power', [
+            (None, "Type 'help'", 90),
+            ('', 'uACPI: AML loaded', 5),
+            ('battery\n', 'Battery BAT0: 80%, discharging, 3:12 left', 20),
+            ('', 'health: 95% of design', 3),
+            ('', 'AC adapter: unplugged', 3),
+            ('', 'Lid: open', 3),
+            ('', 'Power button: fixed event', 3),
+            # значок батареи на панели задач: зелёная заливка 80%
+            ('start\n', 're:wm: started', 20),
+            ({'screen': [((0x20, 0xA0, 0x20), 8, 40)]}, '', 15),
+            # кнопка питания - прямо с рабочего стола
+            ({'qmp': ('system_powerdown', {})}, 'power button pressed - shutting down', 15),
+            ('', '@exit', 20),
+        ], ['-acpitable', 'file=' + bat]))
+
         # установка рядом с Arch (этап 9): диск с systemd-boot, куда MyOS
         # поставлена tools/install-arch.sh; systemd-boot запускает
         # \EFI\MyOS\BOOTX64.EFI, тот находит ядро рядом

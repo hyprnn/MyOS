@@ -100,6 +100,11 @@ void run_command(
 
         kernel_cmd_acpi(out);
 
+    /* этап 9: батарея, зарядка, крышка (AML через uACPI) */
+    } else if (streq(line, "battery") || streq(line, "power")) {
+
+        kernel_cmd_battery(out);
+
     /* сеть (этап 8): состояние стека; Wi-Fi - что за адаптер */
     } else if (streq(line, "net") || streq(line, "netstat")) {
 
@@ -268,6 +273,7 @@ void run_command(
         print(
             out,
             "  acpi          - ACPI tables: CPU cores, I/O APIC, HPET, PCIe, power\n"
+            "  battery       - battery charge, AC adapter, lid (ACPI via uACPI)\n"
             "  cpu           - CPU load and interrupt counters\n"
             "  ps            - threads: state, CPU share, stack, what they wait for\n"
             "  threadtest    - live test: preemption, fair sharing, mutex\n"

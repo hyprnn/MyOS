@@ -63,10 +63,17 @@ FATFS_SRCS := third_party/fatfs/ff.c third_party/fatfs/ffunicode.c
 FATFS_CFLAGS := $(KCFLAGS) -U_FORTIFY_SOURCE -Wno-extra -Wno-unused-parameter \
              -Ithird_party/fatfs/myos -Ithird_party/fatfs -DFFCONF_H='"ffconf.h"'
 
+# ACPI-байт-код (AML): библиотека uACPI (third_party/uacpi, MIT) в ядре -
+# батарея, кнопка питания, крышка, выключение (этап 9). Свои функции ядра
+# для неё - kernel/acpi_os.c; её настройки - флаги ниже.
+UACPI_SRCS := $(sort $(wildcard third_party/uacpi/source/*.c))
+UACPI_DEFS := -DUACPI_NATIVE_ALLOC_ZEROED
+UACPI_CFLAGS := $(KCFLAGS) -U_FORTIFY_SOURCE -Ithird_party/uacpi/include $(UACPI_DEFS)
+
 LOBJS   := $(LSRCS:%.c=build/loader/%.o)
 KOBJS   := $(KSRCS:%.c=build/kernel/%.o) build/kernel/apps.o build/kernel/firmware.o \
-           $(FATFS_SRCS:%.c=build/kernel/%.o)
-DEPS    := $(LOBJS:.o=.d) $(KSRCS:%.c=build/kernel/%.d)
+           $(FATFS_SRCS:%.c=build/kernel/%.o) $(UACPI_SRCS:%.c=build/kernel/%.o)
+DEPS    := $(LOBJS:.o=.d) $(KSRCS:%.c=build/kernel/%.d) $(UACPI_SRCS:%.c=build/kernel/%.d)
 
 # Программы для ring 3 (этап 6): user/apps/*.c + мини-libc user/lib/.
 # Каждая - отдельный статический ELF (build/user/<имя>), линкуется
@@ -399,6 +406,14 @@ build/kernel/third_party/fatfs/%.o: third_party/fatfs/%.c third_party/fatfs/ffco
 	@mkdir -p $(dir $@)
 	@echo "  CC  [fatfs] $<"
 	@$(CC) $(FATFS_CFLAGS) -c $< -o $@
+
+build/kernel/third_party/uacpi/%.o: third_party/uacpi/%.c
+	@mkdir -p $(dir $@)
+	$(TP_SAY) "  CC  [uacpi] $<"
+	@$(CC) $(UACPI_CFLAGS) -MMD -MP -c $< -o $@
+
+# файлы ядра, которые говорят с uACPI, видят её заголовки
+build/kernel/kernel/acpi_os.o build/kernel/kernel/acpi_dev.o: KCFLAGS += -Ithird_party/uacpi/include $(UACPI_DEFS)
 
 build/kernel/fs/exfat.o: fs/exfat.c
 	@mkdir -p $(dir $@)

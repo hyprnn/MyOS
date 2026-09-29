@@ -728,6 +728,7 @@ typedef struct __attribute__((packed)) {
 #define KX_VEC_PS2_KBD   0x21u    /* IRQ 1 */
 #define KX_VEC_PS2_AUX   0x2Cu    /* IRQ 12 */
 #define KX_VEC_XHCI      0x50u    /* MSI от USB-контроллера */
+#define KX_VEC_ACPI      0x29u    /* SCI - прерывание ACPI (обычно IRQ 9) */
 
 typedef void (*KX_IRQ_HANDLER)(void);
 #define KX_VEC_SPURIOUS  0xFFu
@@ -1220,6 +1221,56 @@ typedef struct {
     UINT16  hpet_min_tick;
 } ACPI_INFO;
 
+/* ACPI-устройства через uACPI (kernel/acpi_dev.c, этап 9) */
+#define ACPI_MAX_BATTERIES 2
+
+typedef struct {
+    BOOLEAN present;        /* батарея вставлена (_STA, бит 4) */
+    BOOLEAN valid;          /* данные прочитаны без ошибок */
+    char    name[8];        /* имя в AML: BAT0 */
+    BOOLEAN mah;            /* единицы: mAh/mA (иначе mWh/mW) */
+    UINT32  design;         /* ёмкость по паспорту */
+    UINT32  full;           /* ёмкость последней полной зарядки */
+    UINT32  design_mv;      /* напряжение по паспорту */
+    UINT32  cycles;         /* циклов заряда (_BIX; 0 - неизвестно) */
+    UINT32  state;          /* _BST[0]: 1 - разряжается, 2 - заряжается,
+                               4 - критически мало */
+    UINT32  rate;           /* ток/мощность сейчас (0xFFFFFFFF - неизвестно) */
+    UINT32  remaining;      /* осталось */
+    UINT32  mv;             /* напряжение сейчас */
+    UINT32  percent;        /* 0..100 */
+    INT32   minutes;        /* до разряда/до полной; -1 - неизвестно */
+    char    model[20], type[8], oem[20];
+} ACPI_BATTERY;
+
+typedef struct {
+    BOOLEAN ok;             /* uACPI работает (таблицы загружены) */
+    const char *why;        /* ...а если нет - почему */
+    UINT32  init_ms;        /* сколько заняла загрузка AML */
+
+    UINT32  nbat;
+    ACPI_BATTERY bat[ACPI_MAX_BATTERIES];
+    UINT64  bat_updated_ms; /* когда читали батареи (мс от старта) */
+
+    BOOLEAN have_ac, ac_online;     /* блок питания ACPI0003, _PSR */
+    BOOLEAN have_lid, lid_open;     /* крышка PNP0C0D, _LID */
+    UINT32  lid_changes;
+
+    BOOLEAN have_ec;                /* контроллер EC (PNP0C09) */
+    BOOLEAN ec_from_ecdt;
+    UINT16  ec_data, ec_cmd;        /* его порты */
+    INT32   ec_gpe;                 /* его GPE (-1 - нет) */
+    BOOLEAN ec_glk;                 /* нужен глобальный замок */
+    UINT64  ec_reads, ec_writes, ec_queries, ec_timeouts;
+
+    BOOLEAN pwrbtn_fixed;           /* кнопка - "фиксированное событие" */
+    UINT32  pwrbtn_devices;         /* ...или устройство PNP0C0C */
+    UINT32  pwrbtn_presses;
+
+    UINT32  n_warnings, n_errors;   /* сообщения uACPI */
+    char    last_msg[96];
+} ACPI_DEVS;
+
 /* ACPI: то, что нужно для выключения (kernel/power.c) */
 typedef struct {
     BOOLEAN ok;
@@ -1617,6 +1668,7 @@ extern UINT64 g_kheap_bad_frees;
 extern UINT64 g_kmm_reclaimed_pages;
 extern ACPI_POWER g_acpi_power;
 extern ACPI_INFO g_acpi;
+extern ACPI_DEVS g_acpid;
 extern UINT64  g_pci_ecam_base;
 extern UINT8   g_pci_ecam_bus_start;
 extern UINT8   g_pci_ecam_bus_end;
@@ -2368,6 +2420,7 @@ BOOLEAN vmm_map_page(UINT64 virt, UINT64 phys, UINT32 attr);
 void vmm_unmap_page(UINT64 virt);
 BOOLEAN vmm_map_mmio(UINT64 phys, UINT64 size, UINT32 cache);
 BOOLEAN vmm_ensure_mapped(UINT64 phys, UINT64 size, UINT32 cache);
+BOOLEAN vmm_ensure_writable(UINT64 phys, UINT64 size, UINT32 cache);
 UINT64 vmm_virt_to_phys(UINT64 virt);
 UINT64 vmm_query(UINT64 virt);
 UINT64 vmm_alloc_stack(UINTN pages, const char *name);
@@ -2387,6 +2440,15 @@ UINT64 acpi_hpet_measure_tsc_hz(void);
 UINT64 acpi_pmtimer_measure_tsc_hz(void);
 UINT32 acpi_current_apic_id(void);
 void kernel_cmd_acpi(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
+/* --- kernel/acpi_os.c, kernel/acpi_dev.c (uACPI, этап 9) --- */
+extern UINT64 g_acpi_sci_count, g_acpi_work_done, g_acpi_work_lost;
+void acpi_os_start(void);
+void acpi_dev_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void acpi_dev_note_log(BOOLEAN error, const char *msg);
+void acpi_dev_poweroff(void);
+BOOLEAN acpi_battery_brief(char *buf, UINTN cap, BOOLEAN *charging);
+void kernel_cmd_battery(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 
 /* --- kernel/tz.c --- */
 #define TZ_MOSCOW     0
@@ -2809,6 +2871,19 @@ void klog(const char *fmt, ...)
 /* ================================================================
  * Маленькие static inline функции (порты, MMIO, TSC, биты)
  * ================================================================ */
+
+/* 16-битные порты: регистры ACPI PM1 (выключение), порты uACPI */
+static inline void io_out16(UINT16 port, UINT16 value)
+{
+    __asm__ __volatile__("outw %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline UINT16 io_in16(UINT16 port)
+{
+    UINT16 value;
+    __asm__ __volatile__("inw %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
 
 static inline void io_out32(UINT16 port, UINT32 value)
 {
