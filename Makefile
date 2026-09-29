@@ -16,6 +16,15 @@
 # Путь к прошивке OVMF можно переопределить: make run OVMF=/путь/к/OVMF.fd
 
 CC      := gcc
+
+# Чужой код (third_party: picolibc, curl, NetSurf... - больше двух тысяч
+# файлов) по одному не печатаем - только готовые библиотеки (AR).
+# make V=1 - печатать и его.
+ifeq ($(V),1)
+TP_SAY  := @echo
+else
+TP_SAY  := @true
+endif
 LD      := ld
 OVMF    ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU    ?= qemu-system-x86_64
@@ -231,7 +240,7 @@ build/user/apps/%.o: user/apps/%.c user/include/myos.h sysnum.h
 
 build/user/bearssl/%.o: $(BSSL_DIR)/src/%.c
 	@mkdir -p $(dir $@)
-	@echo "  CC  [bearssl] $<"
+	$(TP_SAY) "  CC  [bearssl] $<"
 	@$(CC) $(BSSL_CFLAGS) -c $< -o $@
 
 build/user/tls/%.o: user/tls/%.c user/tls/tls.h sysnum.h
@@ -250,7 +259,7 @@ build/user/%: build/user/apps/%.o $(ULIB) $(TLS_LIB) user/user.ld
 
 build/user/picolibc/%.o: $(PICO_DIR)/src/%
 	@mkdir -p $(dir $@)
-	@echo "  CC  [picolibc] $<"
+	$(TP_SAY) "  CC  [picolibc] $<"
 	@$(CC) $(PICO_CFLAGS) -c $< -o $@
 
 $(PICO_LIB): $(PICO_OBJS)
@@ -284,12 +293,12 @@ $(PAPPS:%=build/user/%): build/user/%: build/user/posix/apps/%.o $(POSIX_CRT0) $
 
 build/user/posix/bearssl/%.o: $(BSSL_DIR)/src/%.c
 	@mkdir -p $(dir $@)
-	@echo "  CC  [bearssl-posix] $<"
+	$(TP_SAY) "  CC  [bearssl-posix] $<"
 	@$(CC) $(PBSSL_CFLAGS) -c $< -o $@
 
 build/user/posix/bearssl/roots.o: user/tls/roots.c user/tls/tls.h
 	@mkdir -p $(dir $@)
-	@echo "  CC  [bearssl-posix] $<"
+	$(TP_SAY) "  CC  [bearssl-posix] $<"
 	@$(CC) $(PBSSL_CFLAGS) -Iuser/tls -I. -c $< -o $@
 
 $(PBSSL_LIB): $(PBSSL_OBJS)
@@ -299,7 +308,7 @@ $(PBSSL_LIB): $(PBSSL_OBJS)
 
 build/user/zlib/%.o: $(ZLIB_DIR)/%.c
 	@mkdir -p $(dir $@)
-	@echo "  CC  [zlib] $<"
+	$(TP_SAY) "  CC  [zlib] $<"
 	@$(CC) $(ZLIB_CFLAGS) -c $< -o $@
 
 $(ZLIB_LIB): $(ZLIB_OBJS)
@@ -309,12 +318,12 @@ $(ZLIB_LIB): $(ZLIB_OBJS)
 
 build/user/curlobj/lib/%.o: $(CURL_DIR)/lib/%.c $(CURL_DIR)/myos/curl_config.h
 	@mkdir -p $(dir $@)
-	@echo "  CC  [curl] $<"
+	$(TP_SAY) "  CC  [curl] $<"
 	@$(CC) $(CURL_LIB_CFLAGS) -c $< -o $@
 
 build/user/curlobj/src/%.o: $(CURL_DIR)/src/%.c $(CURL_DIR)/myos/curl_config.h
 	@mkdir -p $(dir $@)
-	@echo "  CC  [curl] $<"
+	$(TP_SAY) "  CC  [curl] $<"
 	@$(CC) $(CURL_TOOL_CFLAGS) -c $< -o $@
 
 $(CURL_LIB): $(CURL_LIB_OBJS)
