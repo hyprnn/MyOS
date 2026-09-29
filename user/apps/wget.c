@@ -459,6 +459,15 @@ int main(int argc, char **argv)
             g_out = open(fname, O_WRITE | O_CREATE | O_TRUNC);
             if (g_out < 0) {
                 printf("wget: cannot create '%s': %s\n", fname, strerror(g_out));
+                if (g_out == MYOS_ENOENT) {
+                    /* нет папки - показать, какие диски есть (как ls /) */
+                    struct myos_dirent d;
+                    printf("      disks and folders you can save to:");
+                    for (int i = 0; readdir("/", i, &d) == 1; i++)
+                        if (strcmp(d.name, "bin") != 0)
+                            printf(" /%s", d.name);
+                    printf("\n      (a flash drive formatted as NTFS is not supported yet)\n");
+                }
                 c_close(s);
                 return 1;
             }

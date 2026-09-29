@@ -23,6 +23,7 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
 """
 import argparse, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time, zlib
 import http.server, urllib.request
+from shutil import which as shutil_which
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fatimg
 
@@ -197,6 +198,72 @@ def make_test_disk(path, mib, bits, scheme, label, extra=None):
     for name, data in (extra or {}).items():
         b.add_file(b.root, name, data)
     fatimg.make_disk(path, mib, b.build(), scheme)
+
+
+# ------------------------------------------------------------ exFAT (как флешка Ventoy)
+
+EXFAT_P1 = 2048                 # раздел 1 (exFAT) - с сектора 2048
+EXFAT_P1_SIZE = 96 * 2048       # 96 МиБ
+
+
+def build_exfattool(work):
+    """tools/exfattool.c + FatFs -> утилита хоста (класть/доставать
+    файлы в образе exFAT). None - нет gcc."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = os.path.join(work, 'exfattool')
+    r = subprocess.run(['gcc', '-O2', '-I' + os.path.join(root, 'third_party/fatfs'),
+                        '-DFFCONF_H="ffconf.h"', '-o', out, os.path.join(root, 'tools/exfattool.c'),
+                        os.path.join(root, 'third_party/fatfs/ff.c'),
+                        os.path.join(root, 'third_party/fatfs/ffunicode.c')],
+                       capture_output=True)
+    return out if r.returncode == 0 else None
+
+
+def make_ventoy_disk(path, tool, work):
+    """Флешка как у Ventoy: MBR, раздел 1 exFAT (тип 0x07) с файлами,
+    раздел 2 - маленький FAT16 (тип 0xEF). Нужен mkfs.exfat."""
+    p1 = os.path.join(work, 'exfat-p1.img')
+    open(p1, 'wb').truncate(EXFAT_P1_SIZE * 512)
+    subprocess.run(['mkfs.exfat', '-L', 'Ventoy', p1], check=True, capture_output=True)
+    for name, data in (('/HOST.TXT', b'Hello from exFAT!\n'), ('/ISO/big.bin', BIG_DATA)):
+        src = os.path.join(work, 'exfat-src.bin')
+        open(src, 'wb').write(data)
+        if name.startswith('/ISO/'):
+            subprocess.run([tool, p1, '0', 'mkdir', '/ISO'], capture_output=True)
+        subprocess.run([tool, p1, '0', 'put', src, name], check=True)
+    p2_start = EXFAT_P1 + EXFAT_P1_SIZE
+    p2_size = 16 * 2048
+    b = fatimg.FatBuilder(p2_size - 4096, 16, 'VTOYEFI')
+    b.add_file(b.root, 'ventoy.txt', b'ventoy efi\n')
+    fat = b.build()
+    img = bytearray((p2_start + p2_size) * 512)
+    img[EXFAT_P1 * 512:(EXFAT_P1 + EXFAT_P1_SIZE) * 512] = open(p1, 'rb').read()
+    img[p2_start * 512:p2_start * 512 + len(fat)] = fat
+    for i, (t, st, n) in enumerate(((0x07, EXFAT_P1, EXFAT_P1_SIZE), (0xEF, p2_start, p2_size))):
+        e = 446 + 16 * i
+        img[e + 4] = t
+        struct.pack_into('<II', img, e + 8, st, n)
+    img[510:512] = b'\x55\xaa'
+    open(path, 'wb').write(img)
+
+
+def check_exfat(path, tool, work, expect):
+    """fsck.exfat (независимая проверка) + содержимое файлов"""
+    problems = []
+    p1 = os.path.join(work, 'exfat-check.img')
+    data = open(path, 'rb').read()
+    open(p1, 'wb').write(data[EXFAT_P1 * 512:(EXFAT_P1 + EXFAT_P1_SIZE) * 512])
+    r = subprocess.run(['fsck.exfat', '-n', p1], capture_output=True, text=True)
+    if r.returncode != 0:
+        problems.append('fsck.exfat: ' + (r.stdout + r.stderr).strip()[-300:])
+    for name, want in expect.items():
+        g = subprocess.run([tool, path, str(EXFAT_P1), 'get', name], capture_output=True)
+        got = g.stdout if g.returncode == 0 else None
+        if want is None and got is not None:
+            problems.append('%s should be gone' % name)
+        elif want is not None and got != want:
+            problems.append('%s: wrong content (%s bytes)' % (name, len(got) if got else 'no'))
+    return problems
 
 
 def check_disk(path, expect):
@@ -394,6 +461,7 @@ def main():
     a = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix='myos-test-')
+    exfat_tool = None
 
     # (что набрать, чего ждать в логе, таймаут в секундах)
     main_steps = [
@@ -698,6 +766,41 @@ def main():
             ('wget -O null %s/big.bin\n' % url, crc, 40),
             ('usb\n', 're:network usb-ecm: .*-> usb0', 15),
         ], ['-netdev', 'user,id=n0'], ['qemu-xhci,id=xhci', 'usb-kbd,bus=xhci.0,port=1']))
+        # exFAT (через FatFs): флешка "как у Ventoy" - большой раздел
+        # exFAT + маленький FAT16; файлы, папки, wget прямо на exFAT,
+        # потом повторная загрузка - всё на месте; в конце fsck.exfat
+        exfat_tool = build_exfattool(work) if shutil_which('mkfs.exfat') and \
+            shutil_which('fsck.exfat') else None
+        if exfat_tool:
+            make_ventoy_disk(os.path.join(work, 'ventoy.img'), exfat_tool, work)
+            vdisk = ['-netdev', 'user,id=n0', '-device', 'e1000,netdev=n0',
+                     '-drive', 'if=none,id=vs,format=raw,file=@WORK@/ventoy.img']
+            vdev = ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=vs']
+            runs.append(('exfat', [
+                (None, "Type 'help'", 90),
+                ('', 'dhcp: eth0: address', 20),
+                ('ls /\n', 're:/usb0p1 +exFAT Ventoy', 15),
+                ('', 're:/usb0p2 +FAT16 VTOYEFI', 5),
+                ('cat /usb0p1/host.txt\n', 'Hello from exFAT!', 15),
+                ('cp /usb0p1/ISO/big.bin /usb0p1/copy.bin\n', 'Copied, 300000 bytes', 30),
+                ('mkdir /usb0p1/myos\n', '>', 10),
+                ('write /usb0p1/myos/note.txt Hello exFAT from MyOS\n', 'is now 22 bytes', 15),
+                ('append /usb0p1/myos/note.txt second line\n', 'is now 34 bytes', 15),
+                ('mv /usb0p1/copy.bin /usb0p1/myos/moved.bin\n', 'Moved.', 15),
+                ('wget -O /usb0p1/myos/dl.bin %s/big.bin\n' % url, crc, 40),
+                ('rm /usb0p1/host.txt\n', 'Deleted.', 15),
+                ('df\n', 're:/usb0p1 +exFAT', 15),
+                ('wget -O /usb0p9/x.htm %s/hello.txt\n' % url, 'disks and folders you can save to', 30),
+            ], vdisk, vdev))
+            runs.append(('exfat-reboot', [
+                (None, "Type 'help'", 90),
+                ('cat /usb0p1/myos/note.txt\n', 'second line', 15),
+                ('ls /usb0p1/myos\n', 'dl.bin', 15),
+                ('ls /usb0p1\n', 'ISO/', 15),
+            ], vdisk, vdev))
+        else:
+            print('(no mkfs.exfat/fsck.exfat or gcc on this machine - exFAT runs skipped;'
+                  ' install exfatprogs)')
         # часовые пояса: часы машины - 15 января 10:00 UTC (зима):
         # Москва 13:00 (UTC+3), Иерусалим 12:00 (IST, UTC+2)
         runs.append(('timezone-winter', [
@@ -764,6 +867,18 @@ def main():
                 print('       ', p)
             if problems:
                 ok = False
+
+    if ok and not a.quick and exfat_tool:
+        problems = check_exfat(os.path.join(work, 'ventoy.img'), exfat_tool, work, {
+            '/myos/note.txt': b'Hello exFAT from MyOS\nsecond line\n',
+            '/myos/moved.bin': BIG_DATA, '/myos/dl.bin': BIG_DATA,
+            '/ISO/big.bin': BIG_DATA, '/HOST.TXT': None, '/copy.bin': None})
+        print('%-4s %-14s -> %s' % ('PASS' if not problems else 'FAIL', '[fsck ventoy.img]',
+                                    'fsck.exfat clean, files as expected' if not problems else ''))
+        for p in problems:
+            print('       ', p)
+        if problems:
+            ok = False
 
     if ok:
         print('\nALL TESTS PASSED')

@@ -270,6 +270,7 @@ static const VFS_OPS g_ram_ops = {
     ram_remove,
     ram_rename,
     ram_statfs,
+    NULL                          /* close: нечего дописывать */
 };
 
 
@@ -313,9 +314,16 @@ INTN vfs_mount_dev(UINTN dev, const char *name)
 
     raw_zero_mem((volatile UINT8 *)m, sizeof(*m));
 
+    /* FAT16/32 - свой драйвер (fs/fat.c); exFAT - через FatFs */
+    BOOLEAN exfat = FALSE;
+
     if (!fat_probe(dev, &m->fat, &why)) {
-        kmutex_unlock(&g_vfs_mutex);
-        return VFS_EINVAL;
+        raw_zero_mem((volatile UINT8 *)m, sizeof(*m));
+        if (!exfat_mount(dev, m)) {
+            kmutex_unlock(&g_vfs_mutex);
+            return VFS_EINVAL;
+        }
+        exfat = TRUE;
     }
 
     UINTN k = 0;
@@ -326,14 +334,17 @@ INTN vfs_mount_dev(UINTN dev, const char *name)
     }
 
     m->name[k] = '\0';
-    m->ops = &g_fat_ops;
+    if (!exfat)
+        m->ops = &g_fat_ops;
     m->dev = dev;
     m->dev_gen = g_blk[dev].gen;
     m->readonly = !g_blk[dev].writable;
     m->used = TRUE;
 
-    klog("vfs: /%s mounted: FAT%u, %u clusters of %u bytes, label \"%s\"%s\n",
-         m->name, m->fat.fat_bits, m->fat.clusters, m->fat.cluster_bytes,
+    char ty[12];
+    vfs_fs_name(m, ty, sizeof(ty));
+    klog("vfs: /%s mounted: %s, %u clusters of %u bytes, label \"%s\"%s\n",
+         m->name, ty, m->fat.clusters, m->fat.cluster_bytes,
          m->fat.label, m->readonly ? ", read-only" : "");
 
     kmutex_unlock(&g_vfs_mutex);
@@ -351,7 +362,7 @@ void vfs_forget_dev(UINTN dev)
 
         VFS_MOUNT *m = &g_mounts[i];
 
-        if (!m->used || m->ops != &g_fat_ops || m->dev != dev)
+        if (!m->used || !vfs_is_disk(m) || m->dev != dev)
             continue;
 
         klog("vfs: /%s is gone (the disk disappeared)\n", m->name);
@@ -377,6 +388,7 @@ void vfs_forget_dev(UINTN dev)
             g_cwd[1] = '\0';
         }
 
+        exfat_release(m);
         m->used = FALSE;
         m->gone = TRUE;
     }
@@ -858,11 +870,34 @@ INTN vfs_close(INTN fd)
 
     VFS_FD *f = fd_get(fd);
 
-    if (f != NULL)
+    if (f != NULL) {
+        VFS_MOUNT *m = (f->mount >= 0) ? &g_mounts[f->mount] : NULL;
+        if (!f->gone && m != NULL && m->used && m->ops->close != NULL)
+            m->ops->close(m, &f->node);
         f->used = FALSE;
+    }
 
     kmutex_unlock(&g_vfs_mutex);
     return f ? VFS_OK : VFS_EBADF;
+}
+
+/* Том на диске (FAT или exFAT), а не RAM-диск или /bin */
+BOOLEAN vfs_is_disk(const VFS_MOUNT *m)
+{
+    return m->ops == &g_fat_ops || m->ops == &g_exfat_ops;
+}
+
+/* "FAT32", "exFAT", "bin", "ram" - для ls / и df */
+void vfs_fs_name(const VFS_MOUNT *m, char *buf, UINTN cap)
+{
+    if (m->ops == &g_fat_ops)
+        ksnprintf(buf, cap, "FAT%u", m->fat.fat_bits);
+    else if (m->ops == &g_exfat_ops)
+        ksnprintf(buf, cap, "exFAT");
+    else if (m->ops == &g_bin_ops)
+        ksnprintf(buf, cap, "bin");
+    else
+        ksnprintf(buf, cap, "ram");
 }
 
 INTN vfs_mkdir(const char *path)

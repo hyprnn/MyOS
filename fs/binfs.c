@@ -173,6 +173,7 @@ const VFS_OPS g_bin_ops = {
     bin_ro_remove,
     bin_ro_rename,
     bin_statfs,
+    NULL                          /* close: нечего дописывать */
 };
 
 /* Смонтировать /bin (после vfs_init) */

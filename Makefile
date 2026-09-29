@@ -48,8 +48,15 @@ KLDFLAGS:= -nostdlib -static -z max-page-size=0x1000 -T kernel/kernel.ld
 LSRCS   := loader/loader.c drivers/pci.c drivers/xhci_common.c lib/libc.c
 KSRCS   := $(sort $(wildcard lib/*.c drivers/*.c kernel/*.c fs/*.c gui/*.c shell/*.c net/*.c))
 
+# exFAT - библиотека FatFs (third_party/fatfs, BSD-1-clause) в ядре; свои
+# флаги: чужой код без -Wextra, вместо <string.h> glibc - своя заглушка
+FATFS_SRCS := third_party/fatfs/ff.c third_party/fatfs/ffunicode.c
+FATFS_CFLAGS := $(KCFLAGS) -U_FORTIFY_SOURCE -Wno-extra -Wno-unused-parameter \
+             -Ithird_party/fatfs/myos -Ithird_party/fatfs -DFFCONF_H='"ffconf.h"'
+
 LOBJS   := $(LSRCS:%.c=build/loader/%.o)
-KOBJS   := $(KSRCS:%.c=build/kernel/%.o) build/kernel/apps.o
+KOBJS   := $(KSRCS:%.c=build/kernel/%.o) build/kernel/apps.o \
+           $(FATFS_SRCS:%.c=build/kernel/%.o)
 DEPS    := $(LOBJS:.o=.d) $(KSRCS:%.c=build/kernel/%.d)
 
 # Программы для ring 3 (этап 6): user/apps/*.c + мини-libc user/lib/.
@@ -154,6 +161,16 @@ build/loader/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  CC  [loader] $<"
 	@$(CC) $(LCFLAGS) -MMD -MP -c $< -o $@
+
+build/kernel/third_party/fatfs/%.o: third_party/fatfs/%.c third_party/fatfs/ffconf.h
+	@mkdir -p $(dir $@)
+	@echo "  CC  [fatfs] $<"
+	@$(CC) $(FATFS_CFLAGS) -c $< -o $@
+
+build/kernel/fs/exfat.o: fs/exfat.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  $<"
+	@$(CC) $(KCFLAGS) -Ithird_party/fatfs -DFFCONF_H='"ffconf.h"' -MMD -MP -c $< -o $@
 
 build/kernel/%.o: %.c
 	@mkdir -p $(dir $@)

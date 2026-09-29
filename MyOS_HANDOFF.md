@@ -49,7 +49,7 @@ DSDT/SSDT) не исполняется: решение — взять библи
 make            # BOOTX64.EFI + kernel.elf, инкрементально; оба -> esp/EFI/BOOT/
 make run        # ISO + QEMU, лог COM1 в терминал (-serial stdio)
 make run-tablet # мышь-планшет (без «стенок» в окне QEMU)
-make test       # tools/autotest.py: 15 запусков QEMU (~5 мин): основной
+make test       # tools/autotest.py: 17 запусков QEMU (~6 мин): основной
                 # (-smp 2, загрузка CPU, ps, threadtest, spin), usb-tree
                 # (хаб, флешка, горячее подключение по QMP), ps2
                 # (IRQ 1/12), gui-threads (SLEEP/SPIN в потоке, пока GUI
@@ -390,6 +390,22 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   1.0–1.2 (в BearSSL нет 1.3). Проверено: автотест (свой HTTPS-сервер
   с `tools/tls-test/`), и из песочницы — настоящий pypi.org через TLS-
   шлюз песочницы (с его корнем).
+* **exFAT** (после этапа 8, по просьбе: флешка пользователя - Ventoy, её
+  большой раздел exFAT): библиотека FatFs (ooFatFs R0.13c из
+  MicroPython, BSD-1) в ядре, `third_party/fatfs` + своя `ffconf.h`;
+  `fs/exfat.c` - прослойка к VFS: FatFs работает с путями, поэтому у
+  VFS_NODE появилось поле `fpath` (путь внутри тома), у VFS_OPS -
+  необязательный `close` (vfs_close дописывает файл), у VFS_MOUNT -
+  `xfs` (том FatFs). Открытый файл тома кэшируется (FIL) между read/
+  write, закрывается при vfs_close или любой другой операции тома;
+  чтение каталога продолжается с того же места. Монтирование:
+  `vfs_mount_dev` - сначала свой FAT, иначе `exfat_mount`
+  ("EXFAT   " в секторе 0). `vfs_is_disk` / `vfs_fs_name` вместо
+  сравнений с g_fat_ops. Проверки: автотест `exfat` / `exfat-reboot`
+  (образ "как Ventoy": MBR, exFAT + FAT16), затем `fsck.exfat -n` и
+  сверка файлов утилитой `tools/exfattool.c` (нужен exfatprogs, иначе
+  запуски пропускаются). Консоль ядра показывает не-ASCII имена как '?'
+  (шрифт консоли - только ASCII; в GUI кириллица есть).
 * **Отладка**: `net` (всё сразу), `net drop N` (терять каждый N-й
   принятый кадр), `klog` пишет DHCP/подключения в COM1.
 * GUI: адрес на панели задач (`net_gui_indicator`), строка «Сеть» в

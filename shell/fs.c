@@ -214,10 +214,12 @@ static void fs_ls_root(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         fs_human(t, sizeof(t), total);
         fs_human(f, sizeof(f), freeb);
 
-        if (m->ops == &g_fat_ops) {
+        if (vfs_is_disk(m)) {
             BLKDEV *d = &g_blk[m->dev];
-            kprintf(out, "  /%-9s FAT%u %-12s %9s, %9s free  %s \"%s\"%s\n",
-                    m->name, m->fat.fat_bits,
+            char ty[12];
+            vfs_fs_name(m, ty, sizeof(ty));
+            kprintf(out, "  /%-9s %-5s %-12s %9s, %9s free  %s \"%s\"%s\n",
+                    m->name, ty,
                     m->fat.label[0] ? m->fat.label : "(no label)", t, f,
                     d->parent >= 0 ? g_blk[d->parent].kind : d->kind,
                     d->model, m->readonly ? "  READ-ONLY" : "");
@@ -469,15 +471,10 @@ static void fs_df(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         fs_human(t, sizeof(t), total);
         fs_human(f, sizeof(f), freeb);
 
-        if (m->ops == &g_fat_ops)
-            ksnprintf(ty, sizeof(ty), "FAT%u", m->fat.fat_bits);
-        else if (m->ops == &g_bin_ops)
-            ksnprintf(ty, sizeof(ty), "bin");
-        else
-            ksnprintf(ty, sizeof(ty), "ram");
+        vfs_fs_name(m, ty, sizeof(ty));
 
         kprintf(out, "/%-10s %-9s %-11s %-11s %s%s\n", m->name, ty, t, f,
-                m->ops == &g_fat_ops ? g_blk[m->dev].name :
+                vfs_is_disk(m) ? g_blk[m->dev].name :
                 m->ops == &g_bin_ops ? "kernel image" : "memory",
                 m->readonly ? " (read-only)" : "");
     }

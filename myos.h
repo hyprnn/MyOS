@@ -1001,6 +1001,7 @@ typedef struct {
     INTN    ram_index;           /* RAM-диск: индекс в g_fs */
     UINT8   attr;
     UINT16  wdate, wtime;        /* FAT: дата и время изменения */
+    char    fpath[VFS_PATH_MAX]; /* exFAT (FatFs): путь внутри тома */
 } VFS_NODE;
 
 /* Запись каталога для ls */
@@ -1025,6 +1026,8 @@ typedef struct {
     INTN (*rename)(struct VFS_MOUNT *m, VFS_NODE *dir, VFS_NODE *node,
                    VFS_NODE *newdir, const char *newname);
     INTN (*statfs)(struct VFS_MOUNT *m, UINT64 *total_bytes, UINT64 *free_bytes);
+    /* файл закрыт (может быть NULL): дописать отложенное на диск */
+    INTN (*close)(struct VFS_MOUNT *m, VFS_NODE *f);
 } VFS_OPS;
 
 /* Том FAT (fs/fat.c) */
@@ -1057,7 +1060,8 @@ typedef struct VFS_MOUNT {
     UINT32         dev_gen;      /* его поколение при монтировании */
     BOOLEAN        readonly;
     BOOLEAN        gone;         /* диск пропал - том мёртв */
-    FAT_VOL        fat;
+    FAT_VOL        fat;          /* FAT; у exFAT - только метка и размеры */
+    void          *xfs;          /* exFAT: том FatFs (fs/exfat.c) */
 } VFS_MOUNT;
 
 
@@ -2518,7 +2522,15 @@ BOOLEAN blk_wait(volatile UINT32 *reg, UINT32 mask, UINT32 want, UINT64 timeout_
 extern const VFS_OPS g_fat_ops;
 BOOLEAN fat_probe(UINTN dev, FAT_VOL *v, const char **why);
 
+/* --- fs/exfat.c (exFAT через библиотеку FatFs) --- */
+extern const VFS_OPS g_exfat_ops;
+BOOLEAN exfat_detect(UINTN dev);
+BOOLEAN exfat_mount(UINTN dev, VFS_MOUNT *m);
+void exfat_release(VFS_MOUNT *m);
+
 /* --- fs/vfs.c --- */
+BOOLEAN vfs_is_disk(const VFS_MOUNT *m);
+void vfs_fs_name(const VFS_MOUNT *m, char *buf, UINTN cap);
 extern VFS_MOUNT g_mounts[VFS_MAX_MOUNTS];
 extern char g_cwd[VFS_PATH_MAX];
 void vfs_init(void);

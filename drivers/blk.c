@@ -475,7 +475,7 @@ static void blk_try_mount(UINTN idx)
     FAT_VOL v;
     const char *why = NULL;
 
-    if (!fat_probe(idx, &v, &why)) {
+    if (!fat_probe(idx, &v, &why) && !exfat_detect(idx)) {
         if (why != NULL)
             klog("blk: %s: not mounted - %s\n", g_blk[idx].name, why);
         return;
@@ -734,10 +734,13 @@ void storage_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         if (!g_mounts[i].used)
             continue;
         vols++;
-        if (g_mounts[i].ops == &g_fat_ops)
-            kprintf(out, "  mounted /%s: FAT%u, label \"%s\"%s\n",
-                    g_mounts[i].name, g_mounts[i].fat.fat_bits, g_mounts[i].fat.label,
+        if (vfs_is_disk(&g_mounts[i])) {
+            char ty[12];
+            vfs_fs_name(&g_mounts[i], ty, sizeof(ty));
+            kprintf(out, "  mounted /%s: %s, label \"%s\"%s\n",
+                    g_mounts[i].name, ty, g_mounts[i].fat.label,
                     g_mounts[i].readonly ? " (read-only)" : "");
+        }
     }
 
     kprintf(out, "  Disks: %u; mounted: %u (including /ram - the RAM disk)\n",
@@ -784,7 +787,7 @@ static const char *blk_mount_of(UINTN dev)
 {
     for (UINTN i = 0; i < VFS_MAX_MOUNTS; i++)
         if (g_mounts[i].used && !g_mounts[i].gone &&
-            g_mounts[i].ops == &g_fat_ops && g_mounts[i].dev == dev)
+            vfs_is_disk(&g_mounts[i]) && g_mounts[i].dev == dev)
             return g_mounts[i].name;
 
     return NULL;
