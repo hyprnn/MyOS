@@ -152,6 +152,28 @@ WPA3-only (SAE), WEP, корпоративного WPA2, скоростей 802.
 числа для ключей даёт ядро (`getrandom`: RDRAND + «шум» прерываний).
 Сайты, которые умеют только TLS 1.3, пока не откроются.
 
+## Браузер (этап 9)
+
+`browser` — веб-браузер **NetSurf**, перенесённый в MyOS: HTML и CSS 2.1,
+картинки PNG, JPEG, GIF и BMP, кириллица (шрифты DejaVu), кодировки
+UTF-8 и windows-1251 / ISO-8859-*, HTTPS через curl + BearSSL (проверка
+сертификатов по корням Mozilla). JavaScript нет (сайты, которые целиком
+рисуются скриптами, не откроются). Запуск — ярлык «Браузер» на рабочем
+столе или пункт в меню «Пуск»; из Терминала — `browser` или
+`browser http://адрес/`. Окно 1000x700; адрес, «назад/вперёд», обновить —
+на панели сверху. В строке адреса `Ctrl+L` (или `Ctrl+A`) — стереть её и
+набрать новый адрес, `Enter` — перейти; колесо мыши листает страницу.
+
+Как он устроен: у программ теперь есть **полная libc** — picolibc
+(`third_party/picolibc`), привязанная к ядру MyOS слоем `user/posix/`
+(`os.c` — файлы, время, память, сигналы; `socket.c` — сокеты BSD,
+`poll`, `getaddrinfo`; `fs.c` — `realpath`, `mmap`, `scandir`). На ней
+собраны curl, zlib, FreeType, libpng, libjpeg-turbo и сам NetSurf с его
+библиотеками — всё в `third_party/`, собирается обычным `make`. Окно —
+своя «поверхность» libnsfb (`third_party/netsurf/libnsfb/src/surface/myos.c`).
+Шрифты и стили вшиты в программу и видны ей как файлы `/embed/...`.
+Заодно появилась программа `curl` (`curl -s https://example.com/`).
+
 ## Где что лежит
 
 | Папка | Что внутри |
@@ -165,6 +187,8 @@ WPA3-only (SAE), WEP, корпоративного WPA2, скоростей 802.
 | `drivers/` | PCI, USB (xHCI, клавиатуры/мыши, хабы, флешки — с горячим подключением), PS/2 (клавиатура, мышь/тачпад), разбор HID-дескрипторов; `blk.c` диски, разделы MBR/GPT, кэш секторов; `ahci.c` SATA; `nvme.c` NVMe; сеть: `e1000.c` (Intel), `rtl8169.c` (Realtek), `usbnet.c` (USB-модемы RNDIS/ECM/NCM); Wi-Fi: `rtw8821c.c` (Realtek RTL8821CE, по rtw88) и `rtw8821c_table.c` (таблицы Realtek) |
 | `net/` | стек TCP/IP: `net.c` интерфейсы и поток `net`, `arp.c`, `ip.c` (IPv4, ICMP), `udp.c`, `tcp.c`, `dhcp.c`, `dns.c`, `socket.c` сокеты, `netcmd.c` команда `net` и `ifconfig`; Wi-Fi: `wpa.c` (WPA2: SHA-1, PBKDF2, AES, CCMP, рукопожатие), `wifi.c` (адаптеры, `wifi`), `wlan.c` (802.11: поиск сетей, подключение, `wlan0`), `wlan_sim.c` (программная точка доступа для теста) |
 | `user/` | программы для ring 3: `apps/` (hello, calc, edit, guess, primes, crash, сетевые ping, ifconfig, nslookup, wget, nc, httpd, nettest + оконные clock, paint, life), `lib/` мини-libc (crt0, syscall, printf, malloc, окна `win.c`, сеть `net.c`), `user.ld` |
+| `user/posix/` | полная libc для программ (этап 9): `os.c`, `socket.c`, `fs.c` — POSIX поверх системных вызовов MyOS, свои заголовки (`sys/socket.h`, `netdb.h`...), `crt0.S`, `posix.ld`; программы на ней — `apps/` (`libctest`) |
+| `third_party/` | чужой код с лицензиями (см. `third_party/README.md`): BearSSL, FatFs, picolibc, zlib, curl, NetSurf и его библиотеки, FreeType, libpng, libjpeg-turbo, utf8proc, шрифты DejaVu |
 | `sysnum.h` | номера системных вызовов — общие для ядра и программ |
 | `fs/` | `vfs.c` пути, тома, открытые файлы, RAM-диск как том `/ram`; `fat.c` FAT16/FAT32 чтение и запись (длинные имена) |
 | `gui/` | оконная система: `gfx.c` рисование и сглаженный шрифт, `wm.c` композитор и рабочий стол, `apps.c` родные приложения, `icons.c` значки, `minesweeper.c` логика Сапёра; `font8x16.h` (генерируется `tools/mkfont.py`) |

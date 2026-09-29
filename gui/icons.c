@@ -259,6 +259,26 @@ static const char *const ic_paint[16] = {
     "................"
 };
 
+/* глобус - браузер (этап 9) */
+static const char *const ic_web[16] = {
+    ".....kkkkkk.....",
+    "...kkBBGGBBkk...",
+    "..kBBGGGGBBBBk..",
+    ".kBBBGGGBBBBBBk.",
+    ".kBBGGGGGBBGGBk.",
+    "kBBBBGGGBBBGGGBk",
+    "kBBBBBGBBBGGGGBk",
+    "kBBBBBBBBBBGGBBk",
+    "kBBGGBBBBBBBBBBk",
+    "kBGGGGBBBBBBBBBk",
+    ".kGGGGGBBBBBBBk.",
+    ".kBGGGBBBBBBBBk.",
+    "..kBBBBBBBBBBk..",
+    "...kkBBBBBBkk...",
+    ".....kkkkkk.....",
+    "................"
+};
+
 static const char *const ic_logo[16] = {
     "................",
     ".kkkkkkkkkkkkkk.",
@@ -336,6 +356,7 @@ static const ICON_ENTRY g_icons[] = {
     { "clock", ic_clock },
     { "paint", ic_paint },
     { "logo", ic_logo },
+    { "web", ic_web },
     { "help", ic_help },
     { "shutdown", ic_shutdown }
 };

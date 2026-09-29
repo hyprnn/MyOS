@@ -78,7 +78,9 @@
 * Не взято: заглушки ОС (`libos/`), TLS (`tls.c`, `tcb.S`, `inittls.c`),
   `popen`/`system`/`exec*`/`getpass` — в MyOS программы не порождают процессов.
 * Изменено: `include/sys/features.h` — при `__myos__` объявлены
-  `_POSIX_MONOTONIC_CLOCK` и `_POSIX_TIMERS` (как для RTEMS).
+  `_POSIX_MONOTONIC_CLOCK` и `_POSIX_TIMERS` (как для RTEMS);
+  `include/sys/cdefs.h` — запасной `__has_extension` (у gcc его нет, без него
+  заголовки не собираются в режиме `-std=c99`).
 * Привязка к ядру MyOS — свой файл `user/posix/os.c` (read/write/open/lseek/
   fstat/sbrk/время/opendir...). Программы на ней — `user/posix/apps/`.
 
@@ -104,3 +106,60 @@
   встроенным корням Mozilla из `user/tls/roots.c` (как `wget`).
 * Особенность BearSSL-части curl: сертификат сверяется только с именем
   сервера, не с IP-адресом (`https://1.2.3.4/` с проверкой не пройдёт).
+
+## netsurf/ — браузер NetSurf и его библиотеки (этап 9)
+
+* NetSurf — https://www.netsurf-browser.org/, лицензия **GPL-2.0**
+  (`netsurf/netsurf/COPYING`; отдельные файлы — MIT, см. их начало). Это
+  отдельная программа `/bin/browser`; ядро MyOS под неё не попадает.
+* Библиотеки проекта NetSurf — лицензия **MIT** (`netsurf/<имя>/COPYING`):
+  libwapcaplet, libparserutils, libhubbub (HTML5-разбор), libdom, libcss,
+  libnsutils, libnsgif, libnsbmp, libnspsl, libnslog, libnsfb (рисование).
+* Откуда: https://github.com/netsurf-browser/…, ветка master (сентябрь 2026):
+  netsurf `39da3c3a40af`, libwapcaplet `c7c128d3eb32`, libparserutils
+  `6b0cbf086ca8`, libhubbub `6651b8cf87a4`, libdom `f69781e1f062`, libcss
+  `499f1c4601ad`, libnsutils `0bd39060740b`, libnsgif `22e99eb6818b`, libnsbmp
+  `ea063c9f46ac`, libnspsl `82815c2bc7fd`, libnslog `bedff2146270`, libnsfb
+  `b701cdce7241`.
+* Как получено: сборка их собственной системой сборки (buildsystem) под MyOS
+  (компилятор-обёртка с picolibc и `user/posix`; NetSurf: цель framebuffer,
+  шрифты FreeType, без JavaScript, SVG, WebP, PDF), затем скопированы ровно те
+  исходники и заголовки, что попали в сборку (по `gcc -M`), вместе со
+  сгенерированными файлами (папки `gen/`: таблицы libcss/hubbub/parserutils,
+  разборщик фильтров libnslog (bison/flex), картинки кнопок NetSurf в C,
+  `testament.h`) — поэтому perl, gperf, bison не нужны. Правила сборки —
+  сгенерированный `netsurf/build.mk` (флаги — как у их сборки), подключается
+  из `Makefile`. `netsurf/include/` — два заголовка libdom под тем путём, по
+  которому их подключают (`dom/bindings/hubbub/`).
+* Ресурсы браузера — `netsurf/netsurf/resources/` (тексты `Messages` —
+  английский набор, собранный их скриптом из `FatMessages`; стили, страницы
+  about:, картинки). Вшиваются в программу (`/embed/...`, см. `NS_EMBED`).
+* Изменено (помечено «MyOS» в тексте):
+  * libnsfb: новая поверхность `src/surface/myos.c` (окно рабочего стола MyOS,
+    события мыши и клавиатуры) и `NSFB_SURFACE_MYOS` в `include/libnsfb.h`;
+  * NetSurf `frontends/framebuffer/gui.c` — по умолчанию окно MyOS 1000x700;
+    `fbtk/event.c` — готовый символ Юникода от MyOS (русская раскладка);
+    `fbtk/text.c` — строка адреса хранит UTF-8 (кириллица; Backspace и
+    стрелки — по целым символам), Ctrl+A / Ctrl+L очищают её;
+    `content/fetchers/curl.c` и `frontends/framebuffer/schedule.c` — две
+    ошибки типов (int вместо long), найденные предупреждениями gcc;
+  * libparserutils собрана с `WITHOUT_ICONV_FILTER`: кодировки страниц
+    (UTF-8, UTF-16, ISO-8859-*, Windows-125*) переводит она сама, а не iconv.
+
+## freetype/, libpng/, libjpeg-turbo/, utf8proc/ — шрифты, картинки, Юникод
+
+* FreeType 2.13.3 (тег `VER-2-13-3`, https://freetype.org/) — лицензия FTL
+  (`freetype/LICENSE.TXT`, `docs/FTL.TXT`); без zlib/bzip2/png/HarfBuzz/Brotli.
+  `freetype/myos/include` — настройки, созданные его CMake.
+* libpng 1.6.50 (тег `v1.6.50`) — лицензия libpng (`libpng/LICENSE`);
+  настройки — готовый `scripts/pnglibconf.h.prebuilt`.
+* libjpeg-turbo 3.1.2 (тег `3.1.2`) — лицензии IJG и BSD (`LICENSE.md`,
+  `README.ijg`); без SIMD. `libjpeg-turbo/myos` — созданные CMake `jconfig*.h`.
+* utf8proc 2.10.0 (тег `v2.10.0`, JuliaStrings) — лицензия MIT
+  (`utf8proc/LICENSE.md`) — нужен NetSurf для международных имён сайтов.
+
+## fonts/dejavu/ — шрифты DejaVu для браузера
+
+* DejaVu Sans / Serif / Sans Mono (обычный и жирный) — лицензия Bitstream
+  Vera + public domain (`fonts/dejavu/LICENSE`); из пакета Ubuntu
+  `fonts-dejavu-core`. Кириллица есть. Вшиваются в браузер.

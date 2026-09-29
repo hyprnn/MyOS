@@ -164,12 +164,20 @@ void kbd_press_usage(UINT8 u)
         UINT8 mods = (UINT8)(g_kbd_usb_mods | g_kbd_ps2_mods);
 
         if ((mods & 0x11u) && u == 0x06) {
-            if (g_fg_proc != NULL) {
+            /* у программы своё окно и оно в фокусе (браузер) - там
+               Ctrl+C значит "копировать": отдать как обычную клавишу
+               (Ctrl программа узнает из события окна) */
+            WIN *fw = wm_focused();
+            BOOLEAN own_window = (g_fg_proc != NULL && fw != NULL && fw->proc == g_fg_proc);
+
+            if (g_fg_proc != NULL && !own_window) {
                 proc_ctrl_c();
                 return;
             }
-            kbd_enqueue(0, 3);
-            return;
+            if (!own_window) {
+                kbd_enqueue(0, 3);
+                return;
+            }
         }
 
         /* буквы a..z */

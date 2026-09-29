@@ -220,8 +220,12 @@ struct myos_event {
     int          x, y;
     unsigned int buttons;
     int          wheel;
-    unsigned int pad;
+    unsigned int mods;      /* EV_KEY: какие клавиши-модификаторы зажаты
+                               (MYOS_MOD_*, этап 9); иначе 0 */
 };
+#define MYOS_MOD_CTRL   0x01
+#define MYOS_MOD_SHIFT  0x02
+#define MYOS_MOD_ALT    0x04
 
 #define MYOS_WIN_BASE     0x0000600000000000ull
 #define MYOS_WIN_SPAN     0x0000000001000000ull      /* 16 МиБ на окно */

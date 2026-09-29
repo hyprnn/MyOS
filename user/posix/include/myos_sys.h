@@ -20,6 +20,18 @@ long myos_syscall3(long nr, long a1, long a2, long a3);
 /* То же, с четырьмя (sendto/recvfrom: четвёртый - в r10) */
 long myos_syscall4(long nr, long a1, long a2, long a3, long a4);
 
+/*
+ * Встроенные файлы: программа может вшить в себя файлы (шрифты,
+ * стили) таблицей __myos_embedded_files - libc покажет их как файлы
+ * только для чтения "/embed/<name>" (user/posix/os.c). Конец таблицы -
+ * запись с name == NULL.
+ */
+struct myos_embed_file {
+    const char          *name;     /* "fonts/DejaVuSans.ttf" */
+    const unsigned char *data;
+    unsigned long        size;
+};
+
 /* Ошибку MYOS_E* - в errno (для своих обёрток): errno = ..., ответ -1 */
 int myos_set_errno(long myos_err);
 

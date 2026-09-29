@@ -1093,6 +1093,7 @@ void app_open_minesweeper(void)
 static const struct { const char *label; const char *icon; const char *cmd; } g_desk[] = {
     { "Мой компьютер", "computer", "explorer" },
     { "Терминал",      "terminal", "terminal" },
+    { "Браузер",       "web",      "browser"  },
     { "Блокнот",       "notepad",  "notepad"  },
     { "Часы",          "clock",    "clock"    },
     { "Рисование",     "paint",    "paint"    },
@@ -1191,7 +1192,8 @@ void apps_desktop_launch(const char *what)
     else if (kstreq(what, "calc") || kstreq(what, "guess") ||
              kstreq(what, "primes") || kstreq(what, "hello") || kstreq(what, "crash"))
         app_open_program(what);
-    else if (kstreq(what, "clock") || kstreq(what, "paint") || kstreq(what, "life"))
+    else if (kstreq(what, "clock") || kstreq(what, "paint") || kstreq(what, "life") ||
+             kstreq(what, "browser"))
         app_run_bare(what);          /* графическая программа - без терминала */
     else
         app_open_program(what);

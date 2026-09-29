@@ -457,6 +457,46 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   «О системе»; `fetch` — строка Network; `lspci` помечает сетевые карты.
 * Проверено только в QEMU. На ноутбуке без кабеля — USB-модем телефона.
 
+## Полная libc и браузер (этап 9) — как устроено
+
+* **picolibc** (`third_party/picolibc`, собирается make по `files.mk`) — libc
+  для программ `user/posix/apps/*.c` (и перенесённых). Однопоточная, без TLS;
+  errno глобальный. Привязка к ядру — `user/posix/`: `os.c` (read/write/open/
+  lseek/fstat/stat/sbrk/время/сигналы-эмуляция/opendir, коды MYOS_E* -> errno,
+  TZ из ядра), `socket.c` (сокеты BSD поверх SYS_SOCKET.., MSG_PEEK хранится
+  в программе, poll/select, getaddrinfo через SYS_RESOLVE), `fs.c` (realpath,
+  scandir, mmap = malloc+read, *at через dirfd). Линкуются архивом
+  `libposix.a`: сокеты подтягиваются только если нужны (слабые ссылки).
+  Свои заголовки (`sys/socket.h`, `netdb.h`...) — `user/posix/include`,
+  перед заголовками picolibc; `-nostdinc`, чтобы не попали заголовки glibc.
+* **Ядро для неё**: SYS_SEEK/FSTAT/GETCWD/CHDIR, SYS_POLL (ждёт
+  `g_net_any_event`, который будит каждый `net_wake`; проверка и сон под
+  g_net_mutex — событие не теряется), неблокирующие сокеты (`MYOS_SO_NONBLOCK`:
+  sock_wait сразу MYOS_EAGAIN, connect — MYOS_EINPROGRESS, итог —
+  `MYOS_SO_ERROR`), `MYOS_SO_LOCALADDR`. 32 fd на программу, куча до 512 МБ,
+  стек 1 МБ, ELF до 32 МБ. События окна: поле `mods` (Ctrl/Shift/Alt);
+  Ctrl+C не убивает программу, если в фокусе её собственное окно.
+* **Встроенные файлы**: таблица `__myos_embedded_files` (myos_sys.h) в
+  программе -> файлы только для чтения `/embed/...` (и папки) в open/read/
+  lseek/stat/fstat. Браузер так носит шрифты, стили, `Messages`.
+* **curl 8.14.1** (последний с BearSSL) + zlib: `third_party/curl`, настройки
+  `curl/myos/curl_config.h` (создан CMake с тулчейном MyOS). BearSSL собран
+  второй раз для picolibc (`PBSSL_CFLAGS`: time(), getentropy). Без файла
+  корней curl верит `user/tls/roots.c`. Имя в сертификате — только DNS (не IP).
+* **NetSurf**: `third_party/netsurf/` — NetSurf + 11 библиотек; FreeType,
+  libpng, libjpeg-turbo, utf8proc рядом. `netsurf/build.mk` — правила,
+  сгенерированные из журнала их родной сборки (скрипт переноса: собрать всё
+  их buildsystem с обёрткой `x86_64-myos-gcc` [gcc + picolibc + user/posix],
+  взять команды компиляции, gcc -M -> список файлов). Окно — поверхность
+  libnsfb `src/surface/myos.c` (буфер окна = пиксели XRGB8888 libnsfb,
+  win_event -> события nsfb; символы Юникода кодом 0x10000+c, правка в
+  `fbtk/event.c`). libparserutils — без iconv (свои кодеки: UTF-8/16,
+  ISO-8859, Windows-125x); iconv picolibc знает только UTF-8. Нет:
+  JavaScript, SVG, WebP; курсивных шрифтов (курсив — обычным).
+* **Проверки**: `libctest` (main, usb-tree), curl (network), прогон
+  `browser`: рабочий стол -> терминал -> `browser URL`, затем снимок экрана
+  QEMU и подсчёт точек трёх цветов страницы (`{'screen': ...}` в autotest.py).
+
 ## Ранний запуск на железе (диагностика без COM-порта)
 
 После ExitBootServices загрузчик рисует серую полосу по верху

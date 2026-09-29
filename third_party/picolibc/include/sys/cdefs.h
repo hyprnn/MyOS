@@ -78,6 +78,11 @@
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
+/* MyOS (изменение MyOS): у gcc нет __has_extension - без этого
+   заголовки не собираются в режиме -std=c99 (NetSurf) */
+#ifndef __has_extension
+#define __has_extension(x) __has_feature(x)
+#endif
 #ifndef __has_builtin
 #define __has_builtin(x) 0
 #endif

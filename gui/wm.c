@@ -96,6 +96,7 @@ static BOOLEAN g_menu_open = FALSE;
 /* пункты меню "Пуск": имя, значок, что открыть (apps_desktop_launch) */
 static const struct { const char *label; const char *icon; const char *cmd; } g_menu[] = {
     { "Терминал",    "terminal", "terminal" },
+    { "Браузер",     "web",      "browser"  },
     { "Блокнот",     "notepad",  "notepad"  },
     { "Проводник",   "folder",   "explorer" },
     { "Калькулятор", "calc",     "calc"     },
@@ -762,7 +763,13 @@ static void on_key(EFI_INPUT_KEY *key)
     if (g_focus == NULL)
         return;
 
-    struct myos_event e = { EV_KEY, key->UnicodeChar, key->ScanCode, 0, 0, 0, 0, 0 };
+    /* модификаторы - как зажаты сейчас (HID: бит 0/4 Ctrl, 1/5 Shift,
+       2/6 Alt): программам вроде браузера нужны Ctrl+C/V/A */
+    UINT8 hid = (UINT8)(g_kbd_usb_mods | g_kbd_ps2_mods);
+    UINT32 mods = ((hid & 0x11u) ? MYOS_MOD_CTRL : 0u) |
+                  ((hid & 0x22u) ? MYOS_MOD_SHIFT : 0u) |
+                  ((hid & 0x44u) ? MYOS_MOD_ALT : 0u);
+    struct myos_event e = { EV_KEY, key->UnicodeChar, key->ScanCode, 0, 0, 0, 0, mods };
 
     deliver(g_focus, &e);
 }

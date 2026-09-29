@@ -48,7 +48,7 @@ void (*g_proc_gui_sink)(const char *line) = NULL;   /* куда программ
 #define UPTE_SHARED (1ull << 9)     /* страница чужая (буфер окна) - не освобождать */
 #define UPTE_ADDR  0x000FFFFFFFFFF000ull
 
-#define MAX_ELF_SIZE   (8u * 1024u * 1024u)
+#define MAX_ELF_SIZE   (32u * 1024u * 1024u)   /* браузер со шрифтами - ~7 МБ */
 
 
 /* ================================================================

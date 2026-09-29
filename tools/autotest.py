@@ -21,7 +21,7 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
 
 Выход: 0 - все проверки прошли, 1 - что-то не так (лог сохранён).
 """
-import argparse, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time, zlib
+import argparse, base64, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time, zlib
 import http.server, urllib.request
 from shutil import which as shutil_which
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -301,12 +301,57 @@ def free_port():
     return port
 
 
+# Тестовая страница для браузера (этап 9): заголовок нужного цвета,
+# картинки PNG (жёлтый круг) и JPEG (малиновый прямоугольник), русский
+# текст. Автотест потом ищет эти цвета на снимке экрана.
+BROWSER_H1 = (0x1a, 0x5f, 0xb4)
+BROWSER_SUN = (255, 200, 0)
+BROWSER_JPEG = (200, 30, 160)
+BROWSER_JPEG_DATA = base64.b64decode('''
+/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsK
+CwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQU
+FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAA8AFADASIA
+AhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQA
+AAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3
+ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWm
+p6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEA
+AwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSEx
+BhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElK
+U1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3
+uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDyqiii
+v2A/sUKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAC
+iiigAooooAKKKKACiiigAooooAKKKKAP/9k=
+''')
+BROWSER_PAGE = ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Тест MyOS</title>"
+                "<style>body{background:#fff;font-family:sans-serif}h1{color:#1a5fb4;font-size:40px}"
+                "</style></head><body><h1>Браузер MyOS: Привет!</h1>"
+                "<p>Русский текст, <b>жирный</b>, ссылка <a href='hello.txt'>hello</a>.</p>"
+                "<p><img src='sun.png' width='120' height='120'> <img src='box.jpg'></p>"
+                "</body></html>").encode('utf-8')
+
+
+def make_png(w, h, pixel):
+    """PNG без сторонних библиотек: pixel(x, y) -> (r, g, b)"""
+    raw = b''.join(b'\0' + bytes(c for x in range(w) for c in pixel(x, y)) for y in range(h))
+
+    def chunk(t, d):
+        return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) +
+            chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+
 def start_host_http(folder):
     """HTTP-сервер на хосте: из QEMU (-netdev user) он виден как
-    10.0.2.2:порт. Раздаёт hello.txt и big.bin (BIG_DATA)."""
+    10.0.2.2:порт. Раздаёт hello.txt и big.bin (BIG_DATA), страницу для
+    браузера (page.html, sun.png, box.jpg)."""
     os.makedirs(folder, exist_ok=True)
     open(os.path.join(folder, 'hello.txt'), 'wb').write(HOST_HELLO)
     open(os.path.join(folder, 'big.bin'), 'wb').write(BIG_DATA)
+    open(os.path.join(folder, 'page.html'), 'wb').write(BROWSER_PAGE)
+    open(os.path.join(folder, 'box.jpg'), 'wb').write(BROWSER_JPEG_DATA)
+    open(os.path.join(folder, 'sun.png'), 'wb').write(make_png(
+        120, 120, lambda x, y: BROWSER_SUN if (x - 60) ** 2 + (y - 60) ** 2 < 50 ** 2
+        else (255, 255, 255)))
 
     class Quiet(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kw):
@@ -356,6 +401,22 @@ def start_host_https(folder):
 
 
 DEFAULT_DEVICES = ['qemu-xhci', 'usb-mouse', 'usb-kbd']
+
+
+def count_colors(ppm, colors, tols):
+    """Сколько точек снимка (PPM P6 от QEMU) близки к каждому из цветов"""
+    data = open(ppm, 'rb').read()
+    parts = data.split(b'\n', 3)          # P6, "w h", 255, пиксели
+    w, h = (int(v) for v in parts[1].split())
+    px = parts[3]
+    counts = [0] * len(colors)
+    for i in range(0, w * h * 3, 3):
+        r, g, b = px[i], px[i + 1], px[i + 2]
+        for k, (cr, cg, cb) in enumerate(colors):
+            t = tols[k]
+            if abs(r - cr) <= t and abs(g - cg) <= t and abs(b - cb) <= t:
+                counts[k] += 1
+    return counts
 
 
 def run_steps(a, work, steps, name, extra=(), devices=None):
@@ -411,6 +472,28 @@ def run_steps(a, work, steps, name, extra=(), devices=None):
                     vm.mouse_move(5, 3)
                     time.sleep(0.03)
                 label = '[mouse]'
+            if 'screen' in keys:
+                # снимок экрана QEMU: есть ли на нём нужные цвета (цвет,
+                # допуск, сколько точек минимум) - ждём до timeout секунд
+                want = keys['screen']
+                label = '[screen]'
+                shot = os.path.join(vmdir, 'screen.ppm')
+                t0, good, counts = time.time(), False, []
+                while time.time() - t0 < timeout:
+                    vm.cmd('screendump', filename=shot)
+                    time.sleep(0.5)
+                    counts = count_colors(shot, [c for c, t, n in want], [t for c, t, n in want])
+                    if all(counts[i] >= want[i][2] for i in range(len(want))):
+                        good = True
+                        break
+                    time.sleep(1)
+                print('%-4s %-14s -> %s' % ('PASS' if good else 'FAIL', label,
+                      ', '.join('#%02x%02x%02x x%d (need %d)' % (c + (counts[i] if counts else 0, n))
+                                for i, (c, t, n) in enumerate(want))))
+                if not good:
+                    ok = False
+                    break
+                continue
             if 'http' in keys:
                 # хост скачивает страницу у httpd внутри MyOS (hostfwd)
                 port, path, want = keys['http']
@@ -551,7 +634,7 @@ def main():
         ], [], ['qemu-xhci']))
         # Рабочий стол (этап 7): композитор, окна, окно программы.
         # Экран теста 1280x800; панель задача снизу, кнопка "Пуск" слева.
-        # Меню "Пуск" открывается вверх; пункт "Часы" - 5-й (clock),
+        # Меню "Пуск" открывается вверх; пункт "Часы" - 6-й (clock),
         # запускает программу, у неё своё окно (winproc в COM1).
         runs.append(('desktop', [
             (None, "Type 'help'", 90),
@@ -560,21 +643,21 @@ def main():
             # открыть меню "Пуск"
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            # пункт "Терминал" (1-й, y=569): курсор в (60,575)
-            ({'goto': (60, 575)}, '', 0.3),
+            # пункт "Терминал" (1-й, y=549..569): курсор в (60,559)
+            ({'goto': (60, 559)}, '', 0.3),
             ({'click': 1}, "re:wm: window .* opened", 8),
-            # снова меню -> "Часы" (5-й пункт, y=569+4*20=649)
+            # снова меню -> "Часы" (6-й пункт, y=549+5*20=649..669)
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            ({'goto': (60, 649)}, '', 0.3),
+            ({'goto': (60, 655)}, '', 0.3),
             ({'click': 1}, 're:wm: launch clock', 8),
             ('', 're:winproc: pid [0-9]+ got window', 10),
             # мышь двигается - композитор жив
             ({'mouse': 15}, '', 1),
-            # выход из рабочего стола: меню "Пуск" -> "Выход" (10-й, y=569+9*20=749)
+            # выход из рабочего стола: меню "Пуск" -> "Выход" (11-й, y=549+10*20=749..769)
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            ({'goto': (60, 749)}, '', 0.3),
+            ({'goto': (60, 755)}, '', 0.3),
             ({'click': 1}, 'Left the desktop', 10),
         ]))
         # диски и файлы (этап 5): флешка (MBR+FAT32), SATA-диск через
@@ -652,7 +735,7 @@ def main():
             ('start\n', 're:wm: started', 20),
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            ({'goto': (60, 609)}, '', 0.3),
+            ({'goto': (60, 615)}, '', 0.3),
             ({'click': 1}, 're:wm: launch explorer', 8),
         ], disks, ddev))
         # чипсет q35: PCIe через ECAM (MCFG), перезагрузка через FADT
@@ -750,6 +833,22 @@ def main():
                       '-device', 'e1000,netdev=n0',
                       '-drive', 'if=none,id=nstick,format=raw,file=@WORK@/netstick.img'],
                      ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=nstick']))
+        # браузер NetSurf (этап 9): рабочий стол -> терминал -> browser;
+        # страница с хоста (UTF-8, CSS, PNG, JPEG) - на снимке экрана
+        # должны быть цвет заголовка, жёлтый круг из PNG и малиновый
+        # прямоугольник из JPEG
+        runs.append(('browser', [
+            (None, "Type 'help'", 90),
+            ('', 'dhcp: eth0: address 10.0.2.15', 20),
+            ('start\n', 're:wm: started', 20),
+            ({'goto': (20, 786)}, '', 0.3),
+            ({'click': 1}, '', 0.4),
+            ({'goto': (60, 559)}, '', 0.3),
+            ({'click': 1}, "re:wm: window .* opened", 8),
+            ('browser %s/page.html\n' % url, 're:winproc: pid [0-9]+ got window', 40),
+            ({'screen': [(BROWSER_H1, 8, 300), (BROWSER_SUN, 4, 5000),
+                         (BROWSER_JPEG, 12, 3000)]}, '', 60),
+        ], ['-netdev', 'user,id=n0', '-device', 'e1000,netdev=n0']))
         # Realtek в режиме C+ (тот же механизм колец, что у RTL8111/8168)
         runs.append(('net-rtl8139', [
             (None, "Type 'help'", 90),

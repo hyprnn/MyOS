@@ -37,6 +37,7 @@
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include "myos_sys.h"
 
 /* ================================================================
@@ -138,6 +139,18 @@ uid_t getuid(void)  { return 0; }
 uid_t geteuid(void) { return 0; }
 gid_t getgid(void)  { return 0; }
 gid_t getegid(void) { return 0; }
+
+/* Имя системы (браузер пишет его в User-Agent) */
+int uname(struct utsname *u)
+{
+    memset(u, 0, sizeof(*u));
+    strcpy(u->sysname, "MyOS");
+    strcpy(u->nodename, "myos");
+    strcpy(u->release, "9");
+    strcpy(u->version, "MyOS stage 9");
+    strcpy(u->machine, "x86_64");
+    return 0;
+}
 
 /* Куча: malloc из picolibc берёт память кусками через sbrk */
 void *sbrk(ptrdiff_t inc)
@@ -296,8 +309,100 @@ static int is_socket(int fd)
     return __myos_is_socket != NULL && __myos_is_socket(fd);
 }
 
+/* ================================================================
+ * Встроенные файлы (/embed/...)
+ *
+ * Большой программе (браузер) нужны свои файлы: шрифты, стили,
+ * тексты сообщений. Чтобы не зависеть от флешки, они вшиты в саму
+ * программу таблицей __myos_embedded_files (myos_sys.h), а libc
+ * показывает их как обычные файлы только для чтения по путям
+ * "/embed/имя": open/read/lseek/fstat/stat/close работают как с диском.
+ * Номера таких файлов - EMBED_FD_BASE + i (ядро их не видит).
+ * ================================================================ */
+
+extern const struct myos_embed_file __myos_embedded_files[] __attribute__((weak));
+
+#define EMBED_PREFIX   "/embed/"
+#define EMBED_FD_BASE  0x6000
+#define EMBED_FD_MAX   16
+
+static struct {
+    const struct myos_embed_file *f;       /* NULL - место свободно */
+    size_t                        pos;
+} g_efd[EMBED_FD_MAX];
+
+static const struct myos_embed_file *embed_find(const char *path)
+{
+    if (__myos_embedded_files == NULL ||
+        strncmp(path, EMBED_PREFIX, sizeof(EMBED_PREFIX) - 1) != 0)
+        return NULL;
+
+    const char *name = path + sizeof(EMBED_PREFIX) - 1;
+
+    for (const struct myos_embed_file *f = __myos_embedded_files; f->name != NULL; f++)
+        if (strcmp(f->name, name) == 0)
+            return f;
+
+    return NULL;
+}
+
+/* "/embed" или "/embed/папка" - есть ли встроенные файлы внутри */
+static int embed_is_dir(const char *path)
+{
+    size_t pl = sizeof(EMBED_PREFIX) - 2;          /* "/embed" без '/' */
+
+    if (__myos_embedded_files == NULL || strncmp(path, EMBED_PREFIX, pl) != 0)
+        return 0;
+
+    const char *rest = path + pl;                  /* "" или "/en" или "/en/" */
+
+    while (*rest == '/')
+        rest++;
+
+    size_t rl = strlen(rest);
+
+    while (rl > 0 && rest[rl - 1] == '/')
+        rl--;
+
+    if (rl == 0)
+        return 1;                                  /* сам /embed */
+
+    for (const struct myos_embed_file *f = __myos_embedded_files; f->name != NULL; f++)
+        if (strncmp(f->name, rest, rl) == 0 && f->name[rl] == '/')
+            return 1;
+
+    return 0;
+}
+
+static int embed_slot(int fd)
+{
+    int i = fd - EMBED_FD_BASE;
+
+    return (i >= 0 && i < EMBED_FD_MAX && g_efd[i].f != NULL) ? i : -1;
+}
+
+static void embed_stat(const struct myos_embed_file *f, struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode = S_IFREG | 0444;
+    st->st_nlink = 1;
+    st->st_blksize = 4096;
+    st->st_size = (off_t)f->size;
+    st->st_blocks = (blkcnt_t)((f->size + 511u) / 512u);
+}
+
 ssize_t read(int fd, void *buf, size_t n)
 {
+    int e = embed_slot(fd);
+
+    if (e >= 0) {
+        size_t left = g_efd[e].f->size - g_efd[e].pos;
+        size_t c = (n < left) ? n : left;
+        memcpy(buf, g_efd[e].f->data + g_efd[e].pos, c);
+        g_efd[e].pos += c;
+        return (ssize_t)c;
+    }
+
     /* у сокета могли остаться "подсмотренные" (MSG_PEEK) байты */
     if (is_socket(fd)) {
         ssize_t r = __myos_sock_read(fd, buf, n);
@@ -320,6 +425,23 @@ int open(const char *path, int flags, ...)
     struct myos_dirent d;
 
     /* права (mode) третьим аргументом MyOS не хранит - не читаем его */
+
+    const struct myos_embed_file *ef = embed_find(path);
+
+    if (ef != NULL) {
+        if (acc != O_RDONLY) {
+            errno = EROFS;
+            return -1;
+        }
+        for (int i = 0; i < EMBED_FD_MAX; i++)
+            if (g_efd[i].f == NULL) {
+                g_efd[i].f = ef;
+                g_efd[i].pos = 0;
+                return EMBED_FD_BASE + i;
+            }
+        errno = EMFILE;
+        return -1;
+    }
 
     if (acc == O_RDONLY)
         mf = MYOS_O_READ;
@@ -367,6 +489,13 @@ int close(int fd)
     if (fd >= 0 && fd <= 2)
         return 0;              /* экран и клавиатуру не закрываем */
 
+    int e = embed_slot(fd);
+
+    if (e >= 0) {
+        g_efd[e].f = NULL;
+        return 0;
+    }
+
     if (is_socket(fd))
         __myos_sock_forget(fd);
 
@@ -378,6 +507,21 @@ off_t lseek(int fd, off_t off, int whence)
     if (fd >= 0 && fd <= 2) {
         errno = ESPIPE;
         return -1;
+    }
+
+    int e = embed_slot(fd);
+
+    if (e >= 0) {
+        off_t base = (whence == SEEK_SET) ? 0 :
+                     (whence == SEEK_CUR) ? (off_t)g_efd[e].pos :
+                     (whence == SEEK_END) ? (off_t)g_efd[e].f->size : -1;
+        off_t np = base + off;
+        if (base < 0 || np < 0 || (size_t)np > g_efd[e].f->size) {
+            errno = EINVAL;
+            return -1;
+        }
+        g_efd[e].pos = (size_t)np;
+        return np;
     }
 
     long r = myos_syscall3(SYS_SEEK, fd, (long)off, whence);
@@ -414,6 +558,20 @@ static void to_stat(const struct myos_dirent *d, struct stat *st)
 int stat(const char *path, struct stat *st)
 {
     struct myos_dirent d;
+    const struct myos_embed_file *ef = embed_find(path);
+
+    if (ef != NULL) {
+        embed_stat(ef, st);
+        return 0;
+    }
+
+    if (embed_is_dir(path)) {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = S_IFDIR | 0555;
+        st->st_nlink = 2;
+        return 0;
+    }
+
     long r = myos_syscall3(SYS_STAT, (long)path, (long)&d, 0);
 
     if (r < 0)
@@ -431,6 +589,13 @@ int lstat(const char *path, struct stat *st)
 int fstat(int fd, struct stat *st)
 {
     struct myos_dirent d;
+    int e = embed_slot(fd);
+
+    if (e >= 0) {
+        embed_stat(g_efd[e].f, st);
+        return 0;
+    }
+
     long r = myos_syscall3(SYS_FSTAT, fd, (long)&d, 0);
 
     if (r < 0)
@@ -650,8 +815,12 @@ void rewinddir(DIR *d)
     d->offset = 0;
 }
 
+void __myos_dir_forget(DIR *d) __attribute__((weak));   /* fs.c: dirfd */
+
 int closedir(DIR *d)
 {
+    if (__myos_dir_forget != NULL)
+        __myos_dir_forget(d);
     free(d);
     return 0;
 }
