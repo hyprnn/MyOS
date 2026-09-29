@@ -584,9 +584,15 @@ void proc_reap(KPROC *p)
 
     for (UINTN i = 0; i < PROC_FDS; i++)
         if (p->fds[i] >= 0) {
-            vfs_close(p->fds[i]);
+            if (p->fds[i] & PROC_FD_SOCK)
+                sock_close(p->fds[i] & ~PROC_FD_SOCK);   /* сеть (этап 8) */
+            else
+                vfs_close(p->fds[i]);
             p->fds[i] = -1;
         }
+
+    /* сокеты, которые программа не успела отдать (на всякий случай) */
+    sock_close_pid(p->pid);
 
     if (p->pml4 != 0)
         uvm_free(p->pml4);

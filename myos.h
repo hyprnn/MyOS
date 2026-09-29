@@ -2410,6 +2410,7 @@ UINT32 kx_irq_to_gsi(UINT8 irq, BOOLEAN *level, BOOLEAN *active_low);
 BOOLEAN kx_ioapic_route(UINT32 gsi, UINT8 vector, BOOLEAN level, BOOLEAN active_low);
 UINT8 pci_find_cap(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 id);
 const char *kx_pci_enable_msi(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 vector);
+void kx_ioapic_mask(UINT32 gsi);
 void kx_idle_hlt(void);
 void kx_load_tick(void);
 void kernel_cmd_cpu(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
@@ -2726,6 +2727,34 @@ void run_command(
     CHAR16 *line
 );
 
+
+/* --- net/ (этап 8: сеть) - подробности в net/net.h --- */
+void net_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+BOOLEAN net_running(void);
+INTN sock_create(UINT32 type, UINT32 pid);
+INTN sock_bind(INTN s, UINT32 ip, UINT16 port);
+INTN sock_connect(INTN s, UINT32 ip, UINT16 port);
+INTN sock_listen(INTN s, UINT32 backlog);
+INTN sock_accept(INTN s, UINT32 pid, UINT32 *ip, UINT16 *port);
+INTN sock_sendto(INTN s, const void *buf, UINTN n, UINT32 ip, UINT16 port);
+INTN sock_send(INTN s, const void *buf, UINTN n);
+INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *ttl);
+INTN sock_recv(INTN s, void *buf, UINTN n);
+INTN sock_setopt(INTN s, UINT32 opt, UINT64 val);
+INTN sock_pending(INTN s);
+INTN sock_close(INTN s);
+void sock_close_pid(UINT32 pid);
+const char *net_strerror(INTN e);
+INTN dns_resolve(const char *name, UINT32 *ip, UINT64 timeout_ms);
+INTN net_sys_info(UINTN idx, struct myos_netif *out);
+INTN net_sys_ctl(const struct myos_netctl *c);
+void kernel_cmd_net(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
+void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
+BOOLEAN net_status_line(char *buf, UINTN cap);
+
+/* Сокеты в таблице fd программы: номер сокета с этим флагом
+   (файлы VFS - маленькие неотрицательные числа) */
+#define PROC_FD_SOCK   0x40000000
 
 /* --- lib/serial.c --- */
 extern BOOLEAN g_serial_ok;

@@ -37,7 +37,19 @@
 #define SYS_WIN_EVENT  19 /* win_event(номер, struct myos_event *, ждать мс) -> 1/0 */
 #define SYS_WIN_CLOSE  20 /* win_close(номер) */
 #define SYS_WIN_TITLE  21 /* win_title(номер, заголовок UTF-8) */
-#define SYS_COUNT    22
+/* сеть (этап 8). Сокет - обычный fd: write/read/close работают и с ним */
+#define SYS_SOCKET   22   /* socket(тип MYOS_SOCK_*)              -> fd */
+#define SYS_CONNECT  23   /* connect(fd, struct myos_sockaddr *)   - TCP: соединиться */
+#define SYS_BIND     24   /* bind(fd, struct myos_sockaddr *)      - свой порт */
+#define SYS_LISTEN   25   /* listen(fd, очередь)                   - ждать входящих */
+#define SYS_ACCEPT   26   /* accept(fd, struct myos_sockaddr * или 0) -> новый fd */
+#define SYS_SENDTO   27   /* sendto(fd, buf, n, struct myos_sockaddr * или 0) */
+#define SYS_RECVFROM 28   /* recvfrom(fd, buf, n, struct myos_sockaddr * или 0) -> байт */
+#define SYS_SOCKOPT  29   /* sockopt(fd, MYOS_SO_*, значение) */
+#define SYS_RESOLVE  30   /* resolve(имя, unsigned int *ip)        - DNS */
+#define SYS_NETINFO  31   /* netinfo(номер, struct myos_netif *)   -> 1 есть / 0 конец */
+#define SYS_NETCTL   32   /* netctl(struct myos_netctl *)          - настроить адрес */
+#define SYS_COUNT    33
 
 /* флаги open - те же, что VFS_O_* в ядре */
 #define O_READ    0x01
@@ -63,6 +75,16 @@
 #define MYOS_EXDEV     -15
 #define MYOS_EFAULT    -16   /* плохой указатель от программы */
 #define MYOS_ENOGUI    -17   /* графика не запущена (нужно 'start') */
+/* сеть (этап 8) */
+#define MYOS_ETIMEDOUT     -18   /* нет ответа */
+#define MYOS_ECONNREFUSED  -19   /* на том порту никто не слушает */
+#define MYOS_ECONNRESET    -20   /* собеседник оборвал соединение */
+#define MYOS_ENETUNREACH   -21   /* нет сети: нет адреса или шлюза */
+#define MYOS_EADDRINUSE    -22   /* порт уже занят */
+#define MYOS_ENOTCONN      -23   /* сокет не соединён */
+#define MYOS_EHOSTNOTFOUND -24   /* DNS: нет такого имени */
+#define MYOS_EAGAIN        -25   /* за отведённое время ничего не пришло */
+#define MYOS_EINTR         -26   /* прервано (Ctrl+C) */
 
 struct myos_time {
     unsigned short year;
@@ -75,6 +97,52 @@ struct myos_dirent {
     unsigned long long size;
     unsigned int       is_dir;
     unsigned int       pad;
+};
+
+/* --- сеть (этап 8) --- */
+#define MYOS_SOCK_STREAM  1   /* TCP */
+#define MYOS_SOCK_DGRAM   2   /* UDP */
+#define MYOS_SOCK_PING    3   /* ICMP Echo (ping): программа даёт 8 байт заголовка
+                                 ICMP + данные; номер id и сумму ставит ядро */
+#define MYOS_SO_TIMEOUT   1   /* сколько мс ждать connect/accept/recv (0 - сколько угодно) */
+
+/* адрес: IPv4 в порядке процессора (10.0.2.15 = 0x0A00020F) и порт */
+struct myos_sockaddr {
+    unsigned int   ip;
+    unsigned short port;
+    unsigned char  ttl;     /* recvfrom ping-сокета: TTL ответа */
+    unsigned char  pad;
+};
+
+/* интерфейс (для ifconfig) */
+#define MYOS_NETCFG_NONE    0
+#define MYOS_NETCFG_DHCP    1
+#define MYOS_NETCFG_STATIC  2
+struct myos_netif {
+    char               name[8];        /* lo, eth0, usb0 */
+    char               driver[16];
+    char               model[48];
+    char               irq[24];        /* как карта сообщает о кадрах */
+    char               state[48];      /* что делает DHCP */
+    unsigned char      mac[6];
+    unsigned char      link;           /* кабель / модем на связи */
+    unsigned char      up;             /* адрес есть */
+    unsigned int       cfg;            /* MYOS_NETCFG_* */
+    unsigned int       ip, mask, gw, dns, dns2;
+    unsigned int       speed_mbps;
+    unsigned int       lease_left_s;   /* сколько ещё действует адрес от DHCP */
+    unsigned long long rx_packets, rx_bytes, rx_dropped;
+    unsigned long long tx_packets, tx_bytes, tx_errors;
+};
+
+#define MYOS_NETCTL_DHCP    1   /* адрес - от DHCP (заново) */
+#define MYOS_NETCTL_STATIC  2   /* адрес вручную: ip, mask, gw, dns */
+#define MYOS_NETCTL_DNS     3   /* только сервер DNS */
+#define MYOS_NETCTL_DOWN    4   /* забыть адрес */
+struct myos_netctl {
+    char         name[8];
+    unsigned int cmd;
+    unsigned int ip, mask, gw, dns;
 };
 
 /* --- окна (этап 7) --- */

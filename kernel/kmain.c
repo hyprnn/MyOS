@@ -460,6 +460,10 @@ void kmain_stage2(void)
     kmain_section(out, "[programs]");
     proc_init(out);
 
+    /* --- сеть (этап 8) --- */
+    kmain_section(out, "[network]");
+    net_init(out);
+
     /* --- таблица функций ядра для шелла и GUI --- */
     kx_install_shims();
 

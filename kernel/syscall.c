@@ -339,6 +339,157 @@ static INTN rd_cb(void *ctx, const VFS_DIRENT *e)
 
 
 /* ================================================================
+ * Сеть (этап 8): сокеты - в таблице fd программы с флагом
+ * PROC_FD_SOCK; сама работа - в net/socket.c
+ * ================================================================ */
+
+static INTN sock_of(KPROC *p, UINT64 fd)
+{
+    INTN kfd = fd_kernel(p, (INT64)fd);
+
+    if (kfd < 0 || !(kfd & PROC_FD_SOCK))
+        return -1;
+
+    return kfd & ~PROC_FD_SOCK;
+}
+
+static INTN fd_slot(KPROC *p)
+{
+    for (UINTN i = 0; i < PROC_FDS; i++)
+        if (p->fds[i] < 0)
+            return (INTN)i;
+
+    return -1;
+}
+
+static INT64 sys_net(KPROC *p, UINT64 nr, UINT64 a1, UINT64 a2, UINT64 a3, UINT64 a4)
+{
+    struct myos_sockaddr sa;
+    INTN s;
+
+    switch (nr) {
+
+    case SYS_SOCKET: {
+        INTN slot = fd_slot(p);
+        if (slot < 0)
+            return MYOS_EMFILE;
+        s = sock_create((UINT32)a1, p->pid);
+        if (s < 0)
+            return s;
+        p->fds[slot] = s | PROC_FD_SOCK;
+        return 3 + slot;
+    }
+
+    case SYS_CONNECT:
+    case SYS_BIND:
+        if ((s = sock_of(p, a1)) < 0)
+            return MYOS_EBADF;
+        if (!uptr_ok(p, a2, sizeof(sa), FALSE))
+            return MYOS_EFAULT;
+        memcpy(&sa, (const void *)(UINTN)a2, sizeof(sa));
+        return (nr == SYS_CONNECT) ? sock_connect(s, sa.ip, sa.port)
+                                   : sock_bind(s, sa.ip, sa.port);
+
+    case SYS_LISTEN:
+        if ((s = sock_of(p, a1)) < 0)
+            return MYOS_EBADF;
+        return sock_listen(s, (UINT32)a2);
+
+    case SYS_ACCEPT: {
+        UINT32 ip = 0;
+        UINT16 port = 0;
+        INTN slot = fd_slot(p);
+        if ((s = sock_of(p, a1)) < 0)
+            return MYOS_EBADF;
+        if (a2 && !uptr_ok(p, a2, sizeof(sa), TRUE))
+            return MYOS_EFAULT;
+        if (slot < 0)
+            return MYOS_EMFILE;
+        INTN ns = sock_accept(s, p->pid, &ip, &port);
+        if (ns < 0)
+            return ns;
+        p->fds[slot] = ns | PROC_FD_SOCK;
+        if (a2) {
+            memset(&sa, 0, sizeof(sa));
+            sa.ip = ip;
+            sa.port = port;
+            memcpy((void *)(UINTN)a2, &sa, sizeof(sa));
+        }
+        return 3 + slot;
+    }
+
+    case SYS_SENDTO:
+        if ((s = sock_of(p, a1)) < 0)
+            return MYOS_EBADF;
+        if (!uptr_ok(p, a2, a3, FALSE) || (a4 && !uptr_ok(p, a4, sizeof(sa), FALSE)))
+            return MYOS_EFAULT;
+        if (a4) {
+            memcpy(&sa, (const void *)(UINTN)a4, sizeof(sa));
+            return sock_sendto(s, (const void *)(UINTN)a2, (UINTN)a3, sa.ip, sa.port);
+        }
+        return sock_send(s, (const void *)(UINTN)a2, (UINTN)a3);
+
+    case SYS_RECVFROM: {
+        UINT32 ip = 0;
+        UINT16 port = 0;
+        UINT8 ttl = 0;
+        if ((s = sock_of(p, a1)) < 0)
+            return MYOS_EBADF;
+        if (!uptr_ok(p, a2, a3, TRUE) || (a4 && !uptr_ok(p, a4, sizeof(sa), TRUE)))
+            return MYOS_EFAULT;
+        INTN n = sock_recvfrom(s, (void *)(UINTN)a2, (UINTN)a3, &ip, &port, &ttl);
+        if (n >= 0 && a4) {
+            memset(&sa, 0, sizeof(sa));
+            sa.ip = ip;
+            sa.port = port;
+            sa.ttl = ttl;
+            memcpy((void *)(UINTN)a4, &sa, sizeof(sa));
+        }
+        return n;
+    }
+
+    case SYS_SOCKOPT:
+        if ((s = sock_of(p, a1)) < 0)
+            return MYOS_EBADF;
+        return sock_setopt(s, (UINT32)a2, a3);
+
+    case SYS_RESOLVE: {
+        char name[128];
+        UINT32 ip = 0;
+        INTN r = copy_in_str(p, a1, name, sizeof(name));
+        if (r != VFS_OK)
+            return r;
+        if (!uptr_ok(p, a2, 4, TRUE))
+            return MYOS_EFAULT;
+        r = dns_resolve(name, &ip, 0);
+        if (r == 0)
+            *(volatile UINT32 *)(UINTN)a2 = ip;
+        return r;
+    }
+
+    case SYS_NETINFO: {
+        struct myos_netif ni;
+        if (!uptr_ok(p, a2, sizeof(ni), TRUE))
+            return MYOS_EFAULT;
+        INTN r = net_sys_info((UINTN)a1, &ni);
+        if (r == 1)
+            memcpy((void *)(UINTN)a2, &ni, sizeof(ni));
+        return r;
+    }
+
+    case SYS_NETCTL: {
+        struct myos_netctl c;
+        if (!uptr_ok(p, a1, sizeof(c), FALSE))
+            return MYOS_EFAULT;
+        memcpy(&c, (const void *)(UINTN)a1, sizeof(c));
+        return net_sys_ctl(&c);
+    }
+    }
+
+    return MYOS_ENOSYS;
+}
+
+/* ================================================================
  * Диспетчер
  * ================================================================ */
 
@@ -349,7 +500,9 @@ INT64 kx_syscall_dispatch(UINT64 *f)
     UINT64 a1 = f[SF_RDI], a2 = f[SF_RSI], a3 = f[SF_RDX];
     INT64 r = MYOS_ENOSYS;
 
-    (void)f[SF_R10]; (void)f[SF_R8]; (void)f[SF_R9];
+    UINT64 a4 = f[SF_R10];
+
+    (void)f[SF_R8]; (void)f[SF_R9];
 
     if (p == NULL)
         return MYOS_ENOSYS;       /* syscall не из программы?! */
@@ -368,7 +521,10 @@ INT64 kx_syscall_dispatch(UINT64 *f)
             r = (INT64)a3;
         } else {
             INTN kfd = fd_kernel(p, (INT64)a1);
-            r = (kfd < 0) ? MYOS_EBADF : vfs_write(kfd, (const VOID *)(UINTN)a2, (UINTN)a3);
+            if (kfd >= 0 && (kfd & PROC_FD_SOCK))
+                r = sock_send(kfd & ~PROC_FD_SOCK, (const VOID *)(UINTN)a2, (UINTN)a3);
+            else
+                r = (kfd < 0) ? MYOS_EBADF : vfs_write(kfd, (const VOID *)(UINTN)a2, (UINTN)a3);
         }
         break;
     }
@@ -380,7 +536,10 @@ INT64 kx_syscall_dispatch(UINT64 *f)
                                        : proc_read_console(p, (char *)(UINTN)a2, (UINTN)a3);
         } else {
             INTN kfd = fd_kernel(p, (INT64)a1);
-            r = (kfd < 0) ? MYOS_EBADF : vfs_read(kfd, (VOID *)(UINTN)a2, (UINTN)a3);
+            if (kfd >= 0 && (kfd & PROC_FD_SOCK))
+                r = sock_recv(kfd & ~PROC_FD_SOCK, (VOID *)(UINTN)a2, (UINTN)a3);
+            else
+                r = (kfd < 0) ? MYOS_EBADF : vfs_read(kfd, (VOID *)(UINTN)a2, (UINTN)a3);
         }
         break;
     }
@@ -404,7 +563,10 @@ INT64 kx_syscall_dispatch(UINT64 *f)
     case SYS_CLOSE: {
         INTN kfd = fd_kernel(p, (INT64)a1);
         if (kfd < 0) { r = MYOS_EBADF; break; }
-        vfs_close(kfd);
+        if (kfd & PROC_FD_SOCK)
+            sock_close(kfd & ~PROC_FD_SOCK);
+        else
+            vfs_close(kfd);
         p->fds[a1 - 3] = -1;
         r = 0;
         break;
@@ -536,6 +698,20 @@ INT64 kx_syscall_dispatch(UINT64 *f)
             r = key.UnicodeChar ? key.UnicodeChar : (0x100 + key.ScanCode);
         break;
     }
+
+    case SYS_SOCKET:
+    case SYS_CONNECT:
+    case SYS_BIND:
+    case SYS_LISTEN:
+    case SYS_ACCEPT:
+    case SYS_SENDTO:
+    case SYS_RECVFROM:
+    case SYS_SOCKOPT:
+    case SYS_RESOLVE:
+    case SYS_NETINFO:
+    case SYS_NETCTL:
+        r = sys_net(p, nr, a1, a2, a3, a4);
+        break;
 
     default:
         r = MYOS_ENOSYS;

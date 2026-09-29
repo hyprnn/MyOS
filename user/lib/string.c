@@ -84,6 +84,21 @@ long atol(const char *s)
 
 int atoi(const char *s) { return (int)atol(s); }
 
+/* первое вхождение sub в s (NULL - нет) */
+char *strstr(const char *s, const char *sub)
+{
+    size_t n = strlen(sub);
+
+    if (n == 0)
+        return (char *)s;
+
+    for (; *s; s++)
+        if (*s == *sub && strncmp(s, sub, n) == 0)
+            return (char *)s;
+
+    return NULL;
+}
+
 const char *strerror(int e)
 {
     switch (e) {
@@ -102,6 +117,16 @@ const char *strerror(int e)
     case MYOS_EGONE:     return "the disk was removed";
     case MYOS_EXDEV:     return "different disks";
     case MYOS_EFAULT:    return "bad pointer";
+    case MYOS_ENOGUI:    return "the desktop is not running";
+    case MYOS_ETIMEDOUT:     return "timed out (no answer)";
+    case MYOS_ECONNREFUSED:  return "connection refused";
+    case MYOS_ECONNRESET:    return "connection reset";
+    case MYOS_ENETUNREACH:   return "network unreachable (no address yet? see ifconfig)";
+    case MYOS_EADDRINUSE:    return "port already in use";
+    case MYOS_ENOTCONN:      return "not connected";
+    case MYOS_EHOSTNOTFOUND: return "host not found";
+    case MYOS_EAGAIN:        return "nothing arrived in time";
+    case MYOS_EINTR:         return "interrupted";
     default:             return "error";
     }
 }

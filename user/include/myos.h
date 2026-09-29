@@ -53,6 +53,7 @@ char  *strcpy(char *d, const char *s);
 char  *strncpy(char *d, const char *s, size_t n);
 char  *strcat(char *d, const char *s);
 char  *strchr(const char *s, int c);
+char  *strstr(const char *s, const char *sub);
 void  *memcpy(void *d, const void *s, size_t n);
 void  *memmove(void *d, const void *s, size_t n);
 void  *memset(void *d, int c, size_t n);
@@ -80,6 +81,25 @@ void *malloc(size_t n);
 void  free(void *p);
 void *calloc(size_t n, size_t sz);
 void *realloc(void *p, size_t n);
+
+/* --- сеть (этап 8, user/lib/net.c) --- */
+long syscall4(long nr, long a1, long a2, long a3, long a4);
+int  socket(int type);                                  /* MYOS_SOCK_STREAM/DGRAM/PING */
+int  connect(int fd, unsigned int ip, int port);
+int  bind(int fd, unsigned int ip, int port);
+int  listen(int fd, int backlog);
+int  accept(int fd, struct myos_sockaddr *from);        /* -> новый fd */
+long send(int fd, const void *buf, size_t n);
+long send_all(int fd, const void *buf, size_t n);       /* отправить всё */
+long recv(int fd, void *buf, size_t n);                 /* 0 - собеседник закрыл */
+long sendto(int fd, const void *buf, size_t n, unsigned int ip, int port);
+long recvfrom(int fd, void *buf, size_t n, struct myos_sockaddr *from);
+int  sock_timeout(int fd, unsigned int ms);             /* 0 - ждать сколько угодно */
+int  resolve(const char *name, unsigned int *ip);       /* DNS */
+int  netinfo(int index, struct myos_netif *ni);         /* 1 - есть, 0 - конец */
+int  netctl(struct myos_netctl *c);
+char *ip_to_str(unsigned int ip, char *buf);            /* buf >= 16 байт */
+int  str_to_ip(const char *s, unsigned int *ip);        /* 1 - разобрали */
 
 /* --- разное --- */
 unsigned int rand(void);

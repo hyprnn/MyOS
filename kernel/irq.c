@@ -134,6 +134,35 @@ BOOLEAN kx_ioapic_route(UINT32 gsi, UINT8 vector, BOOLEAN level, BOOLEAN active_
     return TRUE;
 }
 
+/* Замаскировать линию gsi (устройство перешло на опрос: например,
+   сетевая карта, чьё прерывание так и не пришло) */
+void kx_ioapic_mask(UINT32 gsi)
+{
+    UINT64 base = 0;
+    UINT32 first = 0;
+
+    if (g_acpi.nioapics > 0) {
+        for (UINTN i = 0; i < g_acpi.nioapics; i++) {
+            ACPI_IOAPIC *io = &g_acpi.ioapics[i];
+            if (gsi >= io->gsi_base && gsi < io->gsi_base + io->count) {
+                base = io->addr;
+                first = io->gsi_base;
+                break;
+            }
+        }
+    } else {
+        base = 0xFEC00000ull;
+    }
+
+    if (base == 0)
+        return;
+
+    UINT32 idx = gsi - first;
+    UINT32 lo = ioapic_read(base, 0x10u + 2u * idx);
+
+    ioapic_write(base, 0x10u + 2u * idx, lo | (1u << 16));
+}
+
 /* ================================================================
  * MSI / MSI-X для PCI-устройств
  * ================================================================ */

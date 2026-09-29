@@ -100,6 +100,23 @@ void run_command(
 
         kernel_cmd_acpi(out);
 
+    /* сеть (этап 8): состояние стека; Wi-Fi - что за адаптер */
+    } else if (streq(line, "net") || streq(line, "netstat")) {
+
+        kernel_cmd_net(out, "");
+
+    } else if (streq(line, "wifi") || starts_with(line, "wifi ")) {
+
+        char arg[48];
+        UINTN k = 0;
+
+        if (line[4] == ' ')
+            for (CHAR16 *c = line + 5; *c && k + 1 < sizeof(arg); c++)
+                arg[k++] = (*c < 128) ? (char)*c : '?';
+
+        arg[k] = '\0';
+        kernel_cmd_wifi(out, arg);
+
     } else if (streq(line, "boot")) {
 
         kernel_cmd_boot(out);
