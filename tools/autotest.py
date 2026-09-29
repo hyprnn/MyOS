@@ -510,6 +510,8 @@ def main():
         ('primes 100000\n', '9592 primes', 30),
         ('hello\n', 'Hello from ring 3!', 15),
         ('mem\n', 'freed: OK', 15),
+        # этап 9: полная libc (picolibc) - printf с дробями, FILE *, math...
+        ('libctest\n', 're:libctest: [0-9]+/[0-9]+ OK', 30),
     ]
 
     runs = [('main', main_steps, ['-smp', '2'])]
@@ -525,6 +527,7 @@ def main():
             ('disk read 2048\n', 'FAT boot sector', 20),
             ('disk read 0\n', 'this is an MBR', 20),
             ('cat /usb0p1/host.txt\n', 'Hello from the host!', 20),
+            ('libctest /usb0p1\n', 're:libctest: [0-9]+/[0-9]+ OK', 40),
             ({'qmp': ('device_add', {'driver': 'usb-mouse', 'bus': 'xhci.0',
                                      'port': '2.3', 'id': 'hm'})},
              're:usb event: .*connected 0627:0001 - HID, active', 20),

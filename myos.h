@@ -959,7 +959,7 @@ typedef struct BLKDEV {
 #define VFS_MAX_MOUNTS   12
 #define VFS_PATH_MAX     256
 #define VFS_NAME_MAX     128
-#define VFS_MAX_FD       16
+#define VFS_MAX_FD       64
 
 /* Коды ошибок (отрицательные) */
 #define VFS_OK            0
@@ -1072,9 +1072,10 @@ typedef struct VFS_MOUNT {
 #include "sysnum.h"
 
 #define PROC_MAX        12
-#define PROC_FDS        8
+#define PROC_FDS        32
 #define PROC_IN_MAX     256
-#define MAX_HEAP_BYTES  (64ull * 1024u * 1024u)   /* куча программы - не больше */
+#define MAX_HEAP_BYTES  (512ull * 1024u * 1024u)  /* куча программы - не больше
+                                                     (браузеру нужны десятки МБ) */
 
 /* Куда программа пишет и откуда читает (fd 0, 1, 2) */
 #define PROC_IO_CONSOLE 0      /* текстовая консоль шелла */
@@ -2545,6 +2546,7 @@ INTN vfs_read(INTN fd, VOID *buf, UINTN n);
 INTN vfs_write(INTN fd, const VOID *buf, UINTN n);
 INTN vfs_close(INTN fd);
 INTN vfs_size(INTN fd, UINT64 *size);
+INTN vfs_seek(INTN fd, INT64 off, UINT32 whence, UINT64 *newpos);
 INTN vfs_mkdir(const char *path);
 INTN vfs_remove(const char *path);
 INTN vfs_rename(const char *from, const char *to);

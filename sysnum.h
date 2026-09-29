@@ -51,14 +51,29 @@
 #define SYS_NETINFO  31   /* netinfo(номер, struct myos_netif *)   -> 1 есть / 0 конец */
 #define SYS_NETCTL   32   /* netctl(struct myos_netctl *)          - настроить адрес */
 #define SYS_GETRANDOM 33  /* getrandom(buf, n)  - случайные байты для ключей (TLS) */
-#define SYS_COUNT    34
+/* для полной libc (picolibc, этап 9) */
+#define SYS_SEEK     34   /* seek(fd, сдвиг, откуда 0/1/2)         -> новое место */
+#define SYS_FSTAT    35   /* fstat(fd, struct myos_dirent *)       - is_dir: MYOS_FT_* */
+#define SYS_GETCWD   36   /* getcwd(buf, размер)                   -> длина пути */
+#define SYS_CHDIR    37   /* chdir(path)                           - текущая папка программы */
+#define SYS_COUNT    38
 
 /* флаги open - те же, что VFS_O_* в ядре */
-#define O_READ    0x01
-#define O_WRITE   0x02
-#define O_CREATE  0x04
-#define O_TRUNC   0x08
-#define O_APPEND  0x10
+#define MYOS_O_READ    0x01
+#define MYOS_O_WRITE   0x02
+#define MYOS_O_CREATE  0x04
+#define MYOS_O_TRUNC   0x08
+#define MYOS_O_APPEND  0x10
+
+/* короткие имена - для ядра и программ на мини-libc; у программ на
+   полной libc (MYOS_POSIX) O_TRUNC/O_APPEND - свои, из <fcntl.h> */
+#ifndef MYOS_POSIX
+#define O_READ    MYOS_O_READ
+#define O_WRITE   MYOS_O_WRITE
+#define O_CREATE  MYOS_O_CREATE
+#define O_TRUNC   MYOS_O_TRUNC
+#define O_APPEND  MYOS_O_APPEND
+#endif
 
 /* ошибки (отрицательные ответы) - те же, что VFS_E* в ядре */
 #define MYOS_ENOENT     -2
@@ -93,6 +108,12 @@ struct myos_time {
     unsigned char  month, day, hour, minute, second;
     unsigned char  pad;
 };
+
+/* что за fd (поле is_dir у fstat; stat и readdir дают только 0/1) */
+#define MYOS_FT_FILE     0
+#define MYOS_FT_DIR      1
+#define MYOS_FT_CONSOLE  2   /* 0, 1, 2 - клавиатура и экран */
+#define MYOS_FT_SOCKET   3
 
 struct myos_dirent {
     char               name[128];
@@ -192,7 +213,8 @@ struct myos_event {
 /* Адреса программы (нижняя половина адресного пространства) */
 #define MYOS_USER_BASE       0x0000000000400000ull   /* сюда линкуются программы */
 #define MYOS_USER_STACK_TOP  0x00007FFFFFFF0000ull   /* вершина стека */
-#define MYOS_USER_STACK_SIZE (256ull * 1024ull)
+#define MYOS_USER_STACK_SIZE (1024ull * 1024ull)    /* 1 МиБ: разборщикам HTML/CSS
+                                                      нужна глубокая рекурсия */
 #define MYOS_USER_LIMIT      0x00007FFF00000000ull   /* выше - только стек */
 
 #endif

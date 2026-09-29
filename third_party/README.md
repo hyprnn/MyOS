@@ -58,3 +58,23 @@
   распространять её только в двоичном виде и без изменений; условия —
   `firmware/LICENCE.rtlwifi_firmware.txt` (копия LICENCE.rtlwifi_firmware.txt
   из linux-firmware). Вклеивается в ядро файлом `firmware/firmware.S`.
+
+## picolibc/ — picolibc 1.8.12 (полная libc для программ)
+
+* Автор: Keith Packard и проект newlib, https://github.com/picolibc/picolibc
+  (тег `1.8.12`). Лицензии — BSD-подобные (BSD-2/BSD-3 и лицензии newlib для
+  отдельных файлов; сводка — `picolibc/COPYING.picolibc`, текст лицензии —
+  в начале каждого файла).
+* Как получено: сборка meson под x86_64 без ОС (`-Dthread-local-storage=false
+  -Dsingle-thread=true -Dposix-console=true -Dmb-capable=true
+  -Dio-long-long=true -Dformat-default=double -Dos-fallback=false
+  -Dstdio-exit-flush=true`), затем в `src/` скопированы ровно те исходники и
+  заголовки, что попали в `libc.a` (по журналу зависимостей ninja), а в
+  `include/` — установленные заголовки (с готовым `picolibc.h`). Список
+  файлов — `picolibc/files.mk`; собирает `Makefile` (meson не нужен).
+* Не взято: заглушки ОС (`libos/`), TLS (`tls.c`, `tcb.S`, `inittls.c`),
+  `popen`/`system`/`exec*`/`getpass` — в MyOS программы не порождают процессов.
+* Изменено: `include/sys/features.h` — при `__myos__` объявлены
+  `_POSIX_MONOTONIC_CLOCK` и `_POSIX_TIMERS` (как для RTEMS).
+* Привязка к ядру MyOS — свой файл `user/posix/os.c` (read/write/open/lseek/
+  fstat/sbrk/время/opendir...). Программы на ней — `user/posix/apps/`.

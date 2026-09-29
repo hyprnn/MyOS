@@ -721,6 +721,71 @@ INT64 kx_syscall_dispatch(UINT64 *f)
         break;
     }
 
+    case SYS_SEEK: {
+        INTN kfd = fd_kernel(p, (INT64)a1);
+        UINT64 np = 0;
+        if (kfd < 0 || (kfd & PROC_FD_SOCK)) { r = (kfd < 0) ? MYOS_EBADF : MYOS_EINVAL; break; }
+        r = vfs_seek(kfd, (INT64)a2, (UINT32)a3, &np);
+        if (r == VFS_OK)
+            r = (INT64)np;
+        break;
+    }
+
+    case SYS_FSTAT: {
+        struct myos_dirent d;
+        if (!uptr_ok(p, a2, sizeof(d), TRUE)) { r = MYOS_EFAULT; break; }
+        memset(&d, 0, sizeof(d));
+        if ((INT64)a1 >= 0 && a1 <= 2) {
+            d.is_dir = MYOS_FT_CONSOLE;
+            r = 0;
+        } else {
+            INTN kfd = fd_kernel(p, (INT64)a1);
+            if (kfd < 0) { r = MYOS_EBADF; break; }
+            if (kfd & PROC_FD_SOCK) {
+                d.is_dir = MYOS_FT_SOCKET;
+                r = 0;
+            } else {
+                d.is_dir = MYOS_FT_FILE;
+                r = vfs_size(kfd, &d.size);
+            }
+        }
+        if (r == 0)
+            memcpy((void *)(UINTN)a2, &d, sizeof(d));
+        break;
+    }
+
+    case SYS_GETCWD: {
+        UINTN n = 0;
+        while (p->cwd[n])
+            n++;
+        if (!uptr_ok(p, a1, a2, TRUE)) { r = MYOS_EFAULT; break; }
+        if (n + 1 > a2) { r = MYOS_EINVAL; break; }
+        memcpy((void *)(UINTN)a1, p->cwd, n + 1);
+        r = (INT64)n;
+        break;
+    }
+
+    case SYS_CHDIR: {
+        char path[VFS_PATH_MAX], norm[VFS_PATH_MAX];
+        VFS_DIRENT e;
+        r = user_path(p, a1, path, sizeof(path));
+        if (r != VFS_OK)
+            break;
+        r = vfs_normalize(path, norm, sizeof(norm));
+        if (r != VFS_OK)
+            break;
+        /* корень "/" - список томов, в него тоже можно */
+        if (!(norm[0] == '/' && norm[1] == '\0')) {
+            r = vfs_stat(norm, &e);
+            if (r != VFS_OK)
+                break;
+            if (!e.node.is_dir) { r = MYOS_ENOTDIR; break; }
+        }
+        ksnprintf(p->cwd, sizeof(p->cwd), "%s", norm);
+        r = 0;
+        break;
+    }
+
     default:
         r = MYOS_ENOSYS;
         break;

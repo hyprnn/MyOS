@@ -864,6 +864,41 @@ INTN vfs_size(INTN fd, UINT64 *size)
     return f ? VFS_OK : VFS_EBADF;
 }
 
+/*
+ * Сдвинуть место чтения/записи (lseek в POSIX): whence 0 - от начала,
+ * 1 - от текущего места, 2 - от конца файла. Дальше конца не пускаем:
+ * "дыры" в файле (запись далеко за концом) драйверы FAT не умеют, а
+ * программам, которые мы переносим (libc, браузер), хватает этого.
+ */
+INTN vfs_seek(INTN fd, INT64 off, UINT32 whence, UINT64 *newpos)
+{
+    kmutex_lock(&g_vfs_mutex);
+
+    VFS_FD *f = fd_get(fd);
+    INTN r = VFS_OK;
+
+    if (f == NULL)
+        r = VFS_EBADF;
+    else if (f->gone)
+        r = VFS_EGONE;
+    else {
+        INT64 base = (whence == 0) ? 0 :
+                     (whence == 1) ? (INT64)f->pos :
+                     (whence == 2) ? (INT64)f->node.size : -1;
+        INT64 np = base + off;
+
+        if (base < 0 || np < 0 || (UINT64)np > f->node.size)
+            r = VFS_EINVAL;
+        else {
+            f->pos = (UINT64)np;
+            *newpos = f->pos;
+        }
+    }
+
+    kmutex_unlock(&g_vfs_mutex);
+    return r;
+}
+
 INTN vfs_close(INTN fd)
 {
     kmutex_lock(&g_vfs_mutex);
