@@ -513,6 +513,9 @@ void gui_start(EFI_SYSTEM_TABLE *st)
     /* фоновое задание терминала (SLEEP/SPIN в своём потоке):
        какую его версию строк мы уже нарисовали, и сообщили ли в
        лог, что мышь двигалась, пока оно работало */
+    /* выделенный ярлык рабочего стола (-1 - никакой) */
+    INTN desk_sel = -1;
+
     UINT32 job_seen_version = g_term_job.version;
     BOOLEAN job_was_running = g_term_job.running;
     BOOLEAN job_mouse_logged = FALSE;
@@ -762,6 +765,11 @@ void gui_start(EFI_SYSTEM_TABLE *st)
             if (key.ScanCode == 0x17) {
 
                 if (in_terminal) {
+                    /* программе нужен этот терминал - закрыли окно,
+                       значит, её пора завершить */
+                    if (g_term_job.running && g_term_job.kind == GUI_JOB_PROC &&
+                        g_term_job.proc != NULL)
+                        proc_kill(g_term_job.proc);
                     in_terminal = FALSE;
                     dirty = TRUE;
                     continue;
@@ -810,11 +818,17 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                     key.UnicodeChar == CHAR_CARRIAGE_RETURN
                 ) {
 
-                    BOOLEAN want_close =
-                        gui_term_exec(
-                            st, term_input,
-                            term_lines, &term_line_count
-                        );
+                    BOOLEAN want_close = FALSE;
+
+                    /* работает программа (этап 6) - строка ей на ввод */
+                    if (g_term_job.running && g_term_job.kind == GUI_JOB_PROC)
+                        gui_term_program_input(term_input, term_lines, &term_line_count);
+                    else
+                        want_close =
+                            gui_term_exec(
+                                st, term_input,
+                                term_lines, &term_line_count
+                            );
 
                     term_input_len = 0;
                     term_input[0] = '\0';
@@ -1157,6 +1171,72 @@ void gui_start(EFI_SYSTEM_TABLE *st)
 
                         menu_open = TRUE;
                         dirty = TRUE;
+
+                    } else {
+
+                        /* Ярлыки (этап 6): первый щелчок выделяет,
+                           щелчок по выделенному - открывает (как
+                           двойной щелчок в Windows 95) */
+                        INTN sc = gui_shortcut_at(cx, cy);
+
+                        if (sc < 0) {
+
+                            if (desk_sel >= 0) {
+                                desk_sel = -1;
+                                dirty = TRUE;
+                            }
+
+                        } else if (sc != desk_sel) {
+
+                            desk_sel = sc;
+                            dirty = TRUE;
+
+                        } else {
+
+                            const GUI_SHORTCUT *sh = gui_shortcut((UINTN)sc);
+
+                            klog("gui: shortcut %s opened\n", sh->label);
+                            desk_sel = -1;
+                            dirty = TRUE;
+
+                            if (sh->action == GUI_ACT_EXPLORER) {
+
+                                windows[GUI_ACT_EXPLORER].line_count =
+                                    gui_explorer_fill(&explorer, explorer_lines);
+                                open_action = GUI_ACT_EXPLORER;
+                                in_window = TRUE;
+
+                            } else if (sh->action == GUI_ACT_MINESWEEPER) {
+
+                                if (!ms_inited) {
+                                    gui_ms_seed(st);
+                                    gui_ms_reset(&ms);
+                                    ms_inited = TRUE;
+                                }
+
+                                in_minesweeper = TRUE;
+
+                            } else if (sh->action == GUI_ACT_TERMINAL ||
+                                       sh->action == GUI_ACT_PROGRAM) {
+
+                                if (!term_started) {
+                                    term_started = TRUE;
+                                    gui_term_push(term_lines, &term_line_count,
+                                                  "MYOS TERMINAL. TYPE HELP.");
+                                }
+
+                                in_terminal = TRUE;
+
+                                if (sh->action == GUI_ACT_PROGRAM)
+                                    gui_term_run_program(st, sh->program,
+                                                         term_lines, &term_line_count);
+
+                            } else {
+
+                                open_action = sh->action;
+                                in_window = TRUE;
+                            }
+                        }
                     }
 
                 } else if (
@@ -1278,7 +1358,8 @@ void gui_start(EFI_SYSTEM_TABLE *st)
                     menu_open,
                     sbtn_x, sbtn_y, sbtn_w, sbtn_h,
                     cur_x, cur_y,
-                    clock_text
+                    clock_text,
+                    desk_sel
                 );
             }
 

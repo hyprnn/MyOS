@@ -609,11 +609,96 @@ static void gui_term_job_line(GUI_TERM_JOB *j, const char *text)
     klog("gui: term: %s\n", text);
 }
 
+/* Строка вывода программы -> в окно терминала (шрифт GUI - только
+   заглавные) */
+static void gui_term_proc_line(const char *line)
+{
+    char up[GUI_TERM_LINE_LEN + 1];
+    UINTN n = 0;
+
+    for (; line[n] && n < GUI_TERM_LINE_LEN; n++) {
+        char c = line[n];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        if (c == '\t')
+            c = ' ';
+        up[n] = c;
+    }
+
+    up[n] = '\0';
+    gui_term_job_line(&g_term_job, up);
+}
+
+/* Длинный текст - несколькими строками окна */
+static void gui_term_job_wrap(GUI_TERM_JOB *j, const char *text)
+{
+    char row[GUI_TERM_LINE_LEN + 1];
+    UINTN n = 0;
+
+    for (UINTN i = 0; ; i++) {
+
+        char c = text[i];
+
+        if (c == '\0' || n == GUI_TERM_LINE_LEN - 2) {
+            row[n] = '\0';
+            if (n > 0)
+                gui_term_job_line(j, row);
+            n = 0;
+            if (c == '\0')
+                break;
+            row[n++] = ' ';
+            row[n++] = ' ';
+        }
+
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+
+        row[n++] = c;
+    }
+}
+
+/* Программа в ring 3: запустить, ждать, прибрать (этап 6) */
+static void gui_term_job_proc(GUI_TERM_JOB *j)
+{
+    INTN err;
+    char buf[160];
+
+    g_proc_gui_sink = gui_term_proc_line;
+
+    KPROC *p = proc_spawn(j->path, j->args, PROC_IO_GUI, &err);
+
+    if (p == NULL) {
+        ksnprintf(buf, sizeof(buf), "CANNOT RUN %s: %s", j->name, vfs_strerror(err));
+        gui_term_job_wrap(j, buf);
+        return;
+    }
+
+    j->proc = p;
+    g_fg_proc = p;          /* Ctrl+C работает и в GUI */
+
+    INT64 code = proc_wait(p);
+
+    g_fg_proc = NULL;
+    j->proc = NULL;
+
+    if (code == -1 && p->why[0]) {
+        ksnprintf(buf, sizeof(buf), "*** %s WAS STOPPED: %s", p->name, p->why);
+        gui_term_job_wrap(j, buf);
+        gui_term_job_line(j, "MYOS KEEPS RUNNING.");
+    } else if (code != 0) {
+        ksnprintf(buf, sizeof(buf), "(%s EXITED WITH CODE %lld)", p->name, code);
+        gui_term_job_wrap(j, buf);
+    }
+}
+
 static void gui_term_job_main(void *arg)
 {
     GUI_TERM_JOB *j = (GUI_TERM_JOB *)arg;
     char buf[GUI_TERM_LINE_LEN + 1];
     UINTN n = 0;
+
+    if (j->kind == GUI_JOB_PROC)
+        gui_term_job_proc(j);
 
     if (j->kind == GUI_JOB_SLEEP) {
 
@@ -766,6 +851,10 @@ void gui_term_job_stop(void)
 
     j->cancel = TRUE;
 
+    /* программа: попросить ядро её завершить */
+    if (j->kind == GUI_JOB_PROC && j->proc != NULL)
+        proc_kill(j->proc);
+
     for (UINTN k = 0; k < 300 && j->running; k++) {
         if (sched_can_block())
             sched_sleep_ms(10);
@@ -777,6 +866,117 @@ void gui_term_job_stop(void)
     j->lines = NULL;
     j->count = NULL;
     kmutex_unlock(&g_term_mutex);
+}
+
+/*
+ * Запустить программу из /bin в терминале GUI: "CALC 2*(3+4)".
+ * Имя - строчными (так файлы лежат в /bin), аргументы - как есть.
+ * FALSE - такой программы нет.
+ */
+static BOOLEAN gui_term_try_program(EFI_SYSTEM_TABLE *st, const char *cmd,
+                                    char lines[][GUI_TERM_LINE_LEN + 1], UINTN *count)
+{
+    char name[32];
+    UINTN k = 0;
+
+    while (cmd[k] && cmd[k] != ' ' && k + 1 < sizeof(name)) {
+        char c = cmd[k];
+        name[k] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+        k++;
+    }
+
+    name[k] = '\0';
+
+    char path[VFS_PATH_MAX];
+
+    if (name[0] == '\0' || !proc_find_program(name, path, sizeof(path)))
+        return FALSE;
+
+    GUI_TERM_JOB *j = &g_term_job;
+
+    if (j->running) {
+        gui_term_push(lines, count, "BUSY: WAIT FOR THE RUNNING COMMAND");
+        return TRUE;
+    }
+
+    const char *args = cmd + k;
+
+    while (*args == ' ')
+        args++;
+
+    ksnprintf(j->path, sizeof(j->path), "%s", path);
+    ksnprintf(j->args, sizeof(j->args), "%s", args);
+
+    UINTN i = 0;
+
+    for (; name[i] && i < GUI_TERM_LINE_LEN; i++)
+        j->name[i] = (char)((name[i] >= 'a' && name[i] <= 'z') ? name[i] - 'a' + 'A' : name[i]);
+
+    j->name[i] = '\0';
+    j->kind = GUI_JOB_PROC;
+    j->arg = 0;
+    j->cancel = FALSE;
+    j->lines = lines;
+    j->count = count;
+    j->started_ms = g_kticks;
+    j->proc = NULL;
+    j->running = TRUE;
+
+    (void)st;
+
+    j->thread = kthread_create("term-job", gui_term_job_main, j, 16);
+
+    if (j->thread == NULL) {
+        j->running = FALSE;
+        gui_term_push(lines, count, "NO THREADS - PROGRAMS NEED THE TIMER");
+        return TRUE;
+    }
+
+    j->tid = j->thread->tid;
+    klog("gui: program '%s' started from the terminal\n", j->name);
+
+    return TRUE;
+}
+
+/* Для ярлыков рабочего стола: как будто набрали команду */
+void gui_term_run_program(EFI_SYSTEM_TABLE *st, const char *cmdline,
+                          char lines[][GUI_TERM_LINE_LEN + 1], UINTN *count)
+{
+    char prompt[GUI_TERM_LINE_LEN + 1];
+
+    ksnprintf(prompt, sizeof(prompt), "> %s", cmdline);
+
+    for (UINTN i = 0; prompt[i]; i++)
+        if (prompt[i] >= 'a' && prompt[i] <= 'z')
+            prompt[i] = (char)(prompt[i] - 'a' + 'A');
+
+    gui_term_push(lines, count, prompt);
+
+    if (!gui_term_try_program(st, cmdline, lines, count))
+        gui_term_push(lines, count, "NO SUCH PROGRAM IN /BIN");
+}
+
+/* Enter в терминале, пока работает программа: строка - ей на ввод */
+void gui_term_program_input(const char *line, char lines[][GUI_TERM_LINE_LEN + 1],
+                            UINTN *count)
+{
+    char echo[GUI_TERM_LINE_LEN + 1];
+
+    ksnprintf(echo, sizeof(echo), "> %s", line);
+    gui_term_push(lines, count, echo);
+
+    /* программе - строчными, как набрал бы человек (шрифт GUI знает
+       только заглавные, но calc и guess понимают и так) */
+    char low[GUI_TERM_LINE_LEN + 1];
+    UINTN n = 0;
+
+    for (; line[n] && n < GUI_TERM_LINE_LEN; n++)
+        low[n] = (line[n] >= 'A' && line[n] <= 'Z') ? (char)(line[n] - 'A' + 'a') : line[n];
+
+    low[n] = '\0';
+
+    if (g_term_job.proc != NULL)
+        proc_gui_input(g_term_job.proc, low);
 }
 
 /* PS в терминале GUI: шрифт без строчных букв и без знака
@@ -894,6 +1094,7 @@ BOOLEAN gui_term_exec(
 
         gui_term_push(lines, count, "HELP ABOUT VER TIME DATE UPTIME");
         gui_term_push(lines, count, "PS  SLEEP N  SPIN N (IN A THREAD)");
+        gui_term_push(lines, count, "PROGRAMS: HELLO CALC GUESS PRIMES CRASH");
         gui_term_push(lines, count, "WHOAMI CLEAR ECHO TEXT");
         gui_term_push(lines, count, "CALC A OP B");
         gui_term_push(lines, count, "LS TOUCH N CAT N SIZE N RM N");
@@ -1529,7 +1730,9 @@ BOOLEAN gui_term_exec(
 
     } else {
 
-        gui_term_push(lines, count, "UNKNOWN COMMAND. TRY HELP.");
+        /* может быть, это программа из /bin (этап 6) */
+        if (!gui_term_try_program(st, cmd, lines, count))
+            gui_term_push(lines, count, "UNKNOWN COMMAND. TRY HELP.");
     }
 
     return FALSE;

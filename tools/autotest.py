@@ -17,7 +17,7 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
     и проверяется результат. В режиме прошивки туда же пишет сама
     OVMF (её консоль), потом - ядро MyOS (lib/serial.c);
   * в конце - отдельные короткие запуски с нарочными падениями
-    (crash write / crash stack): экран паники тоже должен работать.
+    (kpanic write / kpanic stack): экран паники тоже должен работать.
 
 Выход: 0 - все проверки прошли, 1 - что-то не так (лог сохранён).
 """
@@ -127,7 +127,9 @@ class VM:
 
     KEYS = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash',
             '=': 'equal', ',': 'comma', '*': 'shift-8', '_': 'shift-minus', ':': 'shift-semicolon',
-            '"': 'shift-apostrophe', "'": 'apostrophe', '~': 'shift-grave_accent'}
+            '"': 'shift-apostrophe', "'": 'apostrophe', '~': 'shift-grave_accent',
+            '(': 'shift-9', ')': 'shift-0', '+': 'shift-equal', '!': 'shift-1',
+            '?': 'shift-slash', '%': 'shift-5'}
 
     def type(self, text):
         for ch in text:
@@ -188,6 +190,9 @@ def make_test_disk(path, mib, bits, scheme, label):
     d = b.mkdir(b.root, 'docs')
     b.add_file(d, 'readme.md', b'# readme\n')
     b.add_file(b.root, 'BIG.BIN', BIG_DATA)
+    if os.path.exists('build/user/hello'):
+        a = b.mkdir(b.root, 'apps')
+        b.add_file(a, 'hello', open('build/user/hello', 'rb').read())
     fatimg.make_disk(path, mib, b.build(), scheme)
 
 
@@ -241,6 +246,29 @@ def run_steps(a, work, steps, name, extra=(), devices=None):
                 vm.cmd('human-monitor-command',
                        **{'command-line': 'sendkey %s 40' % keys['key']})
                 label = '[key %s]' % keys['key']
+            if 'goto' in keys:
+                # курсор GUI - в точку экрана: сначала в угол, потом
+                # шагами (мышь QEMU относительная, 1 шаг = 1 пиксель)
+                for _ in range(40):
+                    vm.mouse_move(-50, -50)
+                    time.sleep(0.02)
+                x, y = keys['goto']
+                while x > 0 or y > 0:
+                    dx, dy = min(x, 20), min(y, 20)
+                    vm.mouse_move(dx, dy)
+                    x -= dx
+                    y -= dy
+                    time.sleep(0.02)
+                time.sleep(0.3)
+                label = '[goto %d,%d]' % keys['goto']
+            if 'click' in keys:
+                for _ in range(keys['click']):
+                    for d in (True, False):
+                        vm.cmd('input-send-event', events=[
+                            {'type': 'btn', 'data': {'down': d, 'button': 'left'}}])
+                        time.sleep(0.15)
+                    time.sleep(0.5)
+                label = '[click x%d]' % keys['click']
             if 'mouse' in keys:
                 for _ in range(keys['mouse']):
                     vm.mouse_move(5, 3)
@@ -312,6 +340,21 @@ def main():
         ('', 'the timer shared the CPU fairly', 5),
         ('sleep 1\n', 'Woke up.', 15),
         ('spin 1\n', 're:switched threads [1-9]', 15),
+        # этап 6: программы в ring 3
+        ('ls /bin\n', 'primes', 15),
+        ('hello one two\n', 'Hello from ring 3!', 15),
+        ('', 'My arguments: [one] [two]', 5),
+        ('calc 2*(3+4)\n', '14', 15),
+        ('crash\n', 're:crash \\(pid [0-9]+\\) was stopped: Page Fault: READ of 0x0+ ', 15),
+        ('crash kernel\n', 'tried to touch KERNEL memory', 15),
+        ('crash cli\n', 'only the kernel may do that', 15),
+        ('crash div\n', 'Division', 15),
+        ('crash stack\n', 'was stopped: Page Fault: WRITE', 20),
+        ('crash loop\n', 'press Ctrl+C', 15),
+        ({'key': 'ctrl-c'}, 'stopped with Ctrl+C', 10),
+        ('primes 100000\n', '9592 primes', 30),
+        ('hello\n', 'Hello from ring 3!', 15),
+        ('mem\n', 'freed: OK', 15),
     ]
 
     runs = [('main', main_steps, ['-smp', '2'])]
@@ -363,6 +406,20 @@ def main():
             ('spin 2\n', "gui: job 'SPIN 2' started", 10),
             ({'mouse': 20}, "gui: mouse moved while 'SPIN 2' runs", 5),
             ('', 're:gui: term: SPUN 2 S', 10),
+            # программы в терминале GUI
+            ('hello\n', 'gui: term: HELLO FROM RING 3!', 15),
+            ('crash\n', 'gui: term: *** CRASH WAS STOPPED', 15),
+            ('calc\n', 'gui: term: CALC>', 15),
+            ('6*7\n', 'gui: term: 42', 10),
+            ('\n', "gui: job 'CALC' finished", 10),
+            ({'key': 'esc'}, '', 0.5),
+            # ярлыки рабочего стола: CALC - шестой (y = 22+10+5*66+16)
+            ({'goto': (46, 372)}, '', 0.2),
+            ({'click': 1}, '', 0.3),
+            ({'click': 1}, 'gui: shortcut CALC opened', 10),
+            ('', 'gui: term: CALCULATOR.', 10),
+            ('2+2\n', 'gui: term: 4', 10),
+            ('\n', "gui: job 'CALC' finished", 10),
             ('sleep 30\n', "gui: job 'SLEEP 30' started", 10),
             ({'key': 'esc'}, '', 0.5),
             ({'key': 'esc'}, 'gui: left', 10),
@@ -419,6 +476,9 @@ def main():
             ('line two\n', ': ', 5),
             ('.\n', 'Saved: 2 line(s), 18 bytes', 15),
             ('ls /sata0p1/nope\n', 'no such file or folder', 15),
+            # программа - файлом на флешке (этап 6)
+            ('/usb0p1/apps/hello from-disk\n', 'Hello from ring 3!', 15),
+            ('', '[from-disk]', 5),
             # вторая флешка - на лету: без таблицы разделов (FAT16 с сектора 0)
             ({'qmp': ('device_add', {'driver': 'usb-storage', 'bus': 'xhci.0', 'port': '4',
                                      'drive': 'stick2', 'id': 's2'})},
@@ -461,17 +521,17 @@ def main():
         ], ['-rtc', 'base=2026-01-15T10:00:00']))
         runs.append(('crash-write', [
             (None, "Type 'help'", 90),
-            ('crash write\n', 'Page Fault: WRITE', 15),
+            ('kpanic write\n', 'Page Fault: WRITE', 15),
             ('', 'READ-ONLY', 5),
             ('', 'kernel CODE', 5),
         ]))
         runs.append(('crash-stack', [
             (None, "Type 'help'", 90),
-            ('crash stack\n', 'KERNEL STACK OVERFLOW', 20),
+            ('kpanic stack\n', 'KERNEL STACK OVERFLOW', 20),
         ]))
         runs.append(('crash-null', [
             (None, "Type 'help'", 90),
-            ('crash null\n', 'NULL pointer', 15),
+            ('kpanic null\n', 'NULL pointer', 15),
         ]))
 
     ok = True

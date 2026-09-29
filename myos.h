@@ -307,6 +307,7 @@ typedef EFI_STATUS (EFIAPI *XHCI_FREE_POOL)(VOID *Buffer);
    открывается кликом по файлу в Проводнике. Держим его
    после всех пунктов меню, чтобы не путать с иконками. */
 #define GUI_ACT_FILEVIEW  8
+#define GUI_ACT_PROGRAM   100   /* ярлык программы из /bin */
 
 /* ============================================================
  * Сапёр (Minesweeper)
@@ -866,6 +867,10 @@ typedef struct KTHREAD {
                                     секунду, 0..1000 */
     UINT64      switches;        /* сколько раз получал процессор */
     UINT64      started_ms;      /* когда создан (мс от старта таймера) */
+
+    /* этап 6: поток программы (ring 3) */
+    UINT64      cr3;             /* свои таблицы страниц (0 - ядра) */
+    struct KPROC *proc;          /* чей это поток (NULL - ядра) */
 } KTHREAD;
 
 /* Замок-"мьютекс": пока его держит один поток, другой, пришедший
@@ -1054,6 +1059,54 @@ typedef struct VFS_MOUNT {
     BOOLEAN        gone;         /* диск пропал - том мёртв */
     FAT_VOL        fat;
 } VFS_MOUNT;
+
+
+/* ================================================================
+ * Программы и процессы (этап 6): kernel/proc.c, kernel/syscall.c
+ * ================================================================ */
+
+#include "sysnum.h"
+
+#define PROC_MAX        12
+#define PROC_FDS        8
+#define PROC_IN_MAX     256
+#define MAX_HEAP_BYTES  (64ull * 1024u * 1024u)   /* куча программы - не больше */
+
+/* Куда программа пишет и откуда читает (fd 0, 1, 2) */
+#define PROC_IO_CONSOLE 0      /* текстовая консоль шелла */
+#define PROC_IO_GUI     1      /* окно терминала GUI */
+
+typedef struct KPROC {
+    BOOLEAN          used;
+    UINT32           pid;
+    char             name[KT_NAME_LEN];
+    char             path[VFS_PATH_MAX];
+    char             cwd[VFS_PATH_MAX];   /* от какой папки считать пути */
+    UINT64           pml4;                /* свои таблицы страниц */
+    KTHREAD         *thread;
+    UINT32           tid;
+    UINT64           entry;
+    UINT64           user_rsp;
+    UINT64           brk_base, brk;       /* куча: [brk_base, brk) */
+    UINT64           pages;               /* сколько страниц памяти занято */
+    INTN             fds[PROC_FDS];       /* номера файлов VFS (-1 - нет) */
+    volatile BOOLEAN exited;
+    volatile BOOLEAN killed;              /* попросили завершиться */
+    INT64            exit_code;
+    char             why[160];            /* почему завершилась (ошибка) */
+    UINT64           started_ms;
+    UINT64           syscalls;
+
+    UINT32           io;                  /* PROC_IO_* */
+    /* вывод в окно GUI - строками */
+    void           (*gui_line)(const char *line);
+    char             outline[64];
+    UINTN            outlen;
+    /* ввод из окна GUI: строка, которую набрали в терминале */
+    char             inbuf[PROC_IN_MAX];
+    volatile UINTN   inlen;
+    volatile BOOLEAN inready;
+} KPROC;
 
 /* TSS (64-битный), см. kernel/cpu.c */
 typedef struct __attribute__((packed)) {
@@ -1535,7 +1588,7 @@ extern SIMPLE_TEXT_OUTPUT_MODE g_kcon_mode;
 extern SIMPLE_TEXT_OUTPUT_INTERFACE g_kcon_out;
 extern BOOLEAN g_kcon_dirty;
 extern UINT64  g_kcon_last_flush;
-extern UINT64 g_kgdt[5] __attribute__((aligned(16)));
+extern UINT64 g_kgdt[8] __attribute__((aligned(16)));
 extern KX_TSS g_ktss;
 extern MYOS_BOOT_INFO g_boot;
 extern UINT64  g_vmm_pml4_phys;
@@ -1772,14 +1825,8 @@ int fs_find(
 int fs_find_free(void);
 BOOLEAN fs_shell_command(EFI_SYSTEM_TABLE *st, const CHAR16 *line);
 
-/* --- shell/editor.c --- */
-void cmd_edit(EFI_SYSTEM_TABLE *st, const char *path);
 
-/* --- shell/calc.c --- */
-void cmd_calc(
-    EFI_SYSTEM_TABLE *st,
-    CHAR16 *rest
-);
+
 
 /* --- shell/fetch.c --- */
 void print_label(
@@ -1942,7 +1989,8 @@ void gui_draw_desktop(
     BOOLEAN menu_open,
     INTN btn_x, INTN btn_y, UINTN btn_w, UINTN btn_h,
     INTN cur_x, INTN cur_y,
-    const char *clock_text
+    const char *clock_text,
+    INTN shortcut_sel
 );
 void gui_draw_window(
     volatile UINT32 *fb,
@@ -1990,7 +2038,8 @@ void gui_str_copy8(
 typedef enum {
     GUI_JOB_NONE = 0,
     GUI_JOB_SLEEP,
-    GUI_JOB_SPIN
+    GUI_JOB_SPIN,
+    GUI_JOB_PROC         /* программа из /bin в ring 3 (этап 6) */
 } GUI_JOB_KIND;
 
 typedef struct {
@@ -2006,6 +2055,10 @@ typedef struct {
     UINT64           started_ms;
     KTHREAD         *thread;
     UINT32           tid;
+    /* GUI_JOB_PROC */
+    char             path[VFS_PATH_MAX];
+    char             args[GUI_TERM_LINE_LEN + 1];
+    KPROC *volatile  proc;
 } GUI_TERM_JOB;
 
 extern GUI_TERM_JOB g_term_job;
@@ -2050,6 +2103,24 @@ void gui_draw_minesweeper(
 );
 
 /* --- gui/minesweeper_draw.c --- */
+/* Ярлыки рабочего стола (gui/shortcuts.c) */
+typedef struct {
+    const char        *label;
+    const char *const *icon;        /* 16 строк по 16 букв-цветов */
+    UINTN              action;      /* GUI_ACT_* */
+    const char        *program;     /* для GUI_ACT_PROGRAM: имя в /bin */
+} GUI_SHORTCUT;
+
+UINTN gui_shortcut_count(void);
+const GUI_SHORTCUT *gui_shortcut(UINTN i);
+INTN gui_shortcut_at(INTN x, INTN y);
+void gui_draw_shortcuts(volatile UINT32 *fb, UINT32 stride, UINT32 fb_w, UINT32 fb_h,
+                        EFI_GRAPHICS_PIXEL_FORMAT fmt, INTN selected);
+void gui_term_run_program(EFI_SYSTEM_TABLE *st, const char *cmdline,
+                          char lines[][GUI_TERM_LINE_LEN + 1], UINTN *count);
+void gui_term_program_input(const char *line, char lines[][GUI_TERM_LINE_LEN + 1],
+                            UINTN *count);
+
 /* Проводник (gui/explorer.c): папка VFS -> строки окна */
 typedef struct {
     char   path[VFS_PATH_MAX];                     /* какая папка открыта */
@@ -2265,6 +2336,35 @@ UINTN kthread_stack_used(KTHREAD *t);
 UINTN sched_snapshot(KT_INFO *out, UINTN cap);
 void kernel_cmd_ps(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void kernel_cmd_threadtest(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+
+/* --- kernel/proc.c, kernel/syscall.c --- */
+extern KPROC g_procs[PROC_MAX];
+extern KPROC *volatile g_fg_proc;
+extern volatile UINT64 g_sc_kstack;
+void proc_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void proc_switch_hook(KTHREAD *next);
+KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err);
+INT64 proc_wait(KPROC *p);
+void proc_reap(KPROC *p);
+void proc_fault(const char *what, UINT64 rip);
+void proc_check_kill(void);
+void proc_exit_current(INT64 code) __attribute__((noreturn));
+void proc_kill(KPROC *p);
+void proc_ctrl_c(void);
+BOOLEAN proc_gui_input(KPROC *p, const char *line);
+BOOLEAN proc_find_program(const char *name, char *path, UINTN cap);
+INT64 kx_syscall_dispatch(UINT64 *frame);
+void kx_user_fault(KX_ISR_FRAME *f);
+void kernel_cmd_run(EFI_SYSTEM_TABLE *st, const char *path, const char *args, BOOLEAN quiet);
+BOOLEAN proc_shell_try(EFI_SYSTEM_TABLE *st, const CHAR16 *line);
+BOOLEAN uptr_ok(KPROC *p, UINT64 addr, UINT64 len, BOOLEAN write);
+BOOLEAN proc_map_heap_page(KPROC *p, UINT64 va);
+extern const char *g_proc_last_error;
+extern void (*g_proc_gui_sink)(const char *line);
+
+/* --- fs/binfs.c --- */
+extern const VFS_OPS g_bin_ops;
+void binfs_mount(void);
 
 /* --- drivers/blk.c --- */
 extern BLKDEV g_blk[BLK_MAX];

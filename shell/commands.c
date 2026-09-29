@@ -108,17 +108,19 @@ void run_command(
 
         kernel_cmd_vm(out);
 
-    } else if (streq(line, "crash")) {
+    /* kpanic - сломать САМО ЯДРО (экран паники, машина стоп).
+       "crash" теперь - программа /bin/crash: ломается только она */
+    } else if (streq(line, "kpanic")) {
 
         kernel_cmd_crash(out, "");
 
-    } else if (starts_with(line, "crash ")) {
+    } else if (starts_with(line, "kpanic ")) {
 
         /* line - CHAR16; аргумент переводим в ASCII */
         char arg[16];
         UINTN k = 0;
 
-        for (CHAR16 *c = line + 6; *c && k + 1 < sizeof(arg); c++)
+        for (CHAR16 *c = line + 7; *c && k + 1 < sizeof(arg); c++)
             arg[k++] = (*c < 128) ? (char)*c : '?';
 
         arg[k] = '\0';
@@ -215,7 +217,14 @@ void run_command(
 
         print(
             out,
-            "  calc <a> <op> <b> - basic calculator (+ - * /)\n"
+            "  --- programs (ring 3, files in /bin; also run <path>) ---\n"
+            "  hello         - greeting from user mode\n"
+            "  calc [expr]   - calculator: calc 2*(3+4)\n"
+            "  edit <file>   - type text into a file, end with '.'\n"
+            "  guess         - guess-the-number game\n"
+            "  primes [N]    - count prime numbers (a long job)\n"
+            "  crash [how]   - a program that breaks on purpose (null, write,\n"
+            "                  kernel, cli, div, stack, loop); Ctrl+C stops a program\n"
         );
 
         print(
@@ -275,7 +284,7 @@ void run_command(
 
         print(
             out,
-            "  crash [null|write|stack] - trigger a CPU exception on purpose\n"
+            "  kpanic [null|write|stack] - break the KERNEL itself on purpose\n"
             "                  -> panic screen (the machine halts after it)\n"
         );
 
@@ -311,7 +320,6 @@ void run_command(
             "  cat <name>    - print a file\n"
             "  write <n> <t> - write a line of text into a file (replaces it)\n"
             "  append <n> <t>- add a line of text to the end\n"
-            "  edit <name>   - type several lines into a file, end with '.'\n"
             "  rm <name>     - delete a file\n"
             "  mv <a> <b>    - rename / move;  cp <a> <b> - copy (also between disks)\n"
             "  size <name>   - file size;  df - volumes, size and free space\n"
@@ -385,28 +393,6 @@ void run_command(
         print(
             out,
             "Woke up.\n"
-        );
-
-
-    /* --------------------------------------------------------
-     * calc
-     * -------------------------------------------------------- */
-
-    } else if (starts_with(line, "calc ")) {
-
-        CHAR16 tmp[LINE_MAX];
-
-
-        char16_copy(
-            tmp,
-            line + 5,
-            LINE_MAX
-        );
-
-
-        cmd_calc(
-            st,
-            tmp
         );
 
 
@@ -920,6 +906,15 @@ void run_command(
             NULL
         );
 
+
+    /* --------------------------------------------------------
+     * программа из /bin (или путь к файлу программы) - этап 6:
+     * она работает в ring 3 в своей памяти, шелл её ждёт
+     * -------------------------------------------------------- */
+
+    } else if (proc_shell_try(st, line)) {
+
+        /* выполнено */
 
     /* --------------------------------------------------------
      * unknown command

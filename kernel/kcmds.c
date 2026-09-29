@@ -762,11 +762,11 @@ void kernel_cmd_crash(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *what)
 
     } else {
 
-        print(out, "Usage: crash [null|write|stack]\n");
-        print(out, "  crash        - invalid instruction (#UD)\n");
-        print(out, "  crash null   - read a NULL pointer (Page Fault)\n");
-        print(out, "  crash write  - write into kernel code (Page Fault, read-only)\n");
-        print(out, "  crash stack  - kernel stack overflow (Double Fault)\n");
+        print(out, "Usage: kpanic [null|write|stack]  (the program 'crash' breaks only itself)\n");
+        print(out, "  kpanic        - invalid instruction (#UD)\n");
+        print(out, "  kpanic null   - read a NULL pointer (Page Fault)\n");
+        print(out, "  kpanic write  - write into kernel code (Page Fault, read-only)\n");
+        print(out, "  kpanic stack  - kernel stack overflow (Double Fault)\n");
         return;
     }
 

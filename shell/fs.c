@@ -221,6 +221,8 @@ static void fs_ls_root(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
                     m->fat.label[0] ? m->fat.label : "(no label)", t, f,
                     d->parent >= 0 ? g_blk[d->parent].kind : d->kind,
                     d->model, m->readonly ? "  READ-ONLY" : "");
+        } else if (m->ops == &g_bin_ops) {
+            kprintf(out, "  /%-9s programs built into MyOS (read-only), %s\n", m->name, t);
         } else {
             kprintf(out, "  /%-9s RAM disk: %u files max, cleared on reboot\n",
                     m->name, (UINT32)FS_MAX_FILES);
@@ -469,11 +471,14 @@ static void fs_df(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
         if (m->ops == &g_fat_ops)
             ksnprintf(ty, sizeof(ty), "FAT%u", m->fat.fat_bits);
+        else if (m->ops == &g_bin_ops)
+            ksnprintf(ty, sizeof(ty), "bin");
         else
             ksnprintf(ty, sizeof(ty), "ram");
 
         kprintf(out, "/%-10s %-9s %-11s %-11s %s%s\n", m->name, ty, t, f,
-                m->ops == &g_fat_ops ? g_blk[m->dev].name : "memory",
+                m->ops == &g_fat_ops ? g_blk[m->dev].name :
+                m->ops == &g_bin_ops ? "kernel image" : "memory",
                 m->readonly ? " (read-only)" : "");
     }
 
@@ -649,13 +654,6 @@ BOOLEAN fs_shell_command(EFI_SYSTEM_TABLE *st, const CHAR16 *line)
     } else if (is_cmd(&l, "df") || is_cmd(&l, "mounts")) {
 
         fs_df(out);
-
-    } else if (is_cmd(&l, "edit")) {
-
-        if (!a1)
-            print(out, "Usage: edit <file>\n");
-        else
-            cmd_edit(st, a1);
 
     } else {
 

@@ -219,7 +219,7 @@ void kmain_stage2(void)
             g_boot.fb_width, g_boot.fb_height, g_boot.fb_phys);
 
     kmain_section(out, "[cpu]");
-    print(out, "  GDT loaded (code 0x08, data 0x10, TSS 0x18)\n");
+    print(out, "  GDT loaded (kernel 0x08/0x10, programs 0x2B/0x23, TSS 0x30)\n");
     print(out, "  IDT loaded: 256 vectors, exceptions -> panic screen\n");
     kprintf(out, "  TSS: separate stacks for Double Fault, NMI, Machine Check\n");
 
@@ -455,6 +455,10 @@ void kmain_stage2(void)
     /* --- диски и файлы (этап 5) --- */
     kmain_section(out, "[storage]");
     storage_init(out);
+
+    /* --- программы в ring 3 (этап 6) --- */
+    kmain_section(out, "[programs]");
+    proc_init(out);
 
     /* --- таблица функций ядра для шелла и GUI --- */
     kx_install_shims();

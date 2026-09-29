@@ -25,8 +25,12 @@ Linux, fish; беспроводная мышь Onikuma через USB-донгл
 2 (ACPI), 3 (прерывания, USB-хабы, горячее подключение, флешки) и
 4 (потоки ядра, планировщик с вытеснением, мьютексы, `ps`) и 5
 (диски: USB/AHCI/NVMe, MBR/GPT, FAT16/32 чтение+запись, VFS, кэш,
-команды файлов, Проводник) выполнены.** Следующий по плану — этап 6
-(программы в пользовательском режиме: ring 3, syscall, ELF с диска).
+команды файлов, Проводник) и 6 (программы в ring 3: syscall, свои
+адресные пространства, ELF, мини-libc, /bin; ярлыки рабочего стола
+в стиле Win95) выполнены.** Следующий по плану — этап 7 (оконная
+система: композитор, несколько окон, окна у программ, кириллица).
+Из этапа 6 не сделано: шелл как программа и Сапёр как программа (им
+нужен протокол окон этапа 7).
 Не сделаны: SMP (этап 4, «позже»), virtio-blk (не нужен: QEMU-тесты
 идут через AHCI и NVMe), exFAT/NTFS/ext4 (не монтируются). AML (байт-код
 DSDT/SSDT) не исполняется: решение — взять библиотеку uACPI, когда
@@ -102,7 +106,7 @@ PCI и PIT. OVMF с `-no-acpi` сам не грузится — так не пр
 
 Команды для проверки: `usb` (дерево устройств, журнал подключений), `disk`/`disk read N`, `cpu` (загрузка, прерывания), `acpi` (таблицы, ядра, I/O APIC, ECAM, HPET, FADT), `vm` (раскладка, стеки, проверка перевода
 адресов), `mem` (карта, pmm, куча, самотесты), `boot` (что сделал
-загрузчик + его журнал), `crash`/`crash null`/`crash write`/`crash stack`.
+загрузчик + его журнал), `kpanic`/`kpanic null`/`kpanic write`/`kpanic stack`.
 
 ## Состояние на реальном ноутбуке
 
@@ -211,6 +215,44 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   его. Терминал GUI по-прежнему работает только с RAM-диском.
 * `tools/fatimg.py`: FatBuilder (mkfs + файлы с LFN), make_disk
   (MBR/GPT/без таблицы), FatReader.fsck — независимая проверка.
+
+## Программы в ring 3 (этап 6) — как устроено
+
+* GDT: 0x08/0x10 ядро, 0x18 (пустышка для SYSRET), 0x20 данные
+  программ (0x23), 0x28 код программ (0x2B), 0x30 TSS.
+* `kernel/proc.c`: `KPROC` (12 шт.): своя PML4 (верх 256 записей
+  копируется из ядра при каждом входе — `uvm_sync_kernel_half`),
+  ELF64 ET_EXEC (PT_LOAD, права страниц по флагам, NX), стек 256 КиБ
+  под 0x7FFFFFFF0000 с argc/argv по System V, куча — `sbrk`.
+  Поток ядра `proc_thread_main` ставит CR3 и `iretq` в ring 3.
+  `proc_switch_hook` (из sched.c): TSS.rsp0 = `g_sc_kstack` = стек
+  потока, CR3. Исключение в ring 3 → `kx_user_fault` (cpu.c) →
+  `killed`; в конце `kx_isr_dispatch` и syscall `proc_check_kill` →
+  `proc_exit_current` → `kthread_exit`. Память освобождает ждущий:
+  `proc_wait` → `proc_reap`. Ctrl+C (keyboard.c) → `g_fg_proc`.
+  SMAP выключается (ядро читает буферы программ напрямую после
+  `uptr_ok`).
+* `kernel/syscall.c`: MSR STAR/LSTAR/FMASK, вход `kx_syscall_entry`
+  (свой стек, fxsave, sti, `kx_syscall_dispatch`, sysretq).
+  17 вызовов (`sysnum.h`): exit write read open close sleep uptime
+  sbrk getpid time readdir mkdir unlink rename yield stat getkey.
+  fd 0/1/2 — консоль шелла (`PROC_IO_CONSOLE`) или терминал GUI
+  (`PROC_IO_GUI`: вывод строками через `g_proc_gui_sink`, ввод —
+  `proc_gui_input`), 3+ — файлы VFS.
+* `fs/binfs.c`: том `/bin` из `build/apps.S` (.incbin всех
+  `build/user/*`). make кладёт копии и в `esp/APPS/`.
+* Шелл: неизвестная команда → `proc_shell_try` (ищет /bin/имя, путь
+  или ELF в текущей папке); `run путь аргументы`. Встроенные `calc`
+  и `edit` удалены (стали программами). Старая `crash` ядра →
+  `kpanic`.
+* GUI: `gui/shortcuts.c` — 8 ярлыков, значки 16x16 буквами-цветами
+  (палитра Win95), рисуются x2; выделение «сеточкой»; второй щелчок
+  по выделенному открывает. Терминал GUI запускает программы
+  (`GUI_JOB_PROC`), ввод строк идёт программе, Esc завершает её.
+  В шрифт GUI добавлены + * > < % ? [ ] " # & ; @ | ^ ~ $ \\.
+* Тесты: main (hello/calc/crash*/Ctrl+C/primes/mem), gui-threads
+  (программы в терминале, ярлык CALC мышью), storage (программа с
+  флешки /usb0p1/apps/hello).
 
 ## Ранний запуск на железе (диагностика без COM-порта)
 

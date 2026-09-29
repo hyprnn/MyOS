@@ -99,6 +99,19 @@ void kbd_press_usage(UINT8 u)
 
     if (u >= 0x04 && u <= 0x1D) {
 
+        /* Ctrl+C - остановить программу, которая сейчас работает
+           (этап 6); если программы нет - обычный символ 3 */
+        UINT8 mods = (UINT8)(g_kbd_usb_mods | g_kbd_ps2_mods);
+
+        if ((mods & 0x11u) && u == 0x06) {
+            if (g_fg_proc != NULL) {
+                proc_ctrl_c();
+                return;
+            }
+            kbd_enqueue(0, 3);
+            return;
+        }
+
         /* буквы a..z */
         BOOLEAN upper = shift ? !g_kbd_caps : g_kbd_caps;
         CHAR16 c = (CHAR16)((upper ? 'A' : 'a') + (u - 0x04));

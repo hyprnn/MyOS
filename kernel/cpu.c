@@ -12,17 +12,26 @@
  * принадлежит ОС и может быть переиспользована. Своя GDT в
  * нашем собственном образе - первое, что делает любая ОС.
  *
- * 64-битному режиму нужны всего два дескриптора (сегментация в
- * long mode почти не работает - базы и лимиты игнорируются):
- *   0x08 - код:   L=1 (64-битный), P=1, DPL=0, исполняемый
- *   0x10 - данные: P=1, DPL=0, запись разрешена
- *   0x18 - TSS (занимает две записи по 8 байт), заполняется в
- *          kx_load_tss: отдельные стеки для тяжёлых исключений.
+ * Сегментация в long mode почти не работает (базы и лимиты
+ * игнорируются), но дескрипторы нужны - в них записан УРОВЕНЬ
+ * ПРИВИЛЕГИЙ (DPL): 0 - ядро, 3 - программы (этап 6).
+ *   0x08 - код ядра:     L=1 (64-битный), DPL=0
+ *   0x10 - данные ядра:  DPL=0
+ *   0x18 - код программ, 32-битный - не используется, но нужен
+ *          ради порядка, который требует инструкция SYSRET: она
+ *          берёт селекторы программы как база+8 (данные) и
+ *          база+16 (64-битный код), база = 0x18 (регистр STAR)
+ *   0x20 - данные программ: DPL=3  (селектор с RPL: 0x23)
+ *   0x28 - код программ:    L=1, DPL=3 (селектор 0x2B)
+ *   0x30 - TSS (две записи по 8 байт), заполняется в kx_load_tss
  */
-UINT64 g_kgdt[5] __attribute__((aligned(16))) = {
+UINT64 g_kgdt[8] __attribute__((aligned(16))) = {
     0x0000000000000000ull,
     0x00AF9A000000FFFFull,
     0x00CF92000000FFFFull,
+    0x00CFFA000000FFFFull,
+    0x00CFF2000000FFFFull,
+    0x00AFFA000000FFFFull,
     0, 0
 };
 
@@ -84,7 +93,7 @@ void kx_load_gdt(void)
 
 
 /*
- * Записать TSS в GDT (селектор 0x18) и загрузить его (ltr).
+ * Записать TSS в GDT (селектор 0x30) и загрузить его (ltr).
  * ist1..ist3 - вершины стеков для #DF, NMI, #MC (0 - не ставить).
  */
 void kx_load_tss(UINT64 ist_df, UINT64 ist_nmi, UINT64 ist_mc, UINT64 rsp0)
@@ -105,14 +114,14 @@ void kx_load_tss(UINT64 ist_df, UINT64 ist_nmi, UINT64 ist_mc, UINT64 rsp0)
 
     /* 16-байтный системный дескриптор: тип 0x9 (доступный 64-битный
        TSS), P=1; база разбросана по кусочкам, как в 1985 году */
-    g_kgdt[3] = (limit & 0xFFFFu) |
+    g_kgdt[6] = (limit & 0xFFFFu) |
                 ((base & 0xFFFFFFull) << 16) |
                 (0x89ull << 40) |
                 (((limit >> 16) & 0xFu) << 48) |
                 (((base >> 24) & 0xFFull) << 56);
-    g_kgdt[4] = base >> 32;
+    g_kgdt[7] = base >> 32;
 
-    __asm__ __volatile__("ltr %w0" : : "r"(0x18) : "memory");
+    __asm__ __volatile__("ltr %w0" : : "r"(0x30) : "memory");
 
     /* номера IST в записях IDT (1..3 = ist[0..2]) */
     if (ist_df)  g_kidt[8].ist = 1;
@@ -562,7 +571,7 @@ static void kx_explain(KX_ISR_FRAME *f, UINT64 cr2, char *l1, char *l2, UINTN ca
     } else if (f->vector == 6) {
 
         ksnprintf(l1, cap, "Invalid Opcode: the CPU does not know this instruction");
-        ksnprintf(l2, cap, "  (the 'crash' command does this on purpose with ud2)");
+        ksnprintf(l2, cap, "  ('kpanic' does this on purpose with ud2)");
 
     } else if (f->vector == 0) {
 
@@ -735,6 +744,13 @@ static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
 
     if (v < 32) {
 
+        /* исключение в ПРОГРАММЕ (ring 3): виновата она, а не ядро -
+           программа будет завершена, ОС работает дальше (proc.c) */
+        if ((f->cs & 3u) == 3u) {
+            kx_user_fault(f);
+            return;
+        }
+
         kx_panic(f);
         return;
     }
@@ -779,6 +795,35 @@ void kx_isr_dispatch(KX_ISR_FRAME *f)
        это ошибка или int3, переключаться там незачем */
     if (f->vector >= 32)
         sched_isr_exit();
+
+    /* возвращаемся в программу, а её попросили завершиться
+       (упала, Ctrl+C, закрыли окно) - завершить прямо здесь */
+    if ((f->cs & 3u) == 3u)
+        proc_check_kill();
+}
+
+/*
+ * Исключение в программе: записать понятное объяснение (то же, что
+ * на экране паники ядра) и пометить программу "завершить".
+ */
+void kx_user_fault(KX_ISR_FRAME *f)
+{
+    char l1[128], l2[128];
+    UINT64 cr2 = (f->vector == 14) ? kx_read_cr2() : 0;
+
+    kx_explain(f, cr2, l1, l2, sizeof(l1));
+
+    if (f->vector == 13)
+        ksnprintf(l1, sizeof(l1), "General Protection: only the kernel may do that "
+                                  "(privileged instruction) or a bad address");
+    else if (f->vector == 14 && cr2 >= 0xFFFF800000000000ull)
+        ksnprintf(l1, sizeof(l1), "Page Fault: tried to touch KERNEL memory at 0x%llx - "
+                                  "programs are not allowed there", cr2);
+
+    if (l1[0] == '\0')
+        ksnprintf(l1, sizeof(l1), "%s", kx_exception_name(f->vector));
+
+    proc_fault(l1, f->rip);
 }
 
 

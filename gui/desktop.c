@@ -236,7 +236,8 @@ void gui_draw_desktop(
     BOOLEAN menu_open,
     INTN btn_x, INTN btn_y, UINTN btn_w, UINTN btn_h,
     INTN cur_x, INTN cur_y,
-    const char *clock_text
+    const char *clock_text,
+    INTN shortcut_sel
 )
 {
     /* Классическая "объёмная" серо-бирюзовая палитра */
@@ -254,13 +255,15 @@ void gui_draw_desktop(
     INTN cx = cur_x + GUI_CURSOR_SIZE / 2;
     INTN cy = cur_y + GUI_CURSOR_SIZE / 2;
 
-    /* Рабочий стол: теперь пустой, все программы
-       запускаются из меню "Start", как на референсе. */
+    /* Рабочий стол: бирюза и колонка ярлыков слева (этап 6,
+       gui/shortcuts.c); все программы есть и в меню "Start". */
     gui_fill_rect(
         fb, stride, fb_w, fb_h,
         0, 0, fb_w, fb_h,
         col_bg
     );
+
+    gui_draw_shortcuts(fb, stride, fb_w, fb_h, fmt, shortcut_sel);
 
     /* Панель задач: приподнятая серая панель во всю
        ширину экрана СВЕРХУ, слева - кнопка "Start",

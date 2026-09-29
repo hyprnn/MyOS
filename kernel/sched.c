@@ -368,6 +368,10 @@ static void sched_switch(BOOLEAN from_isr)
 
         g_kcur = next;
 
+        /* стек ядра для прерываний/syscall и таблицы страниц нового
+           потока (у потоков программ - свои, этап 6) */
+        proc_switch_hook(next);
+
         kx_switch(&prev->rsp, next->rsp);
 
         /* ...сюда поток prev попадёт, когда его снова выберут */
@@ -764,6 +768,8 @@ KTHREAD *kthread_create(const char *name, void (*fn)(void *), void *arg, UINTN s
     t->started_ms = g_kticks;
     t->wait_what = NULL;
     t->timed_out = FALSE;
+    t->cr3 = 0;
+    t->proc = NULL;
 
     /*
      * Стек нового потока - так, будто он уже побывал в kx_switch:
