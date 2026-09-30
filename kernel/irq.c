@@ -291,7 +291,7 @@ const char *kx_pci_enable_msi(UINT8 bus, UINT8 dev, UINT8 fn, UINT8 vector)
  * сне - это и есть загрузка.
  * ================================================================ */
 
-volatile UINT64 g_idle_tsc = 0;
+
 volatile UINT32 g_cpu_load_permille = 0;    /* 0..1000 за последнюю секунду */
 volatile UINT32 g_cpu_load_valid = 0;
 static UINT64 g_load_last_tsc = 0;
@@ -309,20 +309,47 @@ void kx_idle_hlt(void)
         return;
     }
 
+    /* Спать - отпустив большой замок ядра (sched.c): пока это ядро
+       процессора ждёт прерывания, код ядра ОС может выполнять другое.
+       Разбудившее прерывание само возьмёт замок; вернувшись сюда,
+       берём его снова. sti;hlt - неразрывная пара (прерывание не
+       влезет между ними и не будет "проспано"). */
+    kx_cli();
+    UINT32 depth = kx_bkl_release_all();
+
     UINT64 t0 = rdtsc();
-    kx_hlt();
-    g_idle_tsc += rdtsc() - t0;
+    __asm__ __volatile__("sti; hlt; cli" ::: "memory");
+    UINT64 t1 = rdtsc();
+
+    kx_bkl_reacquire(depth);
+
+    /* прерывания запрещены - ядро то же, что проспало */
+    kx_cpu()->idle_tsc += t1 - t0;
+
+    kx_sti();
 }
 
 /* Из обработчика таймера, раз в 1000 тиков */
 void kx_load_tick(void)
 {
     UINT64 now = rdtsc();
-    UINT64 idle = g_idle_tsc;
+    UINT64 idle = 0;
+    UINT32 ncpu = 0;
+
+    /* загрузка - средняя по всем ядрам: сон всех ядер против
+       "прошедшего времени x число ядер" */
+    for (UINT32 i = 0; i < KX_MAX_CPUS; i++)
+        if (g_cpus[i].in_sched) {
+            idle += g_cpus[i].idle_tsc;
+            ncpu++;
+        }
+
+    if (ncpu == 0)
+        ncpu = 1;
 
     if (g_load_last_tsc != 0 && now > g_load_last_tsc) {
 
-        UINT64 total = now - g_load_last_tsc;
+        UINT64 total = (now - g_load_last_tsc) * ncpu;
         UINT64 slept = idle - g_load_last_idle;
 
         if (slept > total)

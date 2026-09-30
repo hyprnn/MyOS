@@ -29,15 +29,199 @@
  * "один в один". Попав в ap_main (верхняя половина), ядро переходит на
  * настоящие таблицы ядра.
  *
- * Шаг 1 (этот): ядра просыпаются, настраивают себя (GDT, TSS со своими
- * аварийными стеками, IDT, APIC, NX, PAT) и засыпают (hlt). Работу им
- * даст следующий шаг - общий планировщик.
+ * Проснувшись и настроив себя (GDT, TSS со своими аварийными стеками,
+ * IDT, APIC, NX, PAT, syscall), ядро ждёт, пока BSP запустит всех, и
+ * входит в общий планировщик (sched.c) - с "большим замком ядра",
+ * который тоже здесь.
  */
 #include "myos.h"
 
 KX_CPU g_cpus[KX_MAX_CPUS];
 UINT32 g_ncpus = 1;           /* сколько ядер работает (BSP + проснувшиеся) */
 UINT32 g_ncpus_found = 1;     /* сколько ядер в таблице MADT */
+volatile BOOLEAN g_smp_go;    /* BSP: "все запущены - в планировщик" */
+
+/* ================================================================
+ * Большой замок ядра (BKL) - см. объяснение в начале sched.c.
+ *
+ * Сам замок - одно слово: 0 свободен, иначе номер ядра + 1. Кто его
+ * держит "логически" - счётчик bkl_depth у текущего потока. Ждём
+ * замок с запрещёнными прерываниями (на своём ядре обработчик не
+ * придёт за тем же замком).
+ *
+ * Заодно - TLB: если ядро ОС поменяло отображение страницы, которая
+ * уже была отображена (vmm.c, g_tlb_gen++), остальные ядра процессора
+ * могли запомнить старое. Проверяем при каждом взятии замка: код ядра
+ * ОС выполняется только под ним, так что до чужих страниц ядро
+ * процессора со старым TLB не доберётся.
+ * ================================================================ */
+
+/* Замок "с талончиками" (ticket lock): кто пришёл раньше - получит
+   раньше. Обычный замок-флаг на нескольких ядрах бывает нечестным:
+   отпустившее ядро тут же хватает его снова (у него он в кэше), а
+   ждущее может не дождаться никогда. */
+static volatile UINT32 g_bkl_next;       /* следующий талончик */
+static volatile UINT32 g_bkl_serving;    /* чей черёд */
+static volatile UINT32 g_bkl_owner;      /* номер ядра + 1 (для отладки) */
+static volatile UINT64 g_bkl_since;      /* rdtsc: когда его взяли */
+volatile UINT64 g_tlb_gen;
+UINT64 g_bkl_spins;            /* сколько раз пришлось ждать (для cpu) */
+UINT64 g_bkl_breaks;           /* сколько раз пропустили ждущих вперёд */
+
+static void bkl_acquire(void)
+{
+    UINT32 my = __atomic_fetch_add(&g_bkl_next, 1u, __ATOMIC_RELAXED);
+
+    if (__atomic_load_n(&g_bkl_serving, __ATOMIC_ACQUIRE) != my) {
+        g_bkl_spins++;
+        while (__atomic_load_n(&g_bkl_serving, __ATOMIC_ACQUIRE) != my)
+            cpu_pause();
+    }
+
+    g_bkl_owner = kx_cpu_index() + 1u;
+    g_bkl_since = rdtsc();
+
+    KX_CPU *c = kx_cpu();
+    UINT64 gen = g_tlb_gen;
+
+    if (c->tlb_gen != gen) {
+        UINT64 cr3;
+        __asm__ __volatile__("mov %%cr3, %0; mov %0, %%cr3" : "=r"(cr3) : : "memory");
+        c->tlb_gen = gen;
+    }
+}
+
+static void bkl_release(void)
+{
+    g_bkl_owner = 0;
+    __atomic_store_n(&g_bkl_serving, g_bkl_serving + 1u, __ATOMIC_RELEASE);
+}
+
+/* Ждёт ли замка кто-то ещё */
+static BOOLEAN bkl_contended(void)
+{
+    return __atomic_load_n(&g_bkl_next, __ATOMIC_RELAXED) -
+           __atomic_load_n(&g_bkl_serving, __ATOMIC_RELAXED) > 1u;
+}
+
+/*
+ * "Пропустить вперёд": если замка ждёт другое ядро - отдать его и
+ * встать в очередь снова. Звать можно только там, где текущий поток
+ * и так мог быть прерван и заменён любым другим (прерывания у
+ * прерванного кода были разрешены) - тогда то, что другое ядро
+ * выполнит кусок кода ядра ОС, ничем не отличается от "таймер
+ * переключил на другой поток". Так ни один поток ядра, который долго
+ * считает, не держит замок дольше миллисекунды (тика таймера).
+ *
+ * Но и не меньше миллисекунды: ядро, которое долго ждало замок,
+ * накопило за это время тик таймера - он сработает сразу, как только
+ * ядро получит замок и разрешит прерывания. Отдай оно замок на этом
+ * тике - оно не успело бы поработать вовсе, и одни потоки получали
+ * бы почти всё время, а другие - почти ничего.
+ */
+void kx_bkl_relax(void)
+{
+    if (!bkl_contended())
+        return;
+
+    if (g_tsc_hz != 0 && rdtsc() - g_bkl_since < g_tsc_hz / 1000u)
+        return;
+
+    UINT64 fl = kx_irq_save();
+    UINT32 d = kx_bkl_release_all();
+
+    if (d > 0) {
+        g_bkl_breaks++;
+        kx_bkl_reacquire(d);
+    }
+
+    kx_irq_restore(fl);
+}
+
+/* Вход в код ядра ОС (прерывание, системный вызов) */
+void kx_bkl_enter(void)
+{
+    UINT64 fl = kx_irq_save();
+    KTHREAD *t = kx_cur();
+
+    if (t->bkl_depth++ == 0)
+        bkl_acquire();
+
+    kx_irq_restore(fl);
+}
+
+/* Выход из него; последний выход отпускает замок */
+void kx_bkl_exit(void)
+{
+    UINT64 fl = kx_irq_save();
+    KTHREAD *t = kx_cur();
+
+    if (t->bkl_depth > 0 && --t->bkl_depth == 0)
+        bkl_release();
+
+    kx_irq_restore(fl);
+}
+
+/* Отпустить совсем (перед hlt) - вернуть, сколько было; прерывания
+   должны быть запрещены */
+UINT32 kx_bkl_release_all(void)
+{
+    KTHREAD *t = kx_cur();
+    UINT32 d = t ? t->bkl_depth : 0;
+
+    if (d > 0) {
+        t->bkl_depth = 0;
+        bkl_release();
+    }
+
+    return d;
+}
+
+void kx_bkl_reacquire(UINT32 depth)
+{
+    KTHREAD *t = kx_cur();
+
+    if (depth > 0) {
+        bkl_acquire();
+        t->bkl_depth = depth;
+    }
+}
+
+/* Загрузочное ядро - в самом начале kmain (после своей GDT):
+   регистр GS указывает на g_cpus[0], поток "shell" держит замок */
+void smp_early_init(void)
+{
+    KX_CPU *c = &g_cpus[0];
+
+    c->self = c;
+    c->index = 0;
+    c->kcur = &g_kthreads[0];
+    c->tss_ptr = &g_ktss;
+    c->bsp = TRUE;
+    c->used = TRUE;
+    c->online = TRUE;
+
+    kx_wrmsr(0xC0000101u, (UINT64)(UINTN)c);   /* GS base */
+    kx_wrmsr(0xC0000102u, 0);                  /* KernelGSBase: GS программ */
+
+    /* большой замок держит ядро 0 (поток "shell", bkl_depth = 1) */
+    g_bkl_next = 1u;
+    g_bkl_serving = 0u;
+    g_bkl_owner = 1u;
+}
+
+/* Паника: остановить остальные ядра, чтобы экран паники не затёрли */
+void smp_halt_others(void)
+{
+    if (g_ncpus < 2 || (g_lapic_base == 0 && !g_lapic_x2))
+        return;
+
+    UINT32 me = kx_cpu_index();
+
+    for (UINT32 i = 0; i < KX_MAX_CPUS; i++)
+        if (i != me && g_cpus[i].online)
+            kx_lapic_send_ipi(g_cpus[i].apic_id, KX_VEC_HALT);
+}
 
 /* ================================================================
  * Трамплин. Кладётся в .rodata ядра как кусок байт, копируется в
@@ -149,7 +333,7 @@ static UINT64 g_tr_phys;        /* страница трамплина (ниже
 static UINT64 g_tr_cr3;         /* временные таблицы страниц */
 
 /* значения регистров BSP - такими же настраиваются AP */
-static UINT64 g_bsp_cr0, g_bsp_cr4, g_bsp_pat, g_bsp_efer;
+static UINT64 g_bsp_cr0, g_bsp_cr4, g_bsp_pat, g_bsp_efer, g_bsp_xcr0;
 
 /* ================================================================
  * Сигналы между ядрами (IPI) через Local APIC: регистр ICR.
@@ -230,6 +414,10 @@ static void ap_main(UINT64 idx)
 {
     KX_CPU *c = &g_cpus[idx];
 
+    c->self = c;
+    c->index = (UINT32)idx;
+    c->tss_ptr = &c->tss;
+
     /* 1. настоящие таблицы страниц ядра (трамплин жил на временных) */
     __asm__ __volatile__("mov %0, %%cr3" : : "r"(g_vmm_pml4_phys) : "memory");
 
@@ -245,6 +433,10 @@ static void ap_main(UINT64 idx)
 
     kx_wrmsr(0xC0000080u, g_bsp_efer);
 
+    if (g_bsp_xcr0 != 0)
+        __asm__ __volatile__("xsetbv" : : "a"((UINT32)g_bsp_xcr0),
+                             "d"((UINT32)(g_bsp_xcr0 >> 32)), "c"(0));
+
     /* 3. своя GDT и TSS, общая IDT */
     ap_load_gdt_tss(c);
 
@@ -252,6 +444,14 @@ static void ap_main(UINT64 idx)
     idtr.limit = (UINT16)(sizeof(g_kidt) - 1);
     idtr.base = (UINT64)(UINTN)&g_kidt[0];
     __asm__ __volatile__("lidt %0" : : "m"(idtr) : "memory");
+
+    /* регистр GS - на структуру этого ядра (после lgdt: загрузка
+       сегмента обнуляет базу); "GS программ" - 0 */
+    kx_wrmsr(0xC0000101u, (UINT64)(UINTN)c);
+    kx_wrmsr(0xC0000102u, 0);
+
+    /* системные вызовы (и SMAP выключен) - как у BSP (proc.c) */
+    kx_syscall_cpu_init();
 
     /* 4. сопроцессор (SSE): чистое состояние */
     __asm__ __volatile__("fninit" ::: "memory");
@@ -274,10 +474,18 @@ static void ap_main(UINT64 idx)
     /* 6. "я проснулось" - BSP ждёт этого флага */
     __atomic_store_n(&c->online, TRUE, __ATOMIC_RELEASE);
 
-    /* Шаг 1: работы нет - спать. Прерывания выключены: разбудит
-       только INIT или NMI; планировщик для этих ядер - следующий шаг. */
-    for (;;)
-        __asm__ __volatile__("cli; hlt" ::: "memory");
+    /* 7. ждать, пока BSP запустит всех (и не передумает) */
+    while (!__atomic_load_n(&g_smp_go, __ATOMIC_ACQUIRE))
+        cpu_pause();
+
+    /* 8. свой таймер (1000 Гц, как у BSP: частота та же - шина общая) */
+    kx_lapic_write(0x3E0, 0x3);
+    kx_lapic_write(0x320, (1u << 17) | KX_VEC_TIMER);
+    kx_lapic_write(0x380, (UINT32)(g_lapic_hz / 1000u));
+
+    /* 9. в общий планировщик - под большим замком */
+    bkl_acquire();
+    sched_ap_enter();
 }
 
 /* ================================================================
@@ -427,6 +635,14 @@ void smp_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     g_bsp_efer = kx_rdmsr(0xC0000080u);
     g_bsp_pat = g_vmm_pat ? kx_rdmsr(0x277u) : 0;
 
+    /* XCR0 - какие наборы регистров (x87/SSE/AVX) включены; читается
+       только если прошивка включила XSAVE (CR4.OSXSAVE, бит 18) */
+    if (g_bsp_cr4 & (1ull << 18)) {
+        UINT32 lo, hi;
+        __asm__ __volatile__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        g_bsp_xcr0 = ((UINT64)hi << 32) | lo;
+    }
+
     /* трамплину: CR4 без PCIDE (бит 17, до длинного режима нельзя) и
        без LA57 (бит 12, у нас 4 уровня таблиц), но с PAE (бит 5) */
     *(UINT32 *)(tr + TR_OFF(kx_tr_cr4)) =
@@ -446,9 +662,12 @@ void smp_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         }
     }
 
-    kprintf(out, "  CPU cores: %u of %u running (%u ms to start them); for now the others\n"
-                 "  sleep - the scheduler for all cores is the next step\n",
+    kprintf(out, "  CPU cores: %u of %u running (%u ms to start them); programs run on all\n"
+                 "  of them at once, the kernel itself - on one at a time (big kernel lock)\n",
             g_ncpus, g_ncpus_found, (UINT32)((kx_uptime_us() - t0) / 1000u));
+
+    /* все - в планировщик */
+    __atomic_store_n(&g_smp_go, TRUE, __ATOMIC_RELEASE);
 
     klog("smp: %u of %u cores online, trampoline at 0x%llx\n", g_ncpus, g_ncpus_found, g_tr_phys);
 }
@@ -463,11 +682,86 @@ void smp_describe(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         KX_CPU *c = &g_cpus[i];
 
         kprintf(out, "  cpu%u: APIC id %u, %s", i, c->apic_id,
-                c->bsp ? "boot core" : c->online ? "online (idle)" : "NOT started");
+                c->bsp ? "boot core" : c->online ? "online" : "NOT started");
 
         if (!c->online && c->why)
             kprintf(out, " - %s", c->why);
 
+        if (c->in_sched && c->kcur != NULL)
+            kprintf(out, ", now: %s, timer ticks %llu", c->kcur->name, c->ticks);
+
         print(out, "\n");
     }
+
+    if (g_ncpus > 1)
+        kprintf(out, "Big kernel lock: waited for it %llu times, let others go first %llu times\n",
+                g_bkl_spins, g_bkl_breaks);
+}
+
+/* ================================================================
+ * smptest: правда ли программы идут на нескольких ядрах сразу.
+ * Одна программа burn, потом столько же программ, сколько ядер, -
+ * все сразу. Если ядра работают параллельно, "все сразу" заняли
+ * почти столько же времени, сколько одна.
+ * ================================================================ */
+
+void kernel_cmd_smptest(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
+{
+    UINT32 work = 0;
+
+    for (; *arg >= '0' && *arg <= '9'; arg++)
+        work = work * 10u + (UINT32)(*arg - '0');
+
+    if (work == 0 || work > 1000u)
+        work = 200;
+
+    char args[16];
+    ksnprintf(args, sizeof(args), "%u", work);
+
+    UINT32 n = g_ncpus;
+
+    if (n > 8)
+        n = 8;
+
+    INTN err;
+    UINT64 t0 = kx_uptime_us();
+    KPROC *one = proc_spawn("/bin/burn", args, PROC_IO_CONSOLE, &err);
+
+    if (one == NULL) {
+        kprintf(out, "Cannot start /bin/burn: %s\n", vfs_strerror(err));
+        return;
+    }
+
+    proc_wait(one);
+
+    UINT64 t_one = (kx_uptime_us() - t0) / 1000u;
+
+    kprintf(out, "1 program:  %llu ms\n", t_one);
+
+    KPROC *ps[8];
+    UINT32 started = 0;
+
+    t0 = kx_uptime_us();
+
+    for (UINT32 i = 0; i < n; i++) {
+        ps[i] = proc_spawn("/bin/burn", args, PROC_IO_CONSOLE, &err);
+        if (ps[i] != NULL)
+            started++;
+    }
+
+    for (UINT32 i = 0; i < n; i++)
+        if (ps[i] != NULL)
+            proc_wait(ps[i]);
+
+    UINT64 t_all = (kx_uptime_us() - t0) / 1000u;
+
+    if (t_all == 0)
+        t_all = 1;
+
+    /* во сколько раз быстрее, чем если бы шли по очереди (x100) */
+    UINT64 speed = (t_one * started * 100u) / t_all;
+
+    kprintf(out, "%u programs at once: %llu ms -> %llu.%02llu times faster than one after\n"
+                 "another (%u cores; the ideal is %u.00)\n",
+            started, t_all, speed / 100u, speed % 100u, g_ncpus, started);
 }

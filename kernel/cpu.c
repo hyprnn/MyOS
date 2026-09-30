@@ -425,6 +425,13 @@ __asm__(
     "  KX_ISR_NOERR 255\n"
     ".balign 16\n"
     "kx_isr_common:\n"
+    /* прерывали программу (CS в рамке с RPL 3) - регистр GS сейчас её:
+       swapgs делает его "ядерным" (структура этого ядра процессора,
+       smp.c). В рамке: +0 вектор, +8 код ошибки, +16 rip, +24 cs */
+    "  testb $3, 24(%rsp)\n"
+    "  jz 1f\n"
+    "  swapgs\n"
+    "1:\n"
     "  pushq %rax\n"
     "  pushq %rbx\n"
     "  pushq %rcx\n"
@@ -465,6 +472,11 @@ __asm__(
     "  popq %rbx\n"
     "  popq %rax\n"
     "  addq $16, %rsp\n"
+    /* возвращаемся в программу - вернуть ей её GS (+8 - cs) */
+    "  testb $3, 8(%rsp)\n"
+    "  jz 2f\n"
+    "  swapgs\n"
+    "2:\n"
     "  iretq\n"
 );
 
@@ -595,6 +607,9 @@ void kx_panic(KX_ISR_FRAME *f)
 {
     kx_cli();
 
+    /* остальные ядра процессора - остановить: экран паники - наш */
+    smp_halt_others();
+
     UINT64 cr2 = kx_read_cr2();
     char ex1[112], ex2[112];
 
@@ -699,6 +714,36 @@ void kx_panic(KX_ISR_FRAME *f)
 }
 
 
+/*
+ * Часы в миллисекундах (g_kticks) - по TSC, а не счётом прерываний:
+ * на нескольких ядрах обработчик таймера может подождать большой
+ * замок ядра дольше тика, и счёт прерываний отставал бы от времени.
+ * Ведёт загрузочное ядро; раз в секунду - пересчёт загрузки.
+ */
+static void kx_advance_ticks(void)
+{
+    static UINT64 base_ms;
+    static BOOLEAN have_base;
+
+    UINT64 now = kx_uptime_us() / 1000u;
+
+    if (!have_base) {
+        base_ms = now - g_kticks;
+        have_base = TRUE;
+    }
+
+    UINT64 t = now - base_ms;
+    UINT64 old = g_kticks;
+
+    if (t <= old)
+        return;                 /* та же миллисекунда */
+
+    g_kticks = t;
+
+    if (t / 1000u != old / 1000u)
+        kx_load_tick();
+}
+
 /* Разбор прерывания по вектору (зовётся из kx_isr_dispatch ниже) */
 static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
 {
@@ -706,11 +751,12 @@ static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
 
     if (v == KX_VEC_TIMER) {
 
-        g_kticks = g_kticks + 1;
+        /* у каждого ядра процессора свой таймер; часы (g_kticks) и
+           учёт загрузки ведёт только загрузочное */
+        kx_cpu()->ticks++;
 
-        /* раз в секунду - пересчитать загрузку процессора */
-        if (g_kticks % 1000u == 0)
-            kx_load_tick();
+        if (kx_cpu_index() == 0)
+            kx_advance_ticks();
 
         /* планировщик: разбудить тех, у кого вышел сон, и
            отсчитать квант текущего потока (sched.c) */
@@ -718,6 +764,23 @@ static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
 
         kx_lapic_eoi();
         return;
+    }
+
+    if (v == KX_VEC_RESCHED) {
+
+        /* другое ядро: "для тебя есть готовый поток" - сменить поток
+           на выходе из прерывания (sched_isr_exit) */
+        kx_cpu()->need_resched = TRUE;
+        kx_lapic_eoi();
+        return;
+    }
+
+    if (v == KX_VEC_HALT) {
+
+        /* паника на другом ядре - остановиться, не мешать экрану */
+        kx_lapic_eoi();
+        for (;;)
+            __asm__ __volatile__("cli; hlt" ::: "memory");
     }
 
     if (v == KX_VEC_SPURIOUS) {
@@ -785,11 +848,22 @@ static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
 __attribute__((used, visibility("hidden")))
 void kx_isr_dispatch(KX_ISR_FRAME *f)
 {
-    g_kx_isr_depth++;
+    /* прерывания здесь запрещены: ядро процессора не сменится */
+    KX_CPU *c = kx_cpu();
+
+    /* код ядра ОС - под большим замком (SMP, sched.c). Остановка
+       по панике - без него: владелец замка, может быть, и есть тот,
+       кто паникует */
+    if (f->vector == KX_VEC_HALT)
+        kx_isr_dispatch_inner(f);
+
+    kx_bkl_enter();
+
+    c->isr_depth++;
 
     kx_isr_dispatch_inner(f);
 
-    g_kx_isr_depth--;
+    c->isr_depth--;
 
     /* только внешние прерывания (таймер, устройства): исключения -
        это ошибка или int3, переключаться там незачем */
@@ -800,6 +874,14 @@ void kx_isr_dispatch(KX_ISR_FRAME *f)
        (упала, Ctrl+C, закрыли окно) - завершить прямо здесь */
     if ((f->cs & 3u) == 3u)
         proc_check_kill();
+
+    /* прервали код ядра ОС в месте, где прерывания были разрешены
+       (там его и так мог сменить любой поток) - если другое ядро
+       ждёт большой замок, пропустить его вперёд (smp.c) */
+    if ((f->cs & 3u) == 0 && (f->rflags & (1u << 9)))
+        kx_bkl_relax();
+
+    kx_bkl_exit();
 }
 
 /*

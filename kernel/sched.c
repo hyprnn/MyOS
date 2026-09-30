@@ -60,14 +60,32 @@
  * инструкцией hlt до ближайшего прерывания (так процессор и
  * "отдыхает" - загрузка ~0%).
  *
- * ОДНО ЯДРО
- * ---------
- * Пока работает одно ядро процессора (запуск остальных - SMP -
- * отдельный шаг). На одном ядре "запретить прерывания" (cli) =
- * "никто другой сейчас не выполнится": ни обработчик, ни другой
- * поток (переключает только таймер, а он - прерывание). На этом
- * держится kx_lock. Спин-замок KSPINLOCK уже написан так, чтобы
- * работать и на нескольких ядрах.
+ * НЕСКОЛЬКО ЯДЕР (этап 10) - "БОЛЬШОЙ ЗАМОК ЯДРА"
+ * ----------------------------------------------
+ * Код ядра писался для одного ядра процессора: там "запретить
+ * прерывания" (cli) = "никто другой сейчас не выполнится" - на этом
+ * держатся kx_lock и десятки мест в драйверах. На нескольких ядрах
+ * это уже не так: второе ядро может войти в тот же код одновременно.
+ *
+ * Поэтому, как когда-то Linux 2.0 и FreeBSD 4, - один общий замок на
+ * всё ядро (BKL, Big Kernel Lock). Любое ядро процессора, выполняя
+ * код ЯДРА ОС (поток ядра, обработчик прерывания, системный вызов),
+ * держит этот замок; код ПРОГРАММ (ring 3) выполняется без него - и
+ * вот он работает на всех ядрах по-настоящему параллельно. Значит,
+ * внутри ядра ОС по-прежнему "одновременно работает кто-то один", и
+ * все старые правила (cli = никто не мешает) остаются верными.
+ *
+ * Сколько раз поток "вошёл" в замок - bkl_depth у самого потока: при
+ * переключении потоков замок не отпускается (он принадлежит ЯДРУ
+ * процессора, которое продолжает работать в коде ядра ОС - уже за
+ * другой поток). Отпускается он, когда ядро процессора уходит в
+ * программу (последний выход: sysret/iretq в ring 3) или засыпает в
+ * hlt (поток простоя).
+ *
+ * Очередь готовых потоков общая: освободившееся ядро берёт первого
+ * по очереди. У каждого ядра свой поток простоя (idle), свой квант и
+ * свой таймер. Когда поток просыпается, а какое-то ядро спит, - ему
+ * посылается межпроцессорное прерывание KX_VEC_RESCHED ("есть работа").
  */
 #include "myos.h"
 
@@ -83,16 +101,14 @@
  * пользуется g_kcur с самого начала). После запуска это шелл.
  */
 KTHREAD g_kthreads[KT_MAX] = {
-    [0] = { .tid = 1, .slot = 0, .state = KT_RUNNING, .name = "shell" },
+    [0] = { .tid = 1, .slot = 0, .state = KT_RUNNING, .name = "shell", .bkl_depth = 1 },
 };
 
-KTHREAD *g_kcur = &g_kthreads[0];      /* кто работает сейчас */
-KTHREAD *g_kidle = NULL;               /* поток простоя */
+/* кто работает сейчас, поток простоя, "мы в обработчике прерывания",
+   квант - у каждого ядра процессора свои: KX_CPU (smp.c), g_kcur и
+   т.п. - это чтение оттуда (myos.h) */
 
 volatile BOOLEAN g_sched_on = FALSE;   /* планировщик запущен */
-volatile BOOLEAN g_need_resched = FALSE;
-volatile UINT32  g_kx_isr_depth = 0;   /* >0 - мы внутри обработчика
-                                          прерывания: там спать нельзя */
 
 UINT64 g_sched_switches = 0;           /* всего переключений */
 UINT64 g_sched_preempts = 0;           /* ...из них - принудительных
@@ -100,8 +116,6 @@ UINT64 g_sched_preempts = 0;           /* ...из них - принудител�
 
 static UINT32 g_next_tid = 2;
 static UINT64 g_ready_seq = 0;         /* счётчик мест в очереди */
-static UINT32 g_quantum_left = KT_QUANTUM_MS;
-static UINT64 g_slice_start = 0;       /* rdtsc начала работы g_kcur */
 static UINT64 g_acct_last = 0;         /* rdtsc прошлого пересчёта % */
 
 
@@ -265,7 +279,7 @@ static KTHREAD *sched_pick_next(void)
 
         KTHREAD *t = &g_kthreads[i];
 
-        if (t == g_kidle || t->state != KT_READY)
+        if (t->is_idle || t->state != KT_READY)
             continue;
 
         if (best == NULL ||
@@ -290,7 +304,7 @@ static BOOLEAN sched_others_ready(void)
 
         KTHREAD *t = &g_kthreads[i];
 
-        if (t != g_kcur && t != g_kidle && t->state == KT_READY)
+        if (t != g_kcur && !t->is_idle && t->state == KT_READY)
             return TRUE;
     }
 
@@ -308,10 +322,14 @@ static void sched_switch(BOOLEAN from_isr)
 {
     UINT64 fl = kx_irq_save();
 
-    g_need_resched = FALSE;
+    /* прерывания запрещены - поток не переедет на другое ядро, пока
+       мы тут: указатель на "своё" ядро можно держать */
+    KX_CPU *c = kx_cpu();
 
-    KTHREAD *prev = g_kcur;
-    BOOLEAN expired = (g_quantum_left == 0);
+    c->need_resched = FALSE;
+
+    KTHREAD *prev = c->kcur;
+    BOOLEAN expired = (c->quantum_left == 0);
 
     /*
      * Текущий поток, если он ещё хочет работать, снова встаёт в
@@ -330,7 +348,7 @@ static void sched_switch(BOOLEAN from_isr)
             prev->quantum_left = KT_QUANTUM_MS;
         } else {
             /* вытеснен проснувшимся: остаток кванта - за ним */
-            prev->quantum_left = g_quantum_left;
+            prev->quantum_left = c->quantum_left;
         }
 
         prev->boost = FALSE;
@@ -344,8 +362,8 @@ static void sched_switch(BOOLEAN from_isr)
         prev->state = KT_RUNNING;
 
     /* квант следующего: остаток, если он есть, иначе полный */
-    g_quantum_left = (next->quantum_left != 0 && next->quantum_left <= KT_QUANTUM_MS)
-                         ? next->quantum_left : KT_QUANTUM_MS;
+    c->quantum_left = (next->quantum_left != 0 && next->quantum_left <= KT_QUANTUM_MS)
+                          ? next->quantum_left : KT_QUANTUM_MS;
     next->quantum_left = 0;
 
     if (next != NULL && next != prev) {
@@ -353,8 +371,8 @@ static void sched_switch(BOOLEAN from_isr)
         /* учёт времени: всё с начала "смены" - на счёт prev */
         UINT64 now = rdtsc();
 
-        prev->cpu_tsc += now - g_slice_start;
-        g_slice_start = now;
+        prev->cpu_tsc += now - c->slice_start;
+        c->slice_start = now;
 
         if (from_isr && prev->state == KT_READY)
             g_sched_preempts++;
@@ -364,9 +382,10 @@ static void sched_switch(BOOLEAN from_isr)
 
         next->state = KT_RUNNING;
         next->switches++;
+        next->cpu = c->index;
         g_sched_switches++;
 
-        g_kcur = next;
+        c->kcur = next;
 
         /* стек ядра для прерываний/syscall и таблицы страниц нового
            потока (у потоков программ - свои, этап 6) */
@@ -400,8 +419,33 @@ void sched_yield(void)
    счётчик вложенности уже уменьшен: если надо - сменить поток */
 void sched_isr_exit(void)
 {
-    if (g_sched_on && g_need_resched && g_kx_isr_depth == 0)
+    if (g_sched_on && kx_cpu()->need_resched && g_kx_isr_depth == 0)
         sched_switch(TRUE);
+}
+
+/*
+ * Кто-то стал готов к работе - если какое-то ДРУГОЕ ядро сейчас спит
+ * в потоке простоя, разбудить его межпроцессорным прерыванием: оно
+ * возьмёт этот поток. (Своё ядро будит need_resched.) Зовётся под
+ * большим замком.
+ */
+void sched_kick_idle(void)
+{
+    if (g_ncpus < 2)
+        return;
+
+    UINT32 me = kx_cpu_index();
+
+    for (UINT32 i = 0; i < KX_MAX_CPUS; i++) {
+
+        KX_CPU *o = &g_cpus[i];
+
+        if (i == me || !o->in_sched || o->kcur != o->kidle)
+            continue;
+
+        kx_lapic_send_ipi(o->apic_id, KX_VEC_RESCHED);
+        return;
+    }
 }
 
 /* Можно ли сейчас уснуть/ждать: планировщик работает, мы не в
@@ -422,38 +466,51 @@ void sched_tick(void)
     if (!g_sched_on)
         return;
 
-    UINT64 now = g_kticks;
+    KX_CPU *c = kx_cpu();      /* в обработчике: прерывания запрещены */
 
-    for (UINTN i = 0; i < KT_MAX; i++) {
+    /* будить уснувших - только загрузочное ядро (его таймер ведёт
+       часы g_kticks); проснувшихся разберут свободные ядра */
+    if (c->index == 0) {
 
-        KTHREAD *t = &g_kthreads[i];
+        UINT64 now = g_kticks;
+        BOOLEAN woke = FALSE;
 
-        if (t->state == KT_SLEEPING && now >= t->wake_tick) {
+        for (UINTN i = 0; i < KT_MAX; i++) {
 
-            kt_make_ready(t, TRUE);
-            g_need_resched = TRUE;
+            KTHREAD *t = &g_kthreads[i];
 
-        } else if (t->state == KT_BLOCKED && t->wake_tick != 0 &&
-                   now >= t->wake_tick) {
+            if (t->state == KT_SLEEPING && now >= t->wake_tick) {
 
-            kt_make_ready(t, TRUE);
-            t->timed_out = TRUE;
-            t->wait_on = NULL;
-            g_need_resched = TRUE;
+                kt_make_ready(t, TRUE);
+                woke = TRUE;
+
+            } else if (t->state == KT_BLOCKED && t->wake_tick != 0 &&
+                       now >= t->wake_tick) {
+
+                kt_make_ready(t, TRUE);
+                t->timed_out = TRUE;
+                t->wait_on = NULL;
+                woke = TRUE;
+            }
+        }
+
+        if (woke) {
+            c->need_resched = TRUE;
+            sched_kick_idle();
         }
     }
 
-    /* квант текущего потока */
-    if (g_kcur != g_kidle && g_quantum_left > 0) {
+    /* квант текущего потока этого ядра */
+    if (c->kcur != c->kidle && c->quantum_left > 0) {
 
-        g_quantum_left--;
+        c->quantum_left--;
 
-        if (g_quantum_left == 0) {
+        if (c->quantum_left == 0) {
 
             if (sched_others_ready())
-                g_need_resched = TRUE;
+                c->need_resched = TRUE;
             else
-                g_quantum_left = KT_QUANTUM_MS;   /* работай дальше */
+                c->quantum_left = KT_QUANTUM_MS;   /* работай дальше */
         }
     }
 }
@@ -547,9 +604,13 @@ UINTN sched_wake_all(const void *obj)
 
     /* из обработчика прерывания - переключиться сразу на выходе
        из него (например, USB-поток просыпается на подключение
-       мыши, пока процессор спал в idle) */
-    if (n > 0 && (g_kx_isr_depth > 0 || g_kcur == g_kidle))
-        g_need_resched = TRUE;
+       мыши, пока процессор спал в idle); другие ядра, если спят, -
+       разбудить */
+    if (n > 0) {
+        if (g_kx_isr_depth > 0 || g_kcur == g_kidle)
+            kx_cpu()->need_resched = TRUE;
+        sched_kick_idle();
+    }
 
     kx_irq_restore(fl);
 
@@ -574,8 +635,11 @@ BOOLEAN sched_wake_one(const void *obj)
         }
     }
 
-    if (any && g_kx_isr_depth > 0)
-        g_need_resched = TRUE;
+    if (any) {
+        if (g_kx_isr_depth > 0)
+            kx_cpu()->need_resched = TRUE;
+        sched_kick_idle();
+    }
 
     kx_irq_restore(fl);
 
@@ -770,6 +834,10 @@ KTHREAD *kthread_create(const char *name, void (*fn)(void *), void *arg, UINTN s
     t->timed_out = FALSE;
     t->cr3 = 0;
     t->proc = NULL;
+    t->is_idle = FALSE;
+    t->bkl_depth = 1;      /* новый поток начинает в коде ядра - под
+                              большим замком, который держит ядро
+                              процессора, переключившее на него */
 
     /*
      * Стек нового потока - так, будто он уже побывал в kx_switch:
@@ -800,6 +868,7 @@ KTHREAD *kthread_create(const char *name, void (*fn)(void *), void *arg, UINTN s
     fl = kx_irq_save();
     t->wait_on = NULL;
     kt_make_ready(t, FALSE);
+    sched_kick_idle();
     kx_irq_restore(fl);
 
     klog("sched: thread %u '%s' created (stack %u KiB)\n",
@@ -860,6 +929,57 @@ static void kt_idle(void *arg)
     }
 }
 
+/*
+ * Ядро процессора (не загрузочное) входит в общий планировщик
+ * (smp.c, ap_main, уже под большим замком). То, что сейчас выполняется
+ * на нём, становится его потоком простоя: стек - стек этого ядра.
+ * Дальше - обычный цикл idle: работа есть - переключиться, нет -
+ * отпустить замок и спать до прерывания.
+ */
+void sched_ap_enter(void)
+{
+    KX_CPU *c = kx_cpu();
+    KTHREAD *t = NULL;
+
+    for (UINTN i = 0; i < KT_MAX && t == NULL; i++)
+        if (g_kthreads[i].state == KT_UNUSED)
+            t = &g_kthreads[i];
+
+    if (t == NULL) {
+        /* нет места для потока - ядро просто спит, как на шаге 1 */
+        kx_bkl_release_all();
+        for (;;)
+            __asm__ __volatile__("cli; hlt" ::: "memory");
+    }
+
+    t->tid = g_next_tid++;
+    t->slot = (UINT32)(t - g_kthreads);
+    ksnprintf(t->name, KT_NAME_LEN, "idle%u", c->index);
+    t->state = KT_RUNNING;
+    t->stack_top = c->stack_top;
+    t->stack_pages = 4;
+    t->stack_bottom = c->stack_top - 4u * 4096u;
+    t->started_ms = g_kticks;
+    t->is_idle = TRUE;
+    t->bkl_depth = 1;
+    t->cpu = c->index;
+    t->switches = 1;
+
+    c->kcur = t;
+    c->kidle = t;
+    c->slice_start = rdtsc();
+    c->quantum_left = KT_QUANTUM_MS;
+    c->in_sched = TRUE;
+
+    klog("sched: cpu%u joins the scheduler (thread %u)\n", c->index, t->tid);
+
+    kx_sti();
+    kt_idle(NULL);
+
+    for (;;)
+        kx_hlt();
+}
+
 void sched_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
     if (!g_ktimer_ok) {
@@ -885,19 +1005,26 @@ void sched_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     me->started_ms = g_kticks;
     me->switches = 1;
 
-    g_slice_start = rdtsc();
-    g_acct_last = g_slice_start;
+    KX_CPU *c = kx_cpu();
+
+    c->slice_start = rdtsc();
+    c->quantum_left = KT_QUANTUM_MS;
+    g_acct_last = c->slice_start;
 
     /* с этого момента kthread_create работает */
     g_sched_on = TRUE;
 
-    g_kidle = kthread_create("idle", kt_idle, NULL, 4);
+    KTHREAD *idle = kthread_create("idle", kt_idle, NULL, 4);
 
-    if (g_kidle == NULL) {
+    if (idle == NULL) {
         g_sched_on = FALSE;
         print(out, "  Could not create the idle thread - no threads.\n");
         return;
     }
+
+    idle->is_idle = TRUE;
+    c->kidle = idle;
+    c->in_sched = TRUE;
 
     kprintf(out, "  Scheduler: preemptive round-robin, %u ms quantum, "
                  "threads switch on the %s\n",
@@ -917,8 +1044,15 @@ void sched_account_load(void)
 
     UINT64 now = rdtsc();
 
-    g_kcur->cpu_tsc += now - g_slice_start;
-    g_slice_start = now;
+    /* текущие потоки ВСЕХ ядер: их время с начала "смены" (под
+       большим замком - чужое ядро сейчас не переключает потоки) */
+    for (UINT32 i = 0; i < KX_MAX_CPUS; i++) {
+        KX_CPU *o = &g_cpus[i];
+        if (!o->in_sched || o->kcur == NULL)
+            continue;
+        o->kcur->cpu_tsc += now - o->slice_start;
+        o->slice_start = now;
+    }
 
     UINT64 total = now - g_acct_last;
 

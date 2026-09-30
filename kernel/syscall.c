@@ -23,8 +23,10 @@
  */
 #include "myos.h"
 
-volatile UINT64 g_sc_kstack = 0;      /* вершина стека ядра текущего потока */
-volatile UINT64 g_sc_user_rsp = 0;    /* временно: rsp программы при входе */
+/* Стек ядра текущего потока и временное место для rsp программы -
+   у каждого ядра процессора свои: поля sc_kstack (%gs:8) и
+   sc_user_rsp (%gs:16) структуры KX_CPU (myos.h). swapgs на входе
+   делает GS "ядерным", на выходе - возвращает программе. */
 
 /*
  * Рамка, которую строит kx_syscall_entry (от младших адресов):
@@ -45,9 +47,10 @@ __asm__(
     ".globl kx_syscall_entry\n"
     ".hidden kx_syscall_entry\n"
     "kx_syscall_entry:\n"
-    "  movq %rsp, g_sc_user_rsp(%rip)\n"
-    "  movq g_sc_kstack(%rip), %rsp\n"
-    "  pushq g_sc_user_rsp(%rip)\n"
+    "  swapgs\n"
+    "  movq %rsp, %gs:16\n"
+    "  movq %gs:8, %rsp\n"
+    "  pushq %gs:16\n"
     "  pushq %r11\n"
     "  pushq %rcx\n"
     "  pushq %rax\n"
@@ -91,6 +94,7 @@ __asm__(
     "  popq %rcx\n"
     "  popq %r11\n"
     "  popq %rsp\n"
+    "  swapgs\n"
     "  sysretq\n"
 );
 
@@ -590,7 +594,7 @@ static INT64 sys_net(KPROC *p, UINT64 nr, UINT64 a1, UINT64 a2, UINT64 a3, UINT6
  * Диспетчер
  * ================================================================ */
 
-INT64 kx_syscall_dispatch(UINT64 *f)
+static INT64 kx_syscall_dispatch_inner(UINT64 *f)
 {
     KPROC *p = g_kcur->proc;
     UINT64 nr = f[SF_RAX];
@@ -896,5 +900,16 @@ INT64 kx_syscall_dispatch(UINT64 *f)
     if (p->killed)
         proc_exit_current(-1);
 
+    return r;
+}
+
+/* Вход из ассемблера: весь системный вызов - под большим замком ядра
+   (SMP, sched.c); программа снаружи работает без него */
+__attribute__((used))
+INT64 kx_syscall_dispatch(UINT64 *f)
+{
+    kx_bkl_enter();
+    INT64 r = kx_syscall_dispatch_inner(f);
+    kx_bkl_exit();
     return r;
 }

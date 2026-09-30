@@ -731,6 +731,8 @@ typedef struct __attribute__((packed)) {
 #define KX_VEC_ACPI      0x29u    /* SCI - прерывание ACPI (обычно IRQ 9) */
 
 typedef void (*KX_IRQ_HANDLER)(void);
+#define KX_VEC_RESCHED   0xF0u    /* IPI: "на тебя есть работа" (SMP) */
+#define KX_VEC_HALT      0xF1u    /* IPI: "остановись" (паника на другом ядре) */
 #define KX_VEC_SPURIOUS  0xFFu
 
 extern void kx_isr_stubs(void) __attribute__((visibility("hidden")));
@@ -807,7 +809,7 @@ typedef struct {
 
 /* Сколько потоков может существовать одновременно. Таблица
    маленькая и обходится целиком - так проще и нагляднее списков. */
-#define KT_MAX          32
+#define KT_MAX          64
 #define KT_NAME_LEN     16
 /* Квант времени: столько миллисекунд (тиков таймера) поток
    работает подряд, если другие тоже хотят процессор */
@@ -872,6 +874,13 @@ typedef struct KTHREAD {
     /* этап 6: поток программы (ring 3) */
     UINT64      cr3;             /* свои таблицы страниц (0 - ядра) */
     struct KPROC *proc;          /* чей это поток (NULL - ядра) */
+
+    /* этап 10: несколько ядер */
+    UINT32      bkl_depth;       /* сколько раз вошёл в "большой замок
+                                    ядра" (0 - выполняет программу) */
+    BOOLEAN     is_idle;         /* поток простоя какого-то ядра: его
+                                    не берёт никто, кроме своего ядра */
+    UINT32      cpu;             /* на каком ядре работал последним */
 } KTHREAD;
 
 /* Замок-"мьютекс": пока его держит один поток, другой, пришедший
@@ -1221,13 +1230,33 @@ typedef struct {
     UINT16  hpet_min_tick;
 } ACPI_INFO;
 
-/* Ядра процессора (kernel/smp.c, этап 10) */
+/* Ядра процессора (kernel/smp.c, этап 10).
+   У каждого ядра - своя структура KX_CPU; её адрес лежит в регистре
+   базы GS этого ядра (MSR 0xC0000101), поэтому "мои данные" - это
+   %gs:смещение, одна инструкция. Первые поля читает ассемблер
+   (вход syscall) - их смещения не менять. */
 #define KX_MAX_CPUS 32
 
-typedef struct {
+typedef struct KX_CPU {
+    struct KX_CPU *self;         /* 0:  %gs:0 - адрес этой структуры */
+    UINT64   sc_kstack;          /* 8:  стек ядра текущего потока (syscall) */
+    UINT64   sc_user_rsp;        /* 16: rsp программы при входе в syscall */
+    struct KTHREAD *kcur;        /* 24: поток, который выполняет это ядро */
+    struct KTHREAD *kidle;       /* поток простоя этого ядра */
+    UINT32   index;              /* номер ядра: 0 - загрузочное */
+    volatile UINT32 isr_depth;   /* >0 - внутри обработчика прерывания */
+    volatile BOOLEAN need_resched;   /* сменить поток на выходе из прерывания */
+    UINT32   quantum_left;       /* мс кванта текущего потока */
+    UINT64   slice_start;        /* rdtsc начала работы kcur */
+    volatile UINT64 idle_tsc;    /* сколько тактов ядро проспало в hlt */
+    UINT64   tlb_gen;            /* какую версию отображений ядра видит TLB */
+    UINT64   ticks;              /* тиков таймера этого ядра */
+    KX_TSS  *tss_ptr;            /* TSS этого ядра (у cpu0 - g_ktss) */
+
     BOOLEAN  used;               /* есть в MADT (и включено прошивкой) */
     BOOLEAN  bsp;                /* загрузочное ядро (cpu0) */
     volatile BOOLEAN online;     /* проснулось и настроилось */
+    volatile BOOLEAN in_sched;   /* работает в общем планировщике */
     UINT32   apic_id;            /* номер Local APIC (из MADT) */
     UINT32   apic_id_seen;       /* ...и какой оно назвало само */
     const char *why;             /* почему не запустилось */
@@ -1237,6 +1266,49 @@ typedef struct {
     UINT64   gdt[8] __attribute__((aligned(16)));
     KX_TSS   tss __attribute__((aligned(16)));
 } KX_CPU;
+
+/* "моё" ядро и его поля - одной инструкцией (между чтением адреса
+   структуры и чтением поля поток мог бы переехать на другое ядро) */
+static inline KX_CPU *kx_cpu(void)
+{
+    KX_CPU *c;
+    __asm__ __volatile__("movq %%gs:0, %0" : "=r"(c));
+    return c;
+}
+
+static inline struct KTHREAD *kx_cur(void)
+{
+    struct KTHREAD *t;
+    __asm__ __volatile__("movq %%gs:%c1, %0" : "=r"(t) : "i"(__builtin_offsetof(KX_CPU, kcur)));
+    return t;
+}
+
+static inline struct KTHREAD *kx_idle_thread(void)
+{
+    struct KTHREAD *t;
+    __asm__ __volatile__("movq %%gs:%c1, %0" : "=r"(t) : "i"(__builtin_offsetof(KX_CPU, kidle)));
+    return t;
+}
+
+static inline UINT32 kx_isr_depth(void)
+{
+    UINT32 d;
+    __asm__ __volatile__("movl %%gs:%c1, %0" : "=r"(d) : "i"(__builtin_offsetof(KX_CPU, isr_depth)));
+    return d;
+}
+
+static inline UINT32 kx_cpu_index(void)
+{
+    UINT32 i;
+    __asm__ __volatile__("movl %%gs:%c1, %0" : "=r"(i) : "i"(__builtin_offsetof(KX_CPU, index)));
+    return i;
+}
+
+/* старые имена (до SMP это были глобальные переменные) - только
+   для чтения */
+#define g_kcur          kx_cur()
+#define g_kidle         kx_idle_thread()
+#define g_kx_isr_depth  kx_isr_depth()
 
 /* ACPI-устройства через uACPI (kernel/acpi_dev.c, этап 9) */
 #define ACPI_MAX_BATTERIES 2
@@ -2484,7 +2556,19 @@ extern KX_CPU g_cpus[KX_MAX_CPUS];
 extern UINT32 g_ncpus, g_ncpus_found;
 void smp_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void smp_describe(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kernel_cmd_smptest(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 void kx_lapic_send_ipi(UINT32 apic_id, UINT32 low);
+void smp_early_init(void);
+void smp_halt_others(void);
+void kx_bkl_enter(void);
+void kx_bkl_exit(void);
+UINT32 kx_bkl_release_all(void);
+void kx_bkl_reacquire(UINT32 depth);
+void kx_bkl_relax(void);
+extern volatile UINT64 g_tlb_gen;
+extern volatile BOOLEAN g_smp_go;
+void sched_ap_enter(void) __attribute__((noreturn));
+void sched_kick_idle(void);
 
 /* --- kernel/acpi_os.c, kernel/acpi_dev.c (uACPI, этап 9) --- */
 extern UINT64 g_acpi_sci_count, g_acpi_work_done, g_acpi_work_lost;
@@ -2524,7 +2608,6 @@ void acpi_power_init(void);
 
 /* --- kernel/irq.c --- */
 extern UINT64 g_irq_count[256];
-extern volatile UINT64 g_idle_tsc;
 extern volatile UINT32 g_cpu_load_permille;
 extern volatile UINT32 g_cpu_load_valid;
 void kx_irq_register(UINT8 vector, KX_IRQ_HANDLER fn);
@@ -2540,11 +2623,7 @@ void kernel_cmd_cpu(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 
 /* --- kernel/sched.c --- */
 extern KTHREAD g_kthreads[KT_MAX];
-extern KTHREAD *g_kcur;
-extern KTHREAD *g_kidle;
 extern volatile BOOLEAN g_sched_on;
-extern volatile BOOLEAN g_need_resched;
-extern volatile UINT32 g_kx_isr_depth;
 extern UINT64 g_sched_switches;
 extern UINT64 g_sched_preempts;
 void kx_lock(void);
@@ -2580,9 +2659,9 @@ void kernel_cmd_threadtest(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 /* --- kernel/proc.c, kernel/syscall.c --- */
 extern KPROC g_procs[PROC_MAX];
 extern KPROC *volatile g_fg_proc;
-extern volatile UINT64 g_sc_kstack;
 void proc_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void proc_switch_hook(KTHREAD *next);
+void kx_syscall_cpu_init(void);
 KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err);
 INT64 proc_wait(KPROC *p);
 void proc_reap(KPROC *p);

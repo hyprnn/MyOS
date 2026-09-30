@@ -59,6 +59,19 @@ void run_command(
 
         kernel_cmd_ps(out);
 
+    } else if (streq(line, "smptest") || starts_with(line, "smptest ")) {
+
+        /* этап 10: программы на всех ядрах процессора сразу */
+        char arg[16];
+        UINTN k = 0;
+
+        if (line[7] == ' ')
+            for (CHAR16 *c = line + 8; *c && k + 1 < sizeof(arg); c++)
+                arg[k++] = (*c < 128) ? (char)*c : '?';
+
+        arg[k] = '\0';
+        kernel_cmd_smptest(out, arg);
+
     } else if (streq(line, "threadtest")) {
 
         kernel_cmd_threadtest(out);
@@ -291,6 +304,7 @@ void run_command(
             "  cpu           - CPU load and interrupt counters\n"
             "  ps            - threads: state, CPU share, stack, what they wait for\n"
             "  threadtest    - live test: preemption, fair sharing, mutex\n"
+            "  smptest [N]   - run programs on all CPU cores at once, measure the speedup\n"
             "  spin <sec>    - keep the CPU 100% busy (other threads still run)\n"
             "  disk [read N] - disks: list, show a sector; disk protect <disk> - make read-only\n"
         );

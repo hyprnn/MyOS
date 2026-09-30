@@ -888,6 +888,11 @@ def main():
             (None, 'CPU cores: 4 of 4 running', 90),
             ('', "Type 'help'", 30),
             ('cpu\n', 'cpu3: APIC id 3, online', 15),
+            # 4 программы сразу - хотя бы вдвое быстрее, чем по очереди
+            ('smptest 100\n', 're:4 programs at once: [0-9]+ ms -> ([2-9]|[1-9][0-9])\\.[0-9]+ times faster', 300),
+            ('threadtest\n', 'threadtest: OK', 60),
+            ('cpu\n', 'Big kernel lock', 15),
+            ('ps\n', 'idle3', 15),
         ], ['-smp', '4']))
         runs.append(('smp-q35', [
             (None, 'CPU cores: 4 of 4 running', 90),

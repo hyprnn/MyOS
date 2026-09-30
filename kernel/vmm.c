@@ -192,10 +192,18 @@ BOOLEAN vmm_map_page(UINT64 virt, UINT64 phys, UINT32 attr)
     if (e == NULL)
         return FALSE;
 
+    BOOLEAN was = (*e & PTE_P) != 0;
+
     *e = (phys & PTE_ADDR) | vmm_bits(attr, FALSE);
 
     if (g_vmm_ready)
         vmm_invlpg(virt);
+
+    /* страница уже была отображена (другой адрес или права) - другие
+       ядра процессора могли запомнить старое: пусть сбросят TLB, когда
+       возьмут большой замок (smp.c) */
+    if (was)
+        g_tlb_gen++;
 
     return TRUE;
 }
@@ -208,6 +216,7 @@ void vmm_unmap_page(UINT64 virt)
     if (e != NULL) {
         *e = 0;
         vmm_invlpg(virt);
+        g_tlb_gen++;
     }
 }
 

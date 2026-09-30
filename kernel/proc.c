@@ -297,8 +297,11 @@ static void uvm_free(UINT64 pml4)
  */
 void proc_switch_hook(KTHREAD *next)
 {
-    g_ktss.rsp0 = next->stack_top;
-    g_sc_kstack = next->stack_top;
+    /* прерывания запрещены (зовётся из sched_switch) - ядро не сменится */
+    KX_CPU *c = kx_cpu();
+
+    c->tss_ptr->rsp0 = next->stack_top;
+    c->sc_kstack = next->stack_top;
 
     UINT64 want = next->cr3 ? next->cr3 : g_vmm_pml4_phys;
 
@@ -502,6 +505,11 @@ static BOOLEAN proc_setup_stack(KPROC *p, const char *args)
  */
 static void __attribute__((noreturn)) kx_enter_user(UINT64 entry, UINT64 rsp)
 {
+    /* уходим в программу: большой замок ядра - отпустить (SMP,
+       sched.c), регистр GS - программе (swapgs перед iretq) */
+    kx_cli();
+    kx_bkl_exit();
+
     __asm__ __volatile__(
         "cli\n"
         "pushq $0x23\n"
@@ -524,6 +532,7 @@ static void __attribute__((noreturn)) kx_enter_user(UINT64 entry, UINT64 rsp)
         "xorl %%r13d, %%r13d\n"
         "xorl %%r14d, %%r14d\n"
         "xorl %%r15d, %%r15d\n"
+        "swapgs\n"
         "iretq\n"
         :
         : "r"(entry), "r"(rsp)
@@ -998,6 +1007,36 @@ BOOLEAN proc_shell_try(EFI_SYSTEM_TABLE *st, const CHAR16 *line)
 
 extern void kx_syscall_entry(void);
 
+/*
+ * Системные вызовы на ЭТОМ ядре процессора (у каждого ядра свои MSR):
+ *   EFER.SCE (бит 0)  - разрешить syscall/sysret;
+ *   STAR              - селекторы: [47:32] ядро (0x08, стек 0x10),
+ *                       [63:48] база программы 0x18 (sysret
+ *                       возьмёт код 0x18+16=0x28 и стек 0x18+8=0x20);
+ *   LSTAR             - куда прыгать (kx_syscall_entry, syscall.c);
+ *   FMASK             - какие флаги сбросить при входе: IF
+ *                       (прерывания - пока не перешли на стек
+ *                       ядра), DF, TF, AC.
+ * Зовут proc_init (загрузочное ядро) и smp.c (остальные).
+ */
+void kx_syscall_cpu_init(void)
+{
+    kx_wrmsr(0xC0000080u, kx_rdmsr(0xC0000080u) | 1u);
+    kx_wrmsr(0xC0000081u, (0x18ull << 48) | (0x08ull << 32));
+    kx_wrmsr(0xC0000082u, (UINT64)(UINTN)kx_syscall_entry);
+    kx_wrmsr(0xC0000084u, 0x200u | 0x400u | 0x100u | 0x40000u);
+
+    /* SMAP (CR4 бит 21) запрещает ядру трогать память программ без
+       особых инструкций stac/clac. Наши системные вызовы читают
+       буферы программы напрямую (после проверки uptr_ok), поэтому,
+       если прошивка оставила SMAP включённым, - выключаем. SMEP (бит
+       20, "ядру нельзя исполнять код программ") не мешает - пусть. */
+    UINT64 cr4;
+    __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
+    if (cr4 & (1ull << 21))
+        __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4 & ~(1ull << 21)) : "memory");
+}
+
 void proc_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
     /*
@@ -1011,24 +1050,13 @@ void proc_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
      *                       (прерывания - пока не перешли на стек
      *                       ядра), DF, TF, AC.
      */
-    kx_wrmsr(0xC0000080u, kx_rdmsr(0xC0000080u) | 1u);
-    kx_wrmsr(0xC0000081u, (0x18ull << 48) | (0x08ull << 32));
-    kx_wrmsr(0xC0000082u, (UINT64)(UINTN)kx_syscall_entry);
-    kx_wrmsr(0xC0000084u, 0x200u | 0x400u | 0x100u | 0x40000u);
+    kx_syscall_cpu_init();
 
-    g_sc_kstack = g_kcur->stack_top;
-    g_ktss.rsp0 = g_kcur->stack_top;
-
-    /* SMAP (CR4 бит 21) запрещает ядру трогать память программ без
-       особых инструкций stac/clac. Наши системные вызовы читают
-       буферы программы напрямую (после проверки uptr_ok), поэтому,
-       если прошивка оставила SMAP включённым, - выключаем. SMEP (бит
-       20, "ядру нельзя исполнять код программ") не мешает - пусть. */
     {
-        UINT64 cr4;
-        __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
-        if (cr4 & (1ull << 21))
-            __asm__ __volatile__("mov %0, %%cr4" : : "r"(cr4 & ~(1ull << 21)) : "memory");
+        UINT64 fl = kx_irq_save();
+        kx_cpu()->sc_kstack = g_kcur->stack_top;
+        kx_cpu()->tss_ptr->rsp0 = g_kcur->stack_top;
+        kx_irq_restore(fl);
     }
 
     binfs_mount();

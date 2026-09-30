@@ -66,6 +66,10 @@ static void kx_relax(void)
 {
     if (kx_lock_relaxable() && !g_kx_in_irq) {
         __asm__ __volatile__("sti; nop; nop; nop; nop; cli" ::: "memory");
+        /* SMP: прерывание, которого мы ждём, могло прийти на другое
+           ядро процессора - и его обработчик ждёт большой замок ядра,
+           который держим мы. Пропустить его вперёд. */
+        kx_bkl_relax();
     } else {
         cpu_pause();
     }
