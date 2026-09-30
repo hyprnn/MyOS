@@ -103,6 +103,7 @@ static const struct { const char *label; const char *icon; const char *cmd; } g_
     { "Часы",        "clock",    "clock"    },
     { "Рисование",   "paint",    "paint"    },
     { "Сапёр",       "mine",     "mine"     },
+    { "DOOM",        "doom",     "doom"     },
     { "Жизнь",       "app",      "life"     },
     { "О системе",   "logo",     "about"    },
     { "Выход",       "shutdown", "exit"     },

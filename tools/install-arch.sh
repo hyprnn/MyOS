@@ -126,6 +126,21 @@ sync
 say "загрузчик -> $DEST/BOOTX64.EFI"
 say "ядро      -> $DEST/KERNEL.ELF ($(( $(stat -c %s "$DEST/KERNEL.ELF") / 1024 )) КБ)"
 
+# DOOM (бесплатная shareware-версия, 4 МБ) - если есть рядом и хватает места
+WAD=""
+for f in DOOM1.WAD doom1.wad; do
+    [ -z "$WAD" ] && [ -f "$FROM/$f" ] && WAD="$FROM/$f"
+done
+if [ -n "$WAD" ]; then
+    FREE_KB=$(df -Pk "$ESP" | awk 'NR==2 {print $4}')
+    if [ -z "$FREE_KB" ] || [ "$FREE_KB" -gt 8192 ]; then
+        cp "$WAD" "$DEST/DOOM1.WAD" && sync
+        say "DOOM      -> $DEST/DOOM1.WAD"
+    else
+        say "DOOM1.WAD не скопирован: на $ESP меньше 8 МБ свободно"
+    fi
+fi
+
 # ---- пункт меню ----
 if [ -d "$ESP/loader/entries" ]; then
     cat > "$ENTRY" <<'EOF'

@@ -757,3 +757,37 @@ UEFI: всё — EfiLoaderData, а что ядру не трогать, пере
 * Проверка: прогон `sound` (q35 + ich9-intel-hda + hda-duplex,
   `-audiodev wav`), после него `check_sound` ищет в WAV куски звука и
   их частоты; клавиши громкости - прогоны `sound` (USB) и `ps2`.
+
+## DOOM (этап 10, Б) — как устроено
+
+* `third_party/doomgeneric` (GPL v2; без платформенных файлов и без
+  `w_file_stdc.c`), `third_party/doom-wad/DOOM1.WAD` (shareware 1.9).
+  Сборка: `DOOM_TP` (-w) + `DOOM_OWN` (user/doom, со всеми
+  предупреждениями), `-DFEATURE_SOUND -Iuser/doom/include` (пустая
+  заглушка SDL_mixer.h); объекты - build/user/doomobj.
+* `user/doom/doom_myos.c`: DG_Init/DrawFrame (окно 640x400, memcpy в
+  буфер окна), DG_GetKey из EV_RAWKEY (HID -> doomkeys: Ctrl огонь,
+  пробел USE, Shift бег, Alt вбок), время SYS_UPTIME/SYS_SLEEP,
+  поиск WAD (текущая папка, /<том>/, /<том>/EFI/MyOS/, /<том>/doom/),
+  chdir("/ram") для настроек и сохранений; `system()` - заглушка.
+* `user/doom/w_file_myos.c`: класс файла WAD `stdc_wad_file` - весь
+  файл в malloc, `mapped` (куски без копирования).
+* `user/doom/doom_sound.c`: DG_sound_module (16 каналов, 8 бит ->
+  48 кГц шагом 16.16, громкость по sep/vol как в Chocolate Doom),
+  Update держит в ядре ~100 мс звука (audio_info.queued);
+  DG_music_module: разбор MUS (события 0..6, задержки 1/140 с), 24
+  голоса, волна по инструменту, канал 15 - шум, огибающая.
+* Ядро: `kbd_raw`/`kbd_raw_dequeue` (keyboard.c: USB - разница отчётов
+  и биты модификаторов; ps2.c - каждый байт), wm.c -> EV_RAWKEY окну
+  программы в фокусе. `g_wm_mutex` - см. «гонка окон» ниже.
+* FAT: `VFS_NODE.hint_ci/hint_cl` - кластер прошлого чтения; сброс в
+  vfs_open, fat_write, fat_truncate.
+* Гонка окон (найдена автотестом): код ядра под BKL прерываем
+  (lock-break), и `win_sys_close` освобождал буфер окна посреди
+  compose -> #PF в gfx_blit. Теперь `g_wm_mutex` (рекурсивный): цикл
+  композитора держит его всю итерацию, wm_open/wm_close/wm_set_title
+  и win_sys_create/close берут его сами; win_sys_close ещё и убирает
+  страницы буфера из памяти программы (`proc_unmap_shared`).
+* Проверка: прогон `doom` - `doom -timedemo demo1` (демо-запись на
+  скорость, DOOM печатает "timed N gametics in M realtics").
+

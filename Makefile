@@ -213,7 +213,15 @@ NS_EMBED   := Messages=$(NS_RES)/Messages welcome.html=$(NS_RES)/welcome.html \
               $(foreach f,DejaVuSans DejaVuSans-Bold DejaVuSerif DejaVuSerif-Bold \
                 DejaVuSansMono DejaVuSansMono-Bold,fonts/$(f).ttf=$(NS_FONTS)/$(f).ttf)
 
-ALL_APPS   := $(sort $(APPS) $(PAPPS) curl browser)
+# DOOM (этап 10): doomgeneric (third_party, GPL v2) + своя платформа
+# user/doom/ (окно, клавиши, звук). Чужой код - без предупреждений (-w),
+# свой - со всеми.
+DOOM_DIR    := third_party/doomgeneric
+DOOM_TP     := $(patsubst $(DOOM_DIR)/%.c,build/user/doomobj/tp/%.o,$(filter-out $(DOOM_DIR)/w_file_stdc.c,$(wildcard $(DOOM_DIR)/*.c)))
+DOOM_OWN    := $(patsubst user/doom/%.c,build/user/doomobj/%.o,$(wildcard user/doom/*.c))
+DOOM_DEFS   := -DFEATURE_SOUND -DNORMALUNIX -DLINUX -D_DEFAULT_SOURCE -I$(DOOM_DIR) -Iuser/doom/include
+
+ALL_APPS   := $(sort $(APPS) $(PAPPS) curl browser doom)
 ALL_ELFS   := $(ALL_APPS:%=build/user/%)
 
 QEMU_DEV := -device qemu-xhci -device usb-mouse -device usb-kbd
@@ -233,6 +241,7 @@ all: BOOTX64.EFI kernel.elf
 	@cp BOOTX64.EFI esp/EFI/BOOT/BOOTX64.EFI
 	@cp kernel.elf esp/EFI/BOOT/KERNEL.ELF
 	@for a in $(ALL_APPS); do cp build/user/$$a esp/APPS/$$(echo $$a | tr a-z A-Z); done
+	@cp third_party/doom-wad/DOOM1.WAD esp/DOOM1.WAD
 
 build/user/lib/%.o: user/lib/%.c user/include/myos.h sysnum.h
 	@mkdir -p $(dir $@)
@@ -306,6 +315,20 @@ $(POSIX_LIB): $(POSIX_OBJS)
 $(PAPPS:%=build/user/%): build/user/%: build/user/posix/apps/%.o $(POSIX_CRT0) $(POSIX_LIB) $(PICO_LIB) user/posix/posix.ld
 	@echo "  LD  [posix] $@"
 	@$(LD) $(PLDFLAGS) -o $@ $(POSIX_CRT0) $< $(POSIX_LIB) $(PICO_LIB) $(LIBGCC) $(POSIX_LIB) $(PICO_LIB)
+
+build/user/doomobj/tp/%.o: $(DOOM_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(TP_SAY) "  CC  [doom] $<"
+	@$(CC) $(PCFLAGS) -w $(DOOM_DEFS) -c $< -o $@
+
+build/user/doomobj/%.o: user/doom/%.c user/posix/include/myos_sys.h sysnum.h
+	@mkdir -p $(dir $@)
+	@echo "  CC  [doom] $<"
+	@$(CC) $(PCFLAGS) $(DOOM_DEFS) -c $< -o $@
+
+build/user/doom: $(DOOM_TP) $(DOOM_OWN) $(POSIX_CRT0) $(POSIX_LIB) $(PICO_LIB) user/posix/posix.ld
+	@echo "  LD  [posix] $@"
+	@$(LD) $(PLDFLAGS) -s -o $@ $(POSIX_CRT0) $(DOOM_TP) $(DOOM_OWN) $(POSIX_LIB) $(PICO_LIB) $(LIBGCC) $(POSIX_LIB) $(PICO_LIB)
 
 build/user/posix/bearssl/%.o: $(BSSL_DIR)/src/%.c
 	@mkdir -p $(dir $@)

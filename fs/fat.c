@@ -1090,13 +1090,26 @@ static INTN fat_read(VFS_MOUNT *m, VFS_NODE *f, UINT64 off, VOID *buf, UINTN n)
         n = (UINTN)(f->size - off);
 
     UINT32 cb = v->cluster_bytes;
-    UINT32 cl = chain_nth(v, f->first_cluster, (UINT32)(off / cb));
+    UINT32 want = (UINT32)(off / cb);
+    UINT32 cl;
+
+    /* продолжение прошлого чтения - идти по цепочке от подсказки */
+    if (f->hint_cl != 0 && f->hint_ci <= want && cl_ok(v, f->hint_cl))
+        cl = chain_nth(v, f->hint_cl, want - f->hint_ci);
+    else
+        cl = chain_nth(v, f->first_cluster, want);
+
+    UINT32 ci = want;
     UINTN done = 0;
 
     while (done < n) {
 
         if (cl == 0)
             return (done > 0) ? (INTN)done : VFS_EIO;
+
+        /* запомнить: этот кластер - номер ci в цепочке */
+        f->hint_ci = ci;
+        f->hint_cl = cl;
 
         UINT32 in = (UINT32)(off % cb);
         UINT64 lba = cl_lba(v, cl) + in / 512u;
@@ -1142,6 +1155,7 @@ static INTN fat_read(VFS_MOUNT *m, VFS_NODE *f, UINT64 off, VOID *buf, UINTN n)
                 cl = 0;
             else
                 cl = next;
+            ci++;
         }
     }
 
@@ -1150,6 +1164,9 @@ static INTN fat_read(VFS_MOUNT *m, VFS_NODE *f, UINT64 off, VOID *buf, UINTN n)
 
 static INTN fat_write(VFS_MOUNT *m, VFS_NODE *f, UINT64 off, const VOID *buf, UINTN n)
 {
+    /* цепочка может поменяться - подсказку чтения забыть */
+    f->hint_cl = 0;
+
     FAT_VOL *v = VOL(m);
     const UINT8 *in_buf = (const UINT8 *)buf;
     UINT8 sec[512];
@@ -1278,6 +1295,9 @@ static INTN fat_write(VFS_MOUNT *m, VFS_NODE *f, UINT64 off, const VOID *buf, UI
 
 static INTN fat_truncate(VFS_MOUNT *m, VFS_NODE *f, UINT64 size)
 {
+    /* цепочка может поменяться - подсказку чтения забыть */
+    f->hint_cl = 0;
+
     FAT_VOL *v = VOL(m);
 
     if (f->is_dir)

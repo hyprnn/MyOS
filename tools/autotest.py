@@ -240,6 +240,18 @@ def check_sound(path, expect):
     return [], desc
 
 
+def sound_seconds(path):
+    """Сколько секунд в WAV не тишина (DOOM: музыка и эффекты)"""
+    import struct, wave
+    try:
+        w = wave.open(path)
+    except Exception:
+        return 0.0
+    data = w.readframes(w.getnframes())
+    s = struct.unpack('<%dh' % (len(data) // 2), data)[0::w.getnchannels()]
+    return sum(1 for v in s if abs(v) > 300) / float(w.getframerate())
+
+
 def make_test_disk(path, mib, bits, scheme, label, extra=None):
     """Диск с FAT и файлами "как с Linux": короткое и длинное имя,
     папка, большой файл (300 000 байт, много кластеров)"""
@@ -756,8 +768,8 @@ def main():
             # открыть меню "Пуск"
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            # пункт "Терминал" (1-й, y=549..569): курсор в (60,559)
-            ({'goto': (60, 559)}, '', 0.3),
+            # пункт "Терминал" (1-й, y=529..549): курсор в (60,539)
+            ({'goto': (60, 539)}, '', 0.3),
             ({'click': 1}, "re:wm: window .* opened", 8),
             # в окне терминала - тот же /bin/sh (этап 10): команды ядра,
             # программы, вывод в файл, Ctrl+C останавливает программу
@@ -775,23 +787,23 @@ def main():
             ({'key': 'ctrl-s'}, 'notepad: saved /ram/n.txt, 6 bytes', 10),
             ({'key': 'esc'}, "re:'notepad' exited with code 0", 10),
             ('cat /ram/n.txt\n', 'term: hello', 10),
-            # снова меню -> "Часы" (6-й пункт, y=549+5*20=649..669)
+            # снова меню -> "Часы" (6-й пункт, y=529+5*20=629..649)
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            ({'goto': (60, 655)}, '', 0.3),
+            ({'goto': (60, 635)}, '', 0.3),
             ({'click': 1}, 're:wm: launch clock', 8),
             ('', 're:winproc: pid [0-9]+ got window', 10),
-            # Сапёр (8-й пункт, y=689..709) - тоже программа: окно, Esc
+            # Сапёр (8-й пункт, y=669..689) - тоже программа: окно, Esc
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            ({'goto': (60, 699)}, '', 0.3),
+            ({'goto': (60, 679)}, '', 0.3),
             ({'click': 1}, 're:wm: launch mine', 8),
             ('', "re:started pid [0-9]+ 'mines' \\(/bin/mines\\)", 10),
             ('', 're:winproc: pid [0-9]+ got window', 10),
             ({'key': 'esc'}, "re:'mines' exited with code 0", 10),
             # мышь двигается - композитор жив
             ({'mouse': 15}, '', 1),
-            # выход из рабочего стола: меню "Пуск" -> "Выход" (11-й, y=549+10*20=749..769)
+            # выход из рабочего стола: меню "Пуск" -> "Выход" (12-й, y=529+11*20=749..769)
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
             ({'goto': (60, 755)}, '', 0.3),
@@ -872,7 +884,7 @@ def main():
             ('start\n', 're:wm: started', 20),
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            ({'goto': (60, 615)}, '', 0.3),
+            ({'goto': (60, 595)}, '', 0.3),
             ({'click': 1}, 're:wm: launch explorer', 8),
         ], disks, ddev))
         # чипсет q35: PCIe через ECAM (MCFG), перезагрузка через FADT
@@ -997,6 +1009,30 @@ def main():
             '-device', 'ich9-intel-hda', '-device', 'hda-duplex,audiodev=snd0',
             '-drive', 'if=none,id=sstick,format=raw,file=@WORK@/sndstick.img'],
             ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=sstick']))
+        # DOOM (этап 10): меню "Пуск" -> DOOM (9-й пункт, y=689..709);
+        # игра находит DOOM1.WAD на флешке, открывает окно, играет музыку;
+        # в игре Esc -> меню, стрелка вверх -> "Quit Game", Enter, Y -
+        # клавиши идут "сырыми" событиями (EV_RAWKEY) - игра выходит.
+        runs.append(('doom', [
+            (None, "Type 'help'", 90),
+            ('start\n', 're:wm: started', 20),
+            ({'goto': (20, 786)}, '', 0.3),
+            ({'click': 1}, '', 0.4),
+            ({'goto': (60, 699)}, '', 0.3),
+            ({'click': 1}, 're:wm: launch doom', 8),
+            ('', 're:(?i)game file /usb0p1/doom1\\.wad', 20),
+            ('', 'sound on (48000 Hz', 20),
+            ('', 'I_InitGraphics: DOOM screen size', 40),
+            ('', 're:winproc: pid [0-9]+ got window', 10),
+            ('', '', 6),
+            ({'key': 'esc'}, '', 2),
+            ({'key': 'up'}, '', 1.5),
+            ({'key': 'ret'}, '', 2),
+            ({'key': 'y'}, "re:'doom' exited with code 0", 30),
+        ], ['-machine', 'q35', '-audiodev', 'wav,id=snd0,path=@WORK@/doom.wav',
+            '-device', 'ich9-intel-hda', '-device', 'hda-duplex,audiodev=snd0',
+            '-drive', 'if=none,id=dstick,format=raw,file=@WORK@/doomstick.img'],
+            ['qemu-xhci', 'usb-kbd', 'usb-mouse', 'usb-storage,drive=dstick']))
         # все ядра процессора (этап 10): 4 ядра - все проснулись
         runs.append(('smp', [
             (None, 'CPU cores: 4 of 4 running', 90),
@@ -1094,7 +1130,7 @@ def main():
             ('start\n', 're:wm: started', 20),
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
-            ({'goto': (60, 559)}, '', 0.3),
+            ({'goto': (60, 539)}, '', 0.3),
             ({'click': 1}, "re:wm: window .* opened", 8),
             ('browser %s/page.html\n' % url, 're:winproc: pid [0-9]+ got window', 40),
             ({'screen': [(BROWSER_H1, 8, 300), (BROWSER_SUN, 4, 5000),
@@ -1255,6 +1291,9 @@ def main():
                    {'tone.wav': tone_wav(1000, 1.2),
                     'tone.mp3': open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   'test-tone.mp3'), 'rb').read()})
+    make_test_disk(os.path.join(work, 'doomstick.img'), 40, 16, 'mbr', 'DOOM',
+                   {'DOOM1.WAD': open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                   '..', 'third_party', 'doom-wad', 'DOOM1.WAD'), 'rb').read()})
     make_test_disk(os.path.join(work, 'netstick.img'), 64, 32, 'mbr', 'NETSTICK',
                    {'ca.pem': open(os.path.join(TLS_DIR, 'ca.pem'), 'rb').read()})
 
@@ -1278,6 +1317,13 @@ def main():
         print('%-4s %-14s -> %s' % ('PASS' if not problems else 'FAIL', '[sound.wav]',
                                     res[1] if not problems else '; '.join(problems)))
         if problems:
+            ok = False
+
+    # DOOM: звук был (музыка титульного экрана и эффекты)
+    if ok and any(r[0] == 'doom' for r in runs):
+        sec = sound_seconds(os.path.join(work, 'doom.wav'))
+        print('%-4s %-14s -> %.1f s of sound' % ('PASS' if sec >= 2 else 'FAIL', '[doom.wav]', sec))
+        if sec < 2:
             ok = False
 
     # диски после запусков storage: проверка "как в Linux"

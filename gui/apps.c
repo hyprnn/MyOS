@@ -332,6 +332,7 @@ static const struct { const char *label; const char *icon; const char *cmd; } g_
     { "Часы",          "clock",    "clock"    },
     { "Рисование",     "paint",    "paint"    },
     { "Сапёр",         "mine",     "mine"     },
+    { "DOOM",          "doom",     "doom"     },
 };
 #define DESK_N (sizeof(g_desk) / sizeof(g_desk[0]))
 #define DESK_CELL_W 90
@@ -427,7 +428,7 @@ void apps_desktop_launch(const char *what)
              kstreq(what, "primes") || kstreq(what, "hello") || kstreq(what, "crash"))
         app_open_program(what);
     else if (kstreq(what, "clock") || kstreq(what, "paint") || kstreq(what, "life") ||
-             kstreq(what, "browser") || kstreq(what, "mines"))
+             kstreq(what, "browser") || kstreq(what, "mines") || kstreq(what, "doom"))
         app_run_bare(what);          /* графическая программа - без терминала */
     else
         app_open_program(what);

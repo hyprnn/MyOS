@@ -791,6 +791,8 @@ INTN vfs_open(const char *path, UINT32 flags)
     f->gone = FALSE;
     f->mount = mi;
     f->node = node;
+    f->node.hint_ci = 0;
+    f->node.hint_cl = 0;
     f->flags = flags;
     f->pos = (flags & VFS_O_APPEND) ? node.size : 0;
 

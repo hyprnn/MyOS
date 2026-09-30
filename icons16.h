@@ -72,6 +72,26 @@ static const char *const ic_notepad[16] = {
     "................"
 };
 
+/* DOOM: морда рогатого демона (этап 10) */
+static const char *const ic_doom[16] = {
+    "..k..........k..",
+    ".kmk........kmk.",
+    ".kmmk......kmmk.",
+    "..kmmkkkkkkmmk..",
+    "...kmmmmmmmmk...",
+    "..kmmmmmmmmmmk..",
+    "..kmyykmmkyymk..",
+    "..kmyykmmkyymk..",
+    "..kmmmmkkmmmmk..",
+    "...kmmmkkmmmk...",
+    "...kmwkwwkwmk...",
+    "....kmwkkwmk....",
+    "....kmmmmmmk....",
+    ".....kkkkkk.....",
+    "................",
+    "................"
+};
+
 static const char *const ic_mine[16] = {
     "................",
     ".......k........",
@@ -348,6 +368,7 @@ static const struct {
     { "notepad", ic_notepad },
     { "mine", ic_mine },
     { "mines", ic_mine },        /* программа /bin/mines */
+    { "doom", ic_doom },         /* программа /bin/doom */
     { "about", ic_logo },        /* программа /bin/about */
     { "life", ic_app },
     { "app", ic_app },
