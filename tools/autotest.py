@@ -131,7 +131,8 @@ class VM:
             '=': 'equal', ',': 'comma', '*': 'shift-8', '_': 'shift-minus', ':': 'shift-semicolon',
             '"': 'shift-apostrophe', "'": 'apostrophe', '~': 'shift-grave_accent',
             '(': 'shift-9', ')': 'shift-0', '+': 'shift-equal', '!': 'shift-1',
-            '?': 'shift-slash', '%': 'shift-5'}
+            '?': 'shift-slash', '%': 'shift-5', '&': 'shift-7', '>': 'shift-dot',
+            '<': 'shift-comma', '|': 'shift-backslash', '#': 'shift-3', '$': 'shift-4'}
 
     def type(self, text):
         for ch in text:
@@ -889,6 +890,17 @@ def main():
             ('', "Type 'help'", 30),
             ('cpu\n', 'cpu3: APIC id 3, online', 15),
             # 4 программы сразу - хотя бы вдвое быстрее, чем по очереди
+            # шелл - программа (этап 10): фон, jobs, вывод в файл
+            ('primes 3000000 &\n', 're:\\[[0-9]+\\] primes 3000000', 15),
+            ('jobs\n', 're:running: primes|done: primes', 15),
+            ('ls /bin > /ram/bin.txt\n', '', 2),
+            ('cat /ram/bin.txt\n', 'burn', 15),
+            ('echo one >> /ram/bin.txt\n', '', 2),
+            ('cd /ram\n', '', 1),
+            ('pwd\n', 're:\n/ram\r?\n', 10),
+            ('history\n', 're:[0-9]+ +cd /ram', 10),
+            ('nosuchcmd\n', 'Unknown command: nosuchcmd', 10),
+            ('', 're:done: primes 3000000', 60),
             ('smptest 100\n', 're:4 programs at once: [0-9]+ ms -> ([2-9]|[1-9][0-9])\\.[0-9]+ times faster', 300),
             ('threadtest\n', 'threadtest: OK', 60),
             ('cpu\n', 'Big kernel lock', 15),

@@ -46,6 +46,13 @@ int  unlink(const char *path);
 int  rename(const char *from, const char *to);
 int  yield(void);
 int  getkey(void);
+/* этап 10: шелл-программа */
+int  chdir(const char *path);
+long getcwd_len(char *buf, size_t cap);                 /* -> длина пути */
+int  spawn(const struct myos_spawn *sp);                /* -> pid */
+int  waitpid_info(int pid, struct myos_waitinfo *wi, int flags);  /* 1 кончилась, 0 нет */
+int  readkey(long timeout_ms);                          /* -1 - ждать сколько угодно */
+int  kcmd(const char *line, const char *out_path, int flags);     /* 1 - команда ядра */
 
 /* --- строки (user/lib/string.c) --- */
 size_t strlen(const char *s);

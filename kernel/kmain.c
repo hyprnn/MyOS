@@ -499,16 +499,7 @@ void kmain_stage2(void)
     print(out, "Type 'help' for the list of commands, or 'fetch' for a system summary.\n");
     print(out, "New: disks and folders - ls /, cd /usb0p1, mkdir, cat, write, cp, df, disk.\n\n");
 
-    CHAR16 line[LINE_MAX];
-
-    for (;;) {
-
-        out = g_st->ConOut;
-
-        set_color(out, g_color);
-        kprintf(out, "%s> ", g_cwd);
-
-        read_line(g_st, line, LINE_MAX);
-        run_command(g_st, line);
-    }
+    /* --- шелл - программа /bin/sh (этап 10); ядро присматривает за
+       ним, а если его нет или он падает - аварийный шелл ядра --- */
+    kernel_shell_main();
 }

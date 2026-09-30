@@ -594,6 +594,323 @@ static INT64 sys_net(KPROC *p, UINT64 nr, UINT64 a1, UINT64 a2, UINT64 a3, UINT6
  * Диспетчер
  * ================================================================ */
 
+/* ================================================================
+ * Шелл-программа (этап 10): запуск и ожидание программ, клавиши по
+ * одной, встроенные команды ядра
+ * ================================================================ */
+
+/* Открыть файл для "> файл" / ">> файл" (путь - от папки программы) */
+static INTN open_out_file(KPROC *p, UINT64 upath, BOOLEAN append, INTN *kfd)
+{
+    char path[VFS_PATH_MAX];
+    INTN r = user_path(p, upath, path, sizeof(path));
+
+    if (r != VFS_OK)
+        return r;
+
+    INTN fd = vfs_open(path, VFS_O_WRITE | VFS_O_CREATE | (append ? VFS_O_APPEND : VFS_O_TRUNC));
+
+    if (fd < 0)
+        return fd;
+
+    *kfd = fd;
+    return VFS_OK;
+}
+
+static INT64 sys_spawn(KPROC *p, UINT64 usp)
+{
+    struct myos_spawn sp;
+
+    if (!uptr_ok(p, usp, sizeof(sp), FALSE))
+        return MYOS_EFAULT;
+
+    memcpy(&sp, (const void *)(UINTN)usp, sizeof(sp));
+
+    char name[VFS_PATH_MAX], path[VFS_PATH_MAX], args[512];
+    INTN r = copy_in_str(p, (UINT64)(UINTN)sp.path, name, sizeof(name));
+
+    if (r != VFS_OK)
+        return r;
+
+    args[0] = '\0';
+
+    if (sp.args != NULL) {
+        r = copy_in_str(p, (UINT64)(UINTN)sp.args, args, sizeof(args));
+        if (r != VFS_OK)
+            return r;
+    }
+
+    /* где программа: как в шелле ядра - /bin/имя, путь, ELF в папке
+       (относительно папки шелла-программы) */
+    ksnprintf(g_cwd, sizeof(g_cwd), "%s", p->cwd);
+
+    if (!proc_find_program(name, path, sizeof(path)))
+        return MYOS_ENOENT;
+
+    INTN out_kfd = -1;
+
+    if (sp.out_path != NULL) {
+        r = open_out_file(p, (UINT64)(UINTN)sp.out_path, (sp.flags & MYOS_SPAWN_APPEND) != 0, &out_kfd);
+        if (r != VFS_OK)
+            return r;
+    }
+
+    INTN err = VFS_OK;
+    KPROC *c = proc_spawn_ex(path, args, p->io, p->cwd, p, out_kfd, &err);
+
+    if (c == NULL)
+        return err;
+
+    /* на переднем плане: Ctrl+C - ей (а не шеллу) */
+    if (sp.flags & MYOS_SPAWN_FG) {
+        c->was_fg = TRUE;
+        g_fg_proc = c;
+    }
+
+    return c->pid;
+}
+
+static INT64 sys_wait(KPROC *p, INT64 pid, UINT64 uinfo, UINT32 flags)
+{
+    KPROC *c = NULL;
+
+    for (UINTN i = 0; i < PROC_MAX; i++)
+        if (g_procs[i].used && (INT64)g_procs[i].pid == pid && g_procs[i].parent == p)
+            c = &g_procs[i];
+
+    if (c == NULL)
+        return MYOS_ENOENT;
+
+    if (uinfo != 0 && !uptr_ok(p, uinfo, sizeof(struct myos_waitinfo), TRUE))
+        return MYOS_EFAULT;
+
+    UINT64 fl = kx_irq_save();
+
+    while (kthread_alive(c->thread, c->tid)) {
+
+        if ((flags & MYOS_WAIT_NOHANG) || p->killed) {
+            kx_irq_restore(fl);
+            return p->killed ? MYOS_EINTR : 0;
+        }
+
+        sched_block(c->thread, "wait", 200);
+    }
+
+    kx_irq_restore(fl);
+
+    if (uinfo != 0) {
+        struct myos_waitinfo *wi = (struct myos_waitinfo *)(UINTN)uinfo;
+        wi->pid = (int)c->pid;
+        wi->code = (int)c->exit_code;
+        ksnprintf(wi->name, sizeof(wi->name), "%s", c->name);
+        ksnprintf(wi->why, sizeof(wi->why), "%s", c->why);
+    }
+
+    /* передний план - снова шеллу */
+    if (c->was_fg && (g_fg_proc == c || g_fg_proc == NULL))
+        g_fg_proc = p;
+
+    proc_reap(c);
+    return 1;
+}
+
+/*
+ * Клавиша - одна, без эха (строку ввода шелл-программа рисует сама).
+ * PageUp/PageDown листают историю экрана здесь же (как в шелле ядра),
+ * а программе - MYOS_KEY_REDRAW: "экран сменился, нарисуй строку".
+ */
+static INT64 sys_readkey(KPROC *p, INT64 timeout_ms)
+{
+    if (p->io != PROC_IO_CONSOLE)
+        return MYOS_ENOSYS;          /* окно GUI - этап Д2 */
+
+    p->raw_keys = TRUE;
+
+    UINT64 t0 = g_kticks;
+
+    for (;;) {
+
+        if (p->killed)
+            return -1;
+
+        EFI_INPUT_KEY key;
+
+        if (g_st->ConIn->ReadKeyStroke(g_st->ConIn, &key) == EFI_SUCCESS) {
+
+            if (key.UnicodeChar == 0 && (key.ScanCode == 0x09 || key.ScanCode == 0x0A)) {
+
+                int step = SCROLLBACK_VISIBLE_ROWS - 1;
+
+                if (step < 1)
+                    step = 1;
+
+                int view = g_scrollback_view + ((key.ScanCode == 0x09) ? step : -step);
+
+                if (view < 0)
+                    view = 0;
+
+                scrollback_render(g_st, view);
+                return MYOS_KEY_REDRAW;
+            }
+
+            /* листали историю, а теперь печатают - сначала вниз */
+            if (g_scrollback_view != 0) {
+                scrollback_render(g_st, 0);
+            }
+
+            if (key.UnicodeChar != 0)
+                return key.UnicodeChar;
+
+            return MYOS_KEY_SPECIAL | key.ScanCode;
+        }
+
+        if (timeout_ms >= 0 && g_kticks - t0 >= (UINT64)timeout_ms)
+            return -1;
+
+        sched_sleep_ms(10);
+    }
+}
+
+/* Вывод команды ядра - в файл ("battery > b.txt"): свой "экран",
+   который пишет в файл вместо консоли */
+typedef struct {
+    SIMPLE_TEXT_OUTPUT_INTERFACE o;      /* первым: указатель на него = на всё */
+    INTN kfd;
+} KCMD_FILE_OUT;
+
+static EFI_STATUS EFIAPI kcmd_file_string(SIMPLE_TEXT_OUTPUT_INTERFACE *this, CHAR16 *s)
+{
+    KCMD_FILE_OUT *f = (KCMD_FILE_OUT *)this;
+    char buf[128];
+    UINTN n = 0;
+
+    for (; *s; s++) {
+
+        CHAR16 c = *s;
+
+        if (c == L'\r')
+            continue;
+
+        /* UTF-8 */
+        if (c < 0x80) {
+            buf[n++] = (char)c;
+        } else if (c < 0x800) {
+            buf[n++] = (char)(0xC0 | (c >> 6));
+            buf[n++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            buf[n++] = (char)(0xE0 | (c >> 12));
+            buf[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            buf[n++] = (char)(0x80 | (c & 0x3F));
+        }
+
+        if (n + 4 >= sizeof(buf)) {
+            vfs_write(f->kfd, buf, n);
+            n = 0;
+        }
+    }
+
+    if (n > 0)
+        vfs_write(f->kfd, buf, n);
+
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI kcmd_file_nop_attr(SIMPLE_TEXT_OUTPUT_INTERFACE *this, UINTN a)
+{
+    (void)this;
+    (void)a;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI kcmd_file_nop(SIMPLE_TEXT_OUTPUT_INTERFACE *this)
+{
+    (void)this;
+    return EFI_SUCCESS;
+}
+
+/* строка UTF-8 -> CHAR16 (кириллица в имени сети Wi-Fi и т.п.) */
+static void utf8_to_16(const char *s, CHAR16 *d, UINTN cap)
+{
+    UINTN n = 0;
+    const UINT8 *u = (const UINT8 *)s;
+
+    while (*u && n + 1 < cap) {
+        UINT32 c = *u++;
+        if (c >= 0xC0 && c < 0xE0 && (*u & 0xC0) == 0x80) {
+            c = ((c & 0x1F) << 6) | (*u++ & 0x3F);
+        } else if (c >= 0xE0 && c < 0xF0 && (u[0] & 0xC0) == 0x80 && (u[1] & 0xC0) == 0x80) {
+            c = ((c & 0x0F) << 12) | ((UINT32)(u[0] & 0x3F) << 6) | (u[1] & 0x3F);
+            u += 2;
+        } else if (c >= 0x80) {
+            c = '?';
+        }
+        d[n++] = (CHAR16)c;
+    }
+
+    d[n] = 0;
+}
+
+/*
+ * Встроенная команда ядра (net, wifi, battery, cpu, disk, start...).
+ * Выполняет её тот же разборщик, что и у шелла ядра (run_command), но
+ * вывод - туда, куда пишет программа (или в файл), а незнакомая
+ * команда ничего не печатает: ответ 0 - "это не команда ядра", и
+ * шелл-программа ищет программу с таким именем. 1 - выполнена.
+ */
+static INT64 sys_kcmd(KPROC *p, UINT64 uline, UINT64 upath, UINT32 flags)
+{
+    char line8[LINE_MAX];
+    INTN r = copy_in_str(p, uline, line8, sizeof(line8));
+
+    if (r != VFS_OK)
+        return r;
+
+    if (p->io != PROC_IO_CONSOLE)
+        return MYOS_ENOSYS;          /* окно GUI - этап Д2 */
+
+    KCMD_FILE_OUT fo;
+    EFI_SYSTEM_TABLE st = *g_st;
+    BOOLEAN to_file = (upath != 0);
+
+    if (to_file) {
+
+        INTN kfd = -1;
+        r = open_out_file(p, upath, (flags & MYOS_KCMD_APPEND) != 0, &kfd);
+
+        if (r != VFS_OK)
+            return r;
+
+        fo.o = *g_st->ConOut;
+        fo.o.OutputString = kcmd_file_string;
+        fo.o.SetAttribute = kcmd_file_nop_attr;
+        fo.o.ClearScreen = kcmd_file_nop;
+        fo.kfd = kfd;
+        st.ConOut = &fo.o;
+    }
+
+    CHAR16 line[LINE_MAX];
+    utf8_to_16(line8, line, LINE_MAX);
+
+    /* команды ядра знают одну "текущую папку" - шелла */
+    ksnprintf(g_cwd, sizeof(g_cwd), "%s", p->cwd);
+
+    p->kcmd_probe = TRUE;
+    p->kcmd_unknown = FALSE;
+
+    run_command(&st, line);
+
+    p->kcmd_probe = FALSE;
+
+    ksnprintf(p->cwd, sizeof(p->cwd), "%s", g_cwd);
+
+    kcon_flush();
+
+    if (to_file)
+        vfs_close(fo.kfd);
+
+    return p->kcmd_unknown ? 0 : 1;
+}
+
 static INT64 kx_syscall_dispatch_inner(UINT64 *f)
 {
     KPROC *p = g_kcur->proc;
@@ -617,7 +934,10 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
 
     case SYS_WRITE: {
         if (!uptr_ok(p, a2, a3, FALSE)) { r = MYOS_EFAULT; break; }
-        if (a1 == 1 || a1 == 2) {
+        if ((a1 == 1 || a1 == 2) && p->out_kfd >= 0) {
+            /* шелл запустил с "> файл" */
+            r = vfs_write(p->out_kfd, (const VOID *)(UINTN)a2, (UINTN)a3);
+        } else if (a1 == 1 || a1 == 2) {
             proc_out(p, (const char *)(UINTN)a2, (UINTN)a3);
             r = (INT64)a3;
         } else {
@@ -865,6 +1185,22 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
         r = (INT64)n;
         break;
     }
+
+    case SYS_SPAWN:
+        r = sys_spawn(p, a1);
+        break;
+
+    case SYS_WAIT:
+        r = sys_wait(p, (INT64)a1, a2, (UINT32)a3);
+        break;
+
+    case SYS_READKEY:
+        r = sys_readkey(p, (INT64)a1);
+        break;
+
+    case SYS_KCMD:
+        r = sys_kcmd(p, a1, a2, (UINT32)a3);
+        break;
 
     case SYS_CHDIR: {
         char path[VFS_PATH_MAX], norm[VFS_PATH_MAX];

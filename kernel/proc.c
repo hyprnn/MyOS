@@ -600,6 +600,11 @@ void proc_reap(KPROC *p)
             p->fds[i] = -1;
         }
 
+    if (p->out_kfd >= 0) {
+        vfs_close(p->out_kfd);
+        p->out_kfd = -1;
+    }
+
     /* сокеты, которые программа не успела отдать (на всякий случай) */
     sock_close_pid(p->pid);
 
@@ -617,35 +622,57 @@ void proc_reap(KPROC *p)
  */
 KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err)
 {
+    return proc_spawn_ex(path, args, io, NULL, NULL, -1, err);
+}
+
+/* Убрать завершившиеся программы, которых никто не ждёт (их родитель
+   - шелл - уже закрылся). Сама себя программа убрать не может: она
+   до последнего стоит на своих таблицах страниц. */
+static void proc_sweep_orphans(void)
+{
+    for (UINTN i = 0; i < PROC_MAX; i++) {
+        KPROC *q = &g_procs[i];
+        if (q->used && q->autoreap && q->exited && !kthread_alive(q->thread, q->tid))
+            proc_reap(q);
+    }
+}
+
+/*
+ * Запустить программу. cwd - её текущая папка (NULL - как у шелла
+ * ядра), parent - кто её ждёт (шелл-программа; NULL - ядро), out_kfd
+ * - куда её вывод (открытый файл VFS, "> файл"; -1 - экран). Файл
+ * out_kfd с этого момента принадлежит программе (закроется при её
+ * уборке), даже если запустить не вышло.
+ */
+KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *cwd,
+                     KPROC *parent, INTN out_kfd, INTN *err)
+{
     *err = VFS_OK;
+
+    proc_sweep_orphans();
 
     if (!g_sched_on) {
         *err = VFS_ENOSYS;
+        if (out_kfd >= 0) vfs_close(out_kfd);
         return NULL;
     }
 
     VFS_DIRENT st;
     INTN r = vfs_stat(path, &st);
 
+    if (r == VFS_OK && st.node.is_dir)
+        r = VFS_EISDIR;
+    if (r == VFS_OK && (st.node.size == 0 || st.node.size > MAX_ELF_SIZE))
+        r = VFS_EINVAL;
+
+    UINT8 *img = (r == VFS_OK) ? (UINT8 *)kmalloc((UINTN)st.node.size) : NULL;
+
+    if (r == VFS_OK && img == NULL)
+        r = VFS_ENOSPC;
+
     if (r != VFS_OK) {
         *err = r;
-        return NULL;
-    }
-
-    if (st.node.is_dir) {
-        *err = VFS_EISDIR;
-        return NULL;
-    }
-
-    if (st.node.size == 0 || st.node.size > MAX_ELF_SIZE) {
-        *err = VFS_EINVAL;
-        return NULL;
-    }
-
-    UINT8 *img = (UINT8 *)kmalloc((UINTN)st.node.size);
-
-    if (img == NULL) {
-        *err = VFS_ENOSPC;
+        if (out_kfd >= 0) vfs_close(out_kfd);
         return NULL;
     }
 
@@ -656,6 +683,7 @@ KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err)
     if (r != VFS_OK || got != st.node.size) {
         kfree(img);
         *err = (r != VFS_OK) ? r : VFS_EIO;
+        if (out_kfd >= 0) vfs_close(out_kfd);
         return NULL;
     }
 
@@ -680,15 +708,20 @@ KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err)
     if (p == NULL) {
         kfree(img);
         *err = VFS_EMFILE;
+        if (out_kfd >= 0) vfs_close(out_kfd);
         return NULL;
     }
 
     for (UINTN i = 0; i < PROC_FDS; i++)
         p->fds[i] = -1;
 
+    /* с этого места файл вывода - у программы: его закроет proc_reap */
+    p->out_kfd = out_kfd;
+    p->parent = parent;
+
     proc_name_from(path, p->name);
     ksnprintf(p->path, sizeof(p->path), "%s", path);
-    ksnprintf(p->cwd, sizeof(p->cwd), "%s", g_cwd);
+    ksnprintf(p->cwd, sizeof(p->cwd), "%s", cwd ? cwd : g_cwd);
     p->io = io;
     p->gui_line = (io == PROC_IO_GUI) ? g_proc_gui_sink : NULL;
     p->started_ms = g_kticks;
@@ -779,6 +812,14 @@ void proc_exit_current(INT64 code)
         if (g_fg_proc == p)
             g_fg_proc = NULL;
 
+        /* её программы (запущенные в фоне и не дождавшиеся) - сироты:
+           уберутся сами, когда закончатся */
+        for (UINTN i = 0; i < PROC_MAX; i++)
+            if (g_procs[i].used && g_procs[i].parent == p) {
+                g_procs[i].parent = NULL;
+                g_procs[i].autoreap = TRUE;
+            }
+
         win_proc_cleanup(p);
 
         klog("proc: pid %u '%s' exited with code %lld%s%s\n", p->pid, p->name, code,
@@ -826,6 +867,13 @@ void proc_kill(KPROC *p)
 void proc_ctrl_c(void)
 {
     KPROC *p = g_fg_proc;
+
+    /* на переднем плане - шелл-программа, читающая клавиши сама:
+       Ctrl+C ей - клавиша (сотрёт набранную строку), а не "стоп" */
+    if (p != NULL && p->raw_keys) {
+        kbd_enqueue(0, 3);
+        return;
+    }
 
     if (p != NULL) {
         ksnprintf(p->why, sizeof(p->why), "stopped with Ctrl+C");
@@ -1050,8 +1098,8 @@ void proc_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
      *                       (прерывания - пока не перешли на стек
      *                       ядра), DF, TF, AC.
      */
-    kx_syscall_cpu_init();
-
+    /* MSR системных вызовов у каждого ядра ставит smp.c (у загрузочного -
+       smp_early_init, у остальных - ap_main) */
     {
         UINT64 fl = kx_irq_save();
         kx_cpu()->sc_kstack = g_kcur->stack_top;

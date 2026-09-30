@@ -57,7 +57,17 @@
 #define SYS_GETCWD   36   /* getcwd(buf, размер)                   -> длина пути */
 #define SYS_CHDIR    37   /* chdir(path)                           - текущая папка программы */
 #define SYS_POLL     38   /* poll(struct myos_pollfd *, n, мс; -1 - сколько угодно) -> готовых */
-#define SYS_COUNT    39
+/* этап 10: шелл - программа (/bin/sh) */
+#define SYS_SPAWN    39   /* spawn(struct myos_spawn *)            -> pid */
+#define SYS_WAIT     40   /* wait(pid, struct myos_waitinfo *, флаги MYOS_WAIT_*)
+                             -> 1 завершилась (и убрана), 0 ещё работает */
+#define SYS_READKEY  41   /* readkey(мс; -1 - ждать сколько угодно) -> клавиша:
+                             символ Юникода или MYOS_KEY_SPECIAL | скан-код;
+                             MYOS_KEY_REDRAW - "перерисуй строку ввода";
+                             -1 - нет клавиши */
+#define SYS_KCMD     42   /* kcmd(строка команды, путь для вывода или 0, флаги)
+                             - встроенная команда ядра (net, wifi, battery...) */
+#define SYS_COUNT    43
 
 /* флаги open - те же, что VFS_O_* в ядре */
 #define MYOS_O_READ    0x01
@@ -186,6 +196,38 @@ struct myos_netctl {
     unsigned int cmd;
     unsigned int ip, mask, gw, dns;
 };
+
+/* --- шелл-программа (этап 10) --- */
+#define MYOS_SPAWN_FG      1   /* на переднем плане: Ctrl+C остановит её */
+#define MYOS_SPAWN_APPEND  2   /* вывод в файл - дописывать (>>), а не заново (>) */
+struct myos_spawn {
+    const char *path;          /* файл программы: "/bin/ls" */
+    const char *args;          /* аргументы одной строкой (или 0) */
+    const char *out_path;      /* вывод (fd 1 и 2) - в этот файл (или 0 - как у нас) */
+    unsigned int flags;        /* MYOS_SPAWN_* */
+    unsigned int pad;
+};
+
+#define MYOS_WAIT_NOHANG   1   /* не ждать: ещё работает - сразу 0 */
+struct myos_waitinfo {
+    int  pid;
+    int  code;                 /* код выхода; -1 - её остановило ядро */
+    char name[32];
+    char why[128];             /* почему остановлена (ошибка, Ctrl+C) */
+};
+
+#define MYOS_KEY_SPECIAL   0x10000   /* | скан-код: стрелки, Home, End, Del... */
+#define MYOS_KEY_REDRAW    0x20000   /* экран перерисован (PageUp) - строку заново */
+#define MYOS_SCAN_UP       0x01
+#define MYOS_SCAN_DOWN     0x02
+#define MYOS_SCAN_RIGHT    0x03
+#define MYOS_SCAN_LEFT     0x04
+#define MYOS_SCAN_HOME     0x05
+#define MYOS_SCAN_END      0x06
+#define MYOS_SCAN_DELETE   0x08
+#define MYOS_SCAN_ESC      0x17
+
+#define MYOS_KCMD_APPEND   1   /* вывод в файл - дописывать */
 
 /* --- окна (этап 7) --- */
 struct myos_rect {

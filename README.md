@@ -78,6 +78,28 @@ COM-порта лог молча выключен.
 В GUI — ярлыки на рабочем столе в стиле Windows 95: щелчок выделяет,
 второй щелчок открывает; ярлыки программ запускают их в терминале.
 
+## Шелл — тоже программа (этап 10)
+
+Командная строка — это программа `/bin/sh`, а не часть ядра; ядро
+только запускает её и присматривает (`kernel/ushell.c`). Что она умеет:
+
+* редактирование строки: ←/→, Home/End, Backspace, Delete, история —
+  ↑/↓ (`history` — список), `Ctrl+C` стирает строку, `Esc` тоже,
+  PageUp/PageDown листают экран;
+* `программа &` — запустить в фоне (например, несколько `primes` на
+  разных ядрах процессора), `jobs` — что работает в фоне; о
+  закончившихся шелл скажет сам;
+* `команда > файл` — вывод в файл, `>> файл` — дописать в конец (и для
+  программ, и для команд ядра: `battery > /usb0p1/bat.txt`);
+* `cd`, `pwd`, `help`.
+
+Команды, которые смотрят во внутренности ядра (`net`, `wifi`, `battery`,
+`cpu`, `ps`, `disk`, `acpi`, `start`, `shutdown`...), шелл выполняет
+системным вызовом `kcmd` — их код остаётся в ядре. `exit` — как и
+раньше, выключение. Если `/bin/sh` упадёт, ядро запустит его снова;
+упадёт трижды подряд — откроется **аварийный** шелл, встроенный в ядро
+(приглашение с `#`), чтобы машиной можно было управлять всегда.
+
 ## Файлы и диски
 
 В корне `/` — тома: `/ram` (RAM-диск, пропадает при перезагрузке),
@@ -237,11 +259,11 @@ MyOS можно поставить на диск ноутбука, не трог
 | `bootinfo.h` | "паспорт загрузки" - что загрузчик передаёт ядру, раскладка адресов |
 | `myos.h` | общий заголовок: константы, типы, глобальные переменные, функции |
 | `lib/` | строки, `kprintf`, COM1, `memcpy`/`memset` |
-| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `acpi_os.c` + `acpi_dev.c` AML через uACPI (батарея, EC, кнопка питания), `backlight.c` яркость экрана, `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`), `smp.c` остальные ядра процессора и большой замок ядра (`cpu`, `smptest`) |
+| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `acpi_os.c` + `acpi_dev.c` AML через uACPI (батарея, EC, кнопка питания), `backlight.c` яркость экрана, `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`), `smp.c` остальные ядра процессора и большой замок ядра (`cpu`, `smptest`), `ushell.c` запуск шелла `/bin/sh` и аварийный шелл |
 | `firmware/` | прошивки устройств, вклеенные в ядро: `rtw88/rtw8821c_fw.bin` (Realtek, только двоичная, условия — `LICENCE.rtlwifi_firmware.txt`) |
 | `drivers/` | PCI, USB (xHCI, клавиатуры/мыши, хабы, флешки — с горячим подключением), PS/2 (клавиатура, мышь/тачпад), разбор HID-дескрипторов; `blk.c` диски, разделы MBR/GPT, кэш секторов; `ahci.c` SATA; `nvme.c` NVMe; сеть: `e1000.c` (Intel), `rtl8169.c` (Realtek), `usbnet.c` (USB-модемы RNDIS/ECM/NCM); Wi-Fi: `rtw8821c.c` (Realtek RTL8821CE, по rtw88) и `rtw8821c_table.c` (таблицы Realtek) |
 | `net/` | стек TCP/IP: `net.c` интерфейсы и поток `net`, `arp.c`, `ip.c` (IPv4, ICMP), `udp.c`, `tcp.c`, `dhcp.c`, `dns.c`, `socket.c` сокеты, `netcmd.c` команда `net` и `ifconfig`; Wi-Fi: `wpa.c` (WPA2: SHA-1, PBKDF2, AES, CCMP, рукопожатие), `wifi.c` (адаптеры, `wifi`), `wlan.c` (802.11: поиск сетей, подключение, `wlan0`), `wlan_sim.c` (программная точка доступа для теста) |
-| `user/` | программы для ring 3: `apps/` (hello, calc, edit, guess, primes, crash, сетевые ping, ifconfig, nslookup, wget, nc, httpd, nettest + оконные clock, paint, life), `lib/` мини-libc (crt0, syscall, printf, malloc, окна `win.c`, сеть `net.c`), `user.ld` |
+| `user/` | программы для ring 3: `apps/` (`sh` — шелл, hello, calc, edit, guess, primes, burn, crash, сетевые ping, ifconfig, nslookup, wget, nc, httpd, nettest + оконные clock, paint, life), `lib/` мини-libc (crt0, syscall, printf, malloc, окна `win.c`, сеть `net.c`), `user.ld` |
 | `user/posix/` | полная libc для программ (этап 9): `os.c`, `socket.c`, `fs.c` — POSIX поверх системных вызовов MyOS, свои заголовки (`sys/socket.h`, `netdb.h`...), `crt0.S`, `posix.ld`; программы на ней — `apps/` (`libctest`) |
 | `third_party/` | чужой код с лицензиями (см. `third_party/README.md`): BearSSL, FatFs, picolibc, zlib, curl, NetSurf и его библиотеки, FreeType, libpng, libjpeg-turbo, utf8proc, шрифты DejaVu, uACPI |
 | `sysnum.h` | номера системных вызовов — общие для ядра и программ |

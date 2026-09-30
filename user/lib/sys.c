@@ -43,6 +43,20 @@ int  rename(const char *a, const char *b)     { return (int)syscall3(SYS_RENAME,
 int  yield(void)                              { return (int)syscall3(SYS_YIELD, 0, 0, 0); }
 int  getkey(void)                             { return (int)syscall3(SYS_GETKEY, 0, 0, 0); }
 
+/* этап 10: для шелла-программы */
+int  chdir(const char *path)                  { return (int)syscall3(SYS_CHDIR, (long)path, 0, 0); }
+long getcwd_len(char *buf, size_t cap)        { return syscall3(SYS_GETCWD, (long)buf, (long)cap, 0); }
+int  spawn(const struct myos_spawn *sp)       { return (int)syscall3(SYS_SPAWN, (long)sp, 0, 0); }
+int  waitpid_info(int pid, struct myos_waitinfo *wi, int flags)
+{
+    return (int)syscall3(SYS_WAIT, pid, (long)wi, flags);
+}
+int  readkey(long timeout_ms)                 { return (int)syscall3(SYS_READKEY, timeout_ms, 0, 0); }
+int  kcmd(const char *line, const char *out_path, int flags)
+{
+    return (int)syscall3(SYS_KCMD, (long)line, (long)out_path, flags);
+}
+
 void *sbrk(long inc)
 {
     long r = syscall3(SYS_SBRK, inc, 0, 0);

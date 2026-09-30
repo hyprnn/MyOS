@@ -1081,7 +1081,7 @@ typedef struct VFS_MOUNT {
 
 #include "sysnum.h"
 
-#define PROC_MAX        12
+#define PROC_MAX        24
 #define PROC_FDS        32
 #define PROC_IN_MAX     256
 #define MAX_HEAP_BYTES  (512ull * 1024u * 1024u)  /* куча программы - не больше
@@ -1121,6 +1121,16 @@ typedef struct KPROC {
     char             inbuf[PROC_IN_MAX];
     volatile UINTN   inlen;
     volatile BOOLEAN inready;
+
+    /* этап 10: программы запускает шелл-программа (/bin/sh) */
+    struct KPROC    *parent;              /* кто запустил (ждёт через SYS_WAIT) */
+    INTN             out_kfd;             /* вывод (fd 1, 2) - в этот файл VFS (-1 нет) */
+    BOOLEAN          raw_keys;            /* читает клавиши по одной (SYS_READKEY):
+                                             Ctrl+C ей - клавиша 3, а не "стоп" */
+    BOOLEAN          autoreap;            /* родителя нет: убрать после выхода */
+    BOOLEAN          was_fg;              /* её запустили на переднем плане */
+    BOOLEAN          kcmd_probe;          /* SYS_KCMD: неизвестная команда - */
+    BOOLEAN          kcmd_unknown;        /*   не печатать, а сказать шеллу */
 } KPROC;
 
 /* TSS (64-битный), см. kernel/cpu.c */
@@ -2663,6 +2673,9 @@ void proc_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 void proc_switch_hook(KTHREAD *next);
 void kx_syscall_cpu_init(void);
 KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err);
+KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *cwd,
+                     KPROC *parent, INTN out_kfd, INTN *err);
+void kernel_shell_main(void) __attribute__((noreturn));
 INT64 proc_wait(KPROC *p);
 void proc_reap(KPROC *p);
 void proc_fault(const char *what, UINT64 rip);

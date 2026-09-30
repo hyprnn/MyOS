@@ -204,6 +204,13 @@ void smp_early_init(void)
     kx_wrmsr(0xC0000101u, (UINT64)(UINTN)c);   /* GS base */
     kx_wrmsr(0xC0000102u, 0);                  /* KernelGSBase: GS программ */
 
+    /* Системные вызовы на этом ядре - сразу, здесь. Раньше их включал
+       proc_init, но он работает уже после запуска остальных ядер, когда
+       поток kmain мог переехать на другое ядро: настройка доставалась
+       ему, а у загрузочного ядра syscall оставался выключенным - и
+       первая программа, попавшая на него, падала на sysretq (#UD). */
+    kx_syscall_cpu_init();
+
     /* большой замок держит ядро 0 (поток "shell", bkl_depth = 1) */
     g_bkl_next = 1u;
     g_bkl_serving = 0u;
@@ -696,6 +703,13 @@ void smp_describe(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     if (g_ncpus > 1)
         kprintf(out, "Big kernel lock: waited for it %llu times, let others go first %llu times\n",
                 g_bkl_spins, g_bkl_breaks);
+
+    {
+        extern volatile UINT64 kx_gs_fix_kernel, kx_gs_fix_user;
+        if (kx_gs_fix_kernel || kx_gs_fix_user)
+            kprintf(out, "GS register was wrong on interrupt entry: kernel %llu, program %llu times\n",
+                    kx_gs_fix_kernel, kx_gs_fix_user);
+    }
 }
 
 /* ================================================================

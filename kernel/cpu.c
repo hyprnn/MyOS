@@ -425,13 +425,31 @@ __asm__(
     "  KX_ISR_NOERR 255\n"
     ".balign 16\n"
     "kx_isr_common:\n"
-    /* прерывали программу (CS в рамке с RPL 3) - регистр GS сейчас её:
-       swapgs делает его "ядерным" (структура этого ядра процессора,
-       smp.c). В рамке: +0 вектор, +8 код ошибки, +16 rip, +24 cs */
-    "  testb $3, 24(%rsp)\n"
-    "  jz 1f\n"
+    /* Регистр GS должен указывать на структуру этого ядра процессора
+       (smp.c). Прерывали программу - GS сейчас её, swapgs меняет его на
+       "ядерный". Решаем не по CS в рамке, а по самому регистру (MSR
+       GS base): адрес ядра - "отрицательный" (0xFFFF...). Так вход
+       правилен в любом состоянии; несовпадение с CS считаем (отладка) */
+    "  pushq %rax\n"
+    "  pushq %rcx\n"
+    "  pushq %rdx\n"
+    "  movl $0xC0000101, %ecx\n"
+    "  rdmsr\n"
+    "  testl %edx, %edx\n"
+    "  js 1f\n"
     "  swapgs\n"
+    "  testb $3, 48(%rsp)\n"          /* +24 cs, +24 наших трёх push */
+    "  jnz 2f\n"
+    "  incq kx_gs_fix_kernel(%rip)\n"  /* ядро с GS программы?! */
+    "  jmp 2f\n"
     "1:\n"
+    "  testb $3, 48(%rsp)\n"
+    "  jz 2f\n"
+    "  incq kx_gs_fix_user(%rip)\n"    /* программа с GS ядра?! */
+    "2:\n"
+    "  popq %rdx\n"
+    "  popq %rcx\n"
+    "  popq %rax\n"
     "  pushq %rax\n"
     "  pushq %rbx\n"
     "  pushq %rcx\n"
@@ -472,13 +490,19 @@ __asm__(
     "  popq %rbx\n"
     "  popq %rax\n"
     "  addq $16, %rsp\n"
-    /* возвращаемся в программу - вернуть ей её GS (+8 - cs) */
+    /* возвращаемся в программу (+8 - cs) - вернуть ей её GS; сейчас он
+       обязан быть "ядерным" (проверено на входе) */
     "  testb $3, 8(%rsp)\n"
-    "  jz 2f\n"
+    "  jz 3f\n"
     "  swapgs\n"
-    "2:\n"
+    "3:\n"
     "  iretq\n"
 );
+
+/* сколько раз вход в прерывание нашёл GS не в том состоянии (должно
+   быть 0; показывает команда cpu) */
+volatile UINT64 kx_gs_fix_kernel;
+volatile UINT64 kx_gs_fix_user;
 
 /* Счётчики для команды kinfo */
 volatile UINT64 g_kticks = 0;        /* миллисекунды от старта
