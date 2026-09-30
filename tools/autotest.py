@@ -515,6 +515,9 @@ def make_install_disk(a, work):
     open(esp + '/loader/entries/arch.conf', 'w').write('title Arch Linux\nlinux /vmlinuz-linux\n')
     open(src + '/BOOTX64.EFI', 'wb').write(open(a.efi, 'rb').read())
     open(src + '/KERNEL.ELF', 'wb').write(open(a.kernel, 'rb').read())
+    # DOOM (этап 10): установщик кладёт и его, если есть рядом
+    open(src + '/DOOM1.WAD', 'wb').write(
+        open(os.path.join(root, 'third_party', 'doom-wad', 'DOOM1.WAD'), 'rb').read())
     r = subprocess.run([os.path.join(root, 'tools/install-arch.sh'), '--esp', esp, '--from', src],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -526,6 +529,10 @@ def make_install_disk(a, work):
     subprocess.run(['mformat', '-i', img, '-F', '-T', str(64 * 2048), '-h', '64', '-s', '32', '::'],
                    check=True)
     subprocess.run(['mcopy', '-s', '-i', img, esp + '/EFI', esp + '/loader', '::/'], check=True)
+    # копия - второй диск через AHCI: IDE, с которого грузится прошивка,
+    # MyOS не видит (драйвера IDE нет), а файлы установки проверить надо
+    import shutil
+    shutil.copy(img, os.path.join(work, 'install-copy.img'))
     return img
 
 
@@ -1119,7 +1126,12 @@ def main():
             runs.append(('install', [
                 (None, "Type 'help'", 90),
                 ('boot\n', re.escape('Kernel file: \\EFI\\MYOS\\KERNEL.ELF').join(['re:', '']), 15),
-            ]))
+                # DOOM1.WAD установщик положил рядом - doom его находит
+                # (окна нет - рабочий стол не запущен, но WAD уже найден).
+                ('doom\n', 're:(?i)game file /[a-z0-9]+/EFI/MyOS/doom1\\.wad', 20),
+            ], ['-device', 'ahci,id=ahci0',
+                '-drive', 'if=none,id=icopy,format=raw,file=@WORK@/install-copy.img',
+                '-device', 'ide-hd,drive=icopy,bus=ahci0.0']))
         else:
             print('(no systemd-boot or mtools on this machine - install run skipped)')
         # браузер NetSurf (этап 9): рабочий стол -> терминал -> browser;
