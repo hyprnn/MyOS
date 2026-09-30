@@ -17,10 +17,13 @@
  *                                 большей доле);
  *       0xC8254 BLC_PWM_PCH_CTL2: [31:16] - период (максимум),
  *                                 [15:0]  - доля (яркость);
- *   * BXT (Celeron/Pentium на Apollo Lake и Gemini Lake):
+ *   * BXT (Celeron/Pentium на Apollo Lake и Gemini Lake) и все чипсеты
+ *     с Cannon Point (300-я серия: Coffee/Whiskey/Comet Lake) и новее:
  *       0xC8250 - включён/инверсия (те же биты), 0xC8254 - период
  *       целиком, 0xC8258 - доля целиком.
- * HP 250 G7 бывает и с Core i3/i5, и с Celeron N4000 - умеем оба.
+ * Какой вид - узнаём по чипсету (мост LPC 0:1F.0, как i915 в Linux), а
+ * если прочитанные числа не сходятся - пробуем другой вид.
+ * HP 250 G7 бывает и с Core i3/i5 разных лет, и с Celeron N4000.
  *
  * Запасной путь - ACPI: у устройства экрана в AML бывают методы _BCL
  * (список уровней), _BCM (поставить уровень) и _BQC (какой сейчас).
@@ -78,6 +81,37 @@ static BOOLEAN bl_is_bxt(UINT16 did)
 
     for (UINTN i = 0; i < sizeof(ids) / sizeof(ids[0]); i++)
         if (ids[i] == did)
+            return TRUE;
+
+    return FALSE;
+}
+
+/* Чипсет (PCH): код устройства моста LPC 0:1F.0 с маской 0xFF80 - так
+   его семейство определяет i915 (intel_pch.c). 0 - не Intel. */
+static UINT16 bl_pch_family(void)
+{
+    UINT32 id = pci_config_read32(0, 0x1F, 0, 0x00);
+
+    if ((id & 0xFFFFu) != 0x8086u)
+        return 0;
+
+    return (UINT16)((id >> 16) & 0xFF80u);
+}
+
+/* Старый вид регистров (период и доля в одном 0xC8254): Lynx Point,
+   Wildcat Point (Haswell, Broadwell), Sunrise Point и Union Point
+   (Skylake, Kaby Lake). Всё новее - вид BXT. */
+static BOOLEAN bl_pch_old_layout(UINT16 fam)
+{
+    static const UINT16 old[] = {
+        0x8C00, 0x9C00,          /* Lynx Point, -LP */
+        0x8C80, 0x9C80,          /* Wildcat Point, -LP */
+        0xA100, 0x9D00,          /* Sunrise Point, -LP */
+        0xA280                   /* Union (Kaby Lake) Point */
+    };
+
+    for (UINTN i = 0; i < sizeof(old) / sizeof(old[0]); i++)
+        if (old[i] == fam)
             return TRUE;
 
     return FALSE;
@@ -327,18 +361,46 @@ void backlight_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
         g_backlight.gpu_id = did;
 
+        g_backlight.bar = bar;
+        g_backlight.pch = bl_pch_family();
+
         if (bar != 0) {
             /* нужна одна страница регистров: 0xC8000..0xC8FFF */
             vmm_map_mmio(bar + 0xC8000u, 0x1000u, VMM_UC);
             g_bl_mmio = bar;
-            g_backlight.bxt = bl_is_bxt(did);
+
+            g_backlight.ctl1 = bl_rd(BLC_CTL1);
+            g_backlight.r54 = bl_rd(BLC_CTL2);
+            g_backlight.r58 = bl_rd(BXT_DUTY);
+
+            /* вид регистров: Apollo/Gemini Lake - BXT; иначе по чипсету
+               (старые - период|доля в одном регистре, с Cannon Point - BXT) */
+            g_backlight.bxt = bl_is_bxt(did) ||
+                              (g_backlight.pch != 0 && !bl_pch_old_layout(g_backlight.pch));
 
             UINT32 m = 0, d = 0;
+            BOOLEAN ok = bl_native_read(&m, &d);
 
-            if ((bl_rd(BLC_CTL1) & BLC_ENABLE) && bl_native_read(&m, &d)) {
+            /* числа не сходятся (доля больше периода, период 0) - значит,
+               вид угадан неверно: пробуем другой */
+            if (!ok) {
+                g_backlight.bxt = !g_backlight.bxt;
+                ok = bl_native_read(&m, &d);
+                if (!ok)
+                    g_backlight.bxt = !g_backlight.bxt;
+            }
+
+            if (!(g_backlight.ctl1 & BLC_ENABLE))
+                g_backlight.why = "PWM is switched off (CTL1 bit 31 = 0)";
+            else if (!ok)
+                g_backlight.why = "PWM period/duty registers read as zero or garbage";
+
+            if ((g_backlight.ctl1 & BLC_ENABLE) && ok) {
                 g_backlight.mode = BL_NATIVE;
                 g_backlight.pwm_max = m;
             }
+        } else {
+            g_backlight.why = "GPU has no memory BAR0";
         }
     }
 
@@ -355,17 +417,44 @@ void backlight_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
         uacpi_install_notify_handler(uacpi_namespace_root(), bl_notify, NULL);
 
     if (g_backlight.mode == BL_NATIVE)
-        kprintf(out, "  backlight: Intel GPU %04x (%s registers), PWM max %u, now %d%%\n",
-                g_backlight.gpu_id, g_backlight.bxt ? "BXT" : "PCH",
+        kprintf(out, "  backlight: Intel GPU %04x, chipset %04x (%s registers), PWM max %u, now %d%%\n",
+                g_backlight.gpu_id, g_backlight.pch, g_backlight.bxt ? "BXT" : "PCH",
                 g_backlight.pwm_max, backlight_get());
     else if (g_backlight.mode == BL_ACPI)
-        kprintf(out, "  backlight: ACPI _BCM, %u levels, now %d%%\n",
-                (UINT32)g_bl_nlevels, backlight_get());
+        kprintf(out, "  backlight: ACPI _BCM, %u levels, now %d%%%s%s\n",
+                (UINT32)g_bl_nlevels, backlight_get(),
+                g_backlight.why ? " - Intel PWM not used: " : "",
+                g_backlight.why ? g_backlight.why : "");
     else
         print(out, "  backlight: no control (not a laptop screen, or unknown GPU)\n");
 }
 
-/* Команда brightness [N | + | -] */
+/* brightness debug: что прочитали из видеокарты - для фото, если
+   яркость не меняется */
+static void backlight_debug(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+{
+    kprintf(out, "Intel GPU: %04x, BAR0 0x%llx, chipset family (LPC & 0xFF80): %04x\n",
+            g_backlight.gpu_id, g_backlight.bar, g_backlight.pch);
+
+    if (g_bl_mmio != 0) {
+        UINT32 c1 = bl_rd(BLC_CTL1), r54 = bl_rd(BLC_CTL2), r58 = bl_rd(BXT_DUTY);
+        kprintf(out, "at boot: C8250=%08x C8254=%08x C8258=%08x\n",
+                g_backlight.ctl1, g_backlight.r54, g_backlight.r58);
+        kprintf(out, "now:     C8250=%08x C8254=%08x C8258=%08x\n", c1, r54, r58);
+        kprintf(out, "PWM %s, polarity %s; as PCH: max %u duty %u; as BXT: max %u duty %u\n",
+                (c1 & BLC_ENABLE) ? "on" : "off", (c1 & BLC_POLARITY) ? "inverted" : "normal",
+                r54 >> 16, r54 & 0xFFFFu, r54, r58);
+    }
+
+    kprintf(out, "mode: %s (%s layout)%s%s; ACPI _BCM levels: %u; Fn key events: %u\n",
+            g_backlight.mode == BL_NATIVE ? "Intel PWM" :
+            g_backlight.mode == BL_ACPI ? "ACPI _BCM" : "none",
+            g_backlight.bxt ? "BXT" : "PCH",
+            g_backlight.why ? " - " : "", g_backlight.why ? g_backlight.why : "",
+            (UINT32)g_bl_nlevels, g_backlight.hotkeys);
+}
+
+/* Команда brightness [N | + | - | debug] */
 void kernel_cmd_brightness(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
 {
     if (g_backlight.mode == BL_NONE) {
@@ -379,6 +468,11 @@ void kernel_cmd_brightness(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
     while (*arg == ' ')
         arg++;
 
+    if (arg[0] == 'd' && arg[1] == 'e' && arg[2] == 'b' && arg[3] == 'u' && arg[4] == 'g') {
+        backlight_debug(out);
+        return;
+    }
+
     if (*arg == '+' || *arg == '-') {
         backlight_step(*arg == '+' ? +1 : -1);
     } else if (*arg >= '0' && *arg <= '9') {
@@ -387,7 +481,7 @@ void kernel_cmd_brightness(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
             v = v * 10 + (*arg++ - '0');
         backlight_set(v);
     } else if (*arg != '\0') {
-        print(out, "Usage: brightness [0..100 | + | -]\n");
+        print(out, "Usage: brightness [0..100 | + | - | debug]\n");
         return;
     }
 

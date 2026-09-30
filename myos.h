@@ -1286,6 +1286,10 @@ typedef struct {
     UINT32  pwm_max;         /* период ШИМ = 100% */
     UINT32  acpi_last;       /* последний уровень _BCM (если нет _BQC) */
     UINT32  hotkeys;         /* сколько раз нажали Fn+яркость */
+    UINT64  bar;             /* BAR0 видеокарты */
+    UINT16  pch;             /* семейство чипсета (LPC & 0xFF80) */
+    UINT32  ctl1, r54, r58;  /* регистры ШИМ при загрузке (для debug) */
+    const char *why;         /* почему не свой ШИМ */
 } BACKLIGHT_INFO;
 
 /* ACPI: то, что нужно для выключения (kernel/power.c) */

@@ -287,7 +287,7 @@ void run_command(
             out,
             "  acpi          - ACPI tables: CPU cores, I/O APIC, HPET, PCIe, power\n"
             "  battery       - battery charge, AC adapter, lid (ACPI via uACPI)\n"
-            "  brightness [N|+|-] - screen brightness, 5..100% (also Fn keys)\n"
+            "  brightness [N|+|-|debug] - screen brightness, 5..100% (also Fn keys)\n"
             "  cpu           - CPU load and interrupt counters\n"
             "  ps            - threads: state, CPU share, stack, what they wait for\n"
             "  threadtest    - live test: preemption, fair sharing, mutex\n"
