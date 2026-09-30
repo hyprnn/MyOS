@@ -53,6 +53,13 @@ int  spawn(const struct myos_spawn *sp);                /* -> pid */
 int  waitpid_info(int pid, struct myos_waitinfo *wi, int flags);  /* 1 кончилась, 0 нет */
 int  readkey(long timeout_ms);                          /* -1 - ждать сколько угодно */
 int  kcmd(const char *line, const char *out_path, int flags);     /* 1 - команда ядра */
+/* звук (этап 10): 48000 Гц, 16 бит, стерео */
+int  audio_open(void);                                  /* 0 / MYOS_EBUSY / MYOS_ENODEV */
+long audio_write(const void *buf, size_t n);            /* ждёт места -> записано байт */
+int  audio_close(void);
+int  audio_drain(void);                                 /* дождаться конца звука */
+int  audio_info(struct myos_audio_info *i);
+int  audio_volume(int v);                               /* -1 узнать, -2 вкл/выкл */
 
 /* user/lib/files.c - общее для команд файлов (ls, cp, mv, write...) */
 const char *path_base(const char *p);                   /* "a/b/c.txt" -> "c.txt" */

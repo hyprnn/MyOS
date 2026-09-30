@@ -67,7 +67,9 @@
                              -1 - нет клавиши */
 #define SYS_KCMD     42   /* kcmd(строка команды, путь для вывода или 0, флаги)
                              - встроенная команда ядра (net, wifi, battery...) */
-#define SYS_COUNT    43
+/* этап 10: звук (drivers/hda.c) */
+#define SYS_AUDIO    43   /* audio(MYOS_AUDIO_*, a1, a2) - см. ниже */
+#define SYS_COUNT    44
 
 /* флаги open - те же, что VFS_O_* в ядре */
 #define MYOS_O_READ    0x01
@@ -114,6 +116,8 @@
 #define MYOS_EAGAIN        -25   /* за отведённое время ничего не пришло */
 #define MYOS_EINTR         -26   /* прервано (Ctrl+C) */
 #define MYOS_EINPROGRESS   -27   /* неблокирующий connect: соединение устанавливается */
+#define MYOS_EBUSY         -28   /* занято другой программой (звук) */
+#define MYOS_ENODEV        -29   /* такого устройства нет (звуковой карты) */
 
 struct myos_time {
     unsigned short year;
@@ -246,6 +250,8 @@ struct myos_rect {
 #define EV_WHEEL  5   /* колесо: wheel > 0 - от себя */
 #define EV_CLOSE  6   /* нажали крестик окна */
 #define EV_FOCUS  7   /* key = 1 - окно стало активным, 0 - перестало */
+#define EV_RAWKEY 8   /* физическая клавиша (для игр): scan - HID Usage,
+                         key = 1 нажата, 0 отпущена (этап 10) */
 
 /* scan для особых клавиш (как в UEFI) */
 #define KEY_UP     0x01
@@ -285,5 +291,26 @@ struct myos_event {
 #define MYOS_USER_STACK_SIZE (1024ull * 1024ull)    /* 1 МиБ: разборщикам HTML/CSS
                                                       нужна глубокая рекурсия */
 #define MYOS_USER_LIMIT      0x00007FFF00000000ull   /* выше - только стек */
+
+/* --- звук (этап 10): audio(op, a1, a2) ---
+   Формат один: 48000 Гц, 16 бит со знаком, стерео (L, R, L, R...);
+   другие частоты программа пересчитывает сама (play так и делает).
+   Играть может одна программа за раз; вышла - звук свободен. */
+#define MYOS_AUDIO_OPEN    1   /* занять звук                   -> 0 / EBUSY / ENODEV */
+#define MYOS_AUDIO_WRITE   2   /* (буфер, байт) - ждёт места    -> записано байт */
+#define MYOS_AUDIO_CLOSE   3   /* отпустить (записанное доиграет) */
+#define MYOS_AUDIO_INFO    4   /* (struct myos_audio_info *) */
+#define MYOS_AUDIO_VOLUME  5   /* (0..100 поставить; -1 узнать; -2 вкл/выкл звук) -> громкость */
+#define MYOS_AUDIO_DRAIN   6   /* ждать, пока всё записанное доиграет */
+
+struct myos_audio_info {
+    unsigned int rate, channels, bits;
+    unsigned int volume;               /* 0..100 */
+    unsigned int muted;
+    unsigned int queued;               /* байт ещё не сыграно */
+    unsigned int buffer;               /* размер кольца, байт */
+    unsigned int headphones;           /* штекер наушников вставлен */
+    char         device[48];
+};
 
 #endif

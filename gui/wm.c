@@ -174,7 +174,29 @@ static void win_free_buf(WIN *w)
     w->buf_phys = 0;
 }
 
+/*
+ * Замок оконной системы (этап 10). Список окон меняют не только
+ * композитор, но и программы (системные вызовы окон) и потоки
+ * терминалов. Код ядра под "большим замком" всё равно может быть
+ * прерван (держатель уступает замок ждущим раз в миллисекунду), и без
+ * своего замка программа, закрыв окно, освобождала его буфер прямо
+ * посреди перерисовки экрана - падение на гонке. Композитор держит
+ * этот замок всю итерацию цикла; wm_open/wm_close/wm_set_title берут
+ * его сами (замок рекурсивный - композитору можно звать их изнутри).
+ */
+KMUTEX g_wm_mutex = KMUTEX_INIT("wm");
+
+static WIN *wm_open_locked(const WIN_CLASS *cls, INT32 cw, INT32 ch, const char *title, void *state);
+
 WIN *wm_open(const WIN_CLASS *cls, INT32 cw, INT32 ch, const char *title, void *state)
+{
+    kmutex_lock(&g_wm_mutex);
+    WIN *w = wm_open_locked(cls, cw, ch, title, state);
+    kmutex_unlock(&g_wm_mutex);
+    return w;
+}
+
+static WIN *wm_open_locked(const WIN_CLASS *cls, INT32 cw, INT32 ch, const char *title, void *state)
 {
     if (!g_wm_running)
         return NULL;
@@ -235,7 +257,16 @@ WIN *wm_open(const WIN_CLASS *cls, INT32 cw, INT32 ch, const char *title, void *
     return w;
 }
 
+static void wm_close_locked(WIN *w);
+
 void wm_close(WIN *w)
+{
+    kmutex_lock(&g_wm_mutex);
+    wm_close_locked(w);
+    kmutex_unlock(&g_wm_mutex);
+}
+
+static void wm_close_locked(WIN *w)
 {
     if (w == NULL || !w->used)
         return;
@@ -281,10 +312,14 @@ void wm_invalidate(WIN *w)
 
 void wm_set_title(WIN *w, const char *title)
 {
+    kmutex_lock(&g_wm_mutex);
+
     if (w != NULL && w->used) {
         ksnprintf(w->title, sizeof(w->title), "%s", title);
         g_dirty = TRUE;
     }
+
+    kmutex_unlock(&g_wm_mutex);
 }
 
 GFX wm_client_gfx(WIN *w)
@@ -381,9 +416,10 @@ static void draw_window_frame(WIN *w, BOOLEAN active)
     gfx_button(g, bx, by, 16, 16, FALSE);
     gfx_glyph(g, bx + 4, by, 0x00D7 /* × */, D_BLACK);
 
-    /* содержимое */
-    gfx_blit(g, w->x + WIN_BORDER, w->y + WIN_BORDER + WIN_TITLE_H,
-             w->buf, w->cw, w->ch, (UINT32)w->cw);
+    /* содержимое (буфера нет - окно как раз закрывается) */
+    if (w->buf != NULL)
+        gfx_blit(g, w->x + WIN_BORDER, w->y + WIN_BORDER + WIN_TITLE_H,
+                 w->buf, w->cw, w->ch, (UINT32)w->cw);
 }
 
 static void draw_taskbar(void)
@@ -431,12 +467,15 @@ static void draw_taskbar(void)
        числа раз в 15 секунд обновляет поток power (acpi_dev.c). */
     char bat[8];
     BOOLEAN charging = FALSE;
+    INT32 right = (INT32)SCR_W - 96 - nw - 12 - 4;    /* правый край следующего значка */
 
     if (acpi_battery_brief(bat, sizeof(bat), &charging)) {
 
         INT32 tw = gfx_text_width(bat);
         INT32 bw2 = 22 + 4 + tw + 12;
-        INT32 bx2 = (INT32)SCR_W - 96 - nw - 12 - 4 - bw2;
+        INT32 bx2 = right - bw2;
+
+        right = bx2 - 4;
         INT32 iy = y + 9;
         UINT32 pct = 0;
 
@@ -467,6 +506,41 @@ static void draw_taskbar(void)
         }
 
         gfx_text(g, ix + 22 + 4, y + 7, bat, D_BLACK);
+    }
+
+    /* звук (этап 10): динамик и громкость; без звука - красный крест */
+    if (g_hda.ok) {
+
+        char vol[8];
+        ksnprintf(vol, sizeof(vol), "%u%%", g_hda.volume);
+
+        INT32 tw = gfx_text_width(vol);
+        INT32 sw = 6 + 12 + 4 + tw + 6;
+        INT32 sx = right - sw;
+        INT32 iy = y + 8;
+
+        gfx_button(g, sx, y + 4, sw, TASK_H - 8, FALSE);
+
+        /* динамик: "коробочка" и раструб */
+        INT32 ix = sx + 6;
+        gfx_fill(g, ix, iy + 4, 3, 5, D_BLACK);
+        for (INT32 k = 0; k < 4; k++)
+            gfx_fill(g, ix + 3 + k, iy + 3 - k, 1, 7 + 2 * k, D_BLACK);
+
+        if (g_hda.muted || g_hda.volume == 0) {
+            for (INT32 k = 0; k < 5; k++) {
+                gfx_fill(g, ix + 8 + k, iy + 4 + k, 1, 1, 0xD02020u);
+                gfx_fill(g, ix + 12 - k, iy + 4 + k, 1, 1, 0xD02020u);
+            }
+        } else {
+            /* "волны" - по громкости */
+            if (g_hda.volume > 0)
+                gfx_fill(g, ix + 9, iy + 5, 1, 3, D_BLACK);
+            if (g_hda.volume > 50)
+                gfx_fill(g, ix + 11, iy + 3, 1, 7, D_BLACK);
+        }
+
+        gfx_text(g, ix + 12 + 4, y + 7, vol, g_hda.muted ? D_GRAY : D_BLACK);
     }
 
     /* часы справа + индикатор раскладки */
@@ -864,12 +938,22 @@ void wm_start(EFI_SYSTEM_TABLE *st)
 
     klog("wm: started, %ux%u\n", SCR_W, SCR_H);
 
+    /* старые "сырые" клавиши (набранные в консоли) - не окнам */
+    {
+        UINT8 u;
+        BOOLEAN d;
+        while (kbd_raw_dequeue(&u, &d))
+            ;
+    }
+
     /* первое окно - "О системе" (программа /bin/about, этап 10) */
     app_open_about();
 
     UINTN idle = 0;
 
     while (!g_stop) {
+
+        kmutex_lock(&g_wm_mutex);
 
         kernel_poll_input();
 
@@ -940,6 +1024,19 @@ void wm_start(EFI_SYSTEM_TABLE *st)
             g_dirty = TRUE;        /* обновить и индикатор раскладки */
         }
 
+        /* физические клавиши (нажата/отпущена) - окну программы в
+           фокусе: игре нужно знать, что клавишу ещё держат */
+        UINT8 ru;
+        BOOLEAN rdown;
+
+        while (kbd_raw_dequeue(&ru, &rdown)) {
+            if (g_focus && g_focus->proc && !g_focus->minimized) {
+                struct myos_event e = { EV_RAWKEY, rdown ? 1u : 0u, ru, 0, 0, 0, 0, 0 };
+                wm_push_event(g_focus, &e);
+            }
+            acted = TRUE;
+        }
+
         /* тик раз в ~100 мс (часы, анимации, окна программ) */
         static UINT64 last_tick = 0;
 
@@ -962,8 +1059,12 @@ void wm_start(EFI_SYSTEM_TABLE *st)
         } else {
             /* нечего делать - поспать, отдать процессор другим */
             idle++;
+            kmutex_unlock(&g_wm_mutex);
             sched_sleep_ms(idle > 20 ? 30 : 8);
+            continue;
         }
+
+        kmutex_unlock(&g_wm_mutex);
     }
 
     g_wm_running = FALSE;

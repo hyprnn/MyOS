@@ -48,6 +48,41 @@ void kbd_enqueue(UINT16 scan, CHAR16 uc)
     g_kbd_keys_total++;
 }
 
+/*
+ * "Сырые" клавиши для игр (этап 10, DOOM): какая физическая клавиша
+ * (HID Usage) нажата или ОТПУЩЕНА. Обычная очередь выше - это символы
+ * (с раскладкой и автоповтором), отпусканий в ней нет; а игре нужно
+ * знать, что стрелку всё ещё держат. Рабочий стол отдаёт эти события
+ * окну программы (EV_RAWKEY).
+ */
+#define KBD_RAW_N 64
+static volatile UINT16 g_kbd_raw[KBD_RAW_N];
+static volatile UINTN  g_kbd_raw_head, g_kbd_raw_tail;
+
+void kbd_raw(UINT8 usage, BOOLEAN down)
+{
+    UINTN next = (g_kbd_raw_tail + 1u) % KBD_RAW_N;
+
+    if (next == g_kbd_raw_head)
+        return;
+
+    g_kbd_raw[g_kbd_raw_tail] = (UINT16)(usage | (down ? 0x100u : 0u));
+    g_kbd_raw_tail = next;
+}
+
+BOOLEAN kbd_raw_dequeue(UINT8 *usage, BOOLEAN *down)
+{
+    if (g_kbd_raw_head == g_kbd_raw_tail)
+        return FALSE;
+
+    UINT16 v = g_kbd_raw[g_kbd_raw_head];
+    g_kbd_raw_head = (g_kbd_raw_head + 1u) % KBD_RAW_N;
+
+    *usage = (UINT8)(v & 0xFFu);
+    *down = (v & 0x100u) != 0;
+    return TRUE;
+}
+
 BOOLEAN kbd_dequeue(EFI_INPUT_KEY *key)
 {
     if (g_kbd_q_head == g_kbd_q_tail)
@@ -131,6 +166,19 @@ static CHAR16 cyr_letter(UINT8 u)
 void kbd_press_usage(UINT8 u)
 {
     BOOLEAN shift = kbd_shift_down();
+
+    /* клавиши громкости (этап 10): звук - дело ядра, программам они
+       не нужны. HID: 0x7F "без звука", 0x80 громче, 0x81 тише */
+    if (u == 0x7F) {
+        hda_mute_toggle();
+        return;
+    }
+
+    if (u == 0x80 || u == 0x81) {
+        INT32 v = (INT32)g_hda.volume + (u == 0x80 ? 10 : -10);
+        hda_volume(v < 0 ? 0 : v);
+        return;
+    }
 
     /* Ctrl+Space - переключить раскладку EN <-> RU */
     {
@@ -327,6 +375,28 @@ void kbd_usb_boot_report(
     if (cur[0] == 0x01)
         return;
 
+    /* модификаторы (Ctrl, Shift, Alt...): бит i = Usage 0xE0 + i -
+       для "сырых" событий нажатия и отпускания */
+    for (UINT8 b = 0; b < 8; b++)
+        if (((g_kbd_usb_mods ^ rep[0]) >> b) & 1u)
+            kbd_raw((UINT8)(0xE0u + b), (rep[0] >> b) & 1u);
+
+    /* отпущенные: были в прошлом отчёте, нет в новом */
+    for (UINTN j = 0; j < 6; j++) {
+
+        if (prev[j] < 0x04)
+            continue;
+
+        BOOLEAN still = FALSE;
+
+        for (UINTN i = 0; i < 6; i++)
+            if (cur[i] == prev[j])
+                still = TRUE;
+
+        if (!still)
+            kbd_raw(prev[j], FALSE);
+    }
+
     g_kbd_usb_mods = rep[0];
 
     for (UINTN i = 0; i < 6; i++) {
@@ -345,6 +415,7 @@ void kbd_usb_boot_report(
 
         if (!was_down) {
 
+            kbd_raw(u, TRUE);
             kbd_press_usage(u);
 
             if (kbd_usage_repeats(u)) {

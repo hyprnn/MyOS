@@ -1181,6 +1181,10 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
         r = sys_kcmd(p, a1, a2, (UINT32)a3);
         break;
 
+    case SYS_AUDIO:
+        r = sys_audio(p, a1, a2, a3);
+        break;
+
     case SYS_CHDIR: {
         char path[VFS_PATH_MAX], norm[VFS_PATH_MAX];
         VFS_DIRENT e;

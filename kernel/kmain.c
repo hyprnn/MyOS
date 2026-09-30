@@ -481,6 +481,10 @@ void kmain_stage2(void)
     acpi_dev_init(out);
     backlight_init(out);
 
+    /* --- звук: Intel HD Audio (этап 10) --- */
+    kmain_section(out, "[sound]");
+    hda_init(out);
+
     /* --- таблица функций ядра для шелла и GUI --- */
     kx_install_shims();
 

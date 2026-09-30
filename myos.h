@@ -1209,6 +1209,25 @@ typedef struct {
     char    last_msg[96];
 } ACPI_DEVS;
 
+/* Звук: Intel HD Audio (drivers/hda.c, этап 10) */
+typedef struct {
+    BOOLEAN ok;
+    UINT32  pci_id;             /* vendor | device << 16 */
+    UINT8   bus, dev, fn;
+    UINT8   codec_addr;
+    UINT32  codec_vendor;       /* vendor << 16 | device */
+    UINT32  nout;
+    UINT8   out_pin[4], out_dac[4], out_dev[4];
+    BOOLEAN immediate;          /* команды кодеку - без колец CORB/RIRB */
+    BOOLEAN headphones;         /* штекер наушников вставлен */
+    UINT32  volume;             /* 0..100 */
+    BOOLEAN muted;
+    UINT32  owner_pid;          /* какая программа играет (0 - никто) */
+    UINT32  underruns;          /* программа не успела подать звук */
+    UINT32  cmd_timeouts;
+    UINT64  bytes_played;
+} HDA_INFO;
+
 /* Яркость экрана (kernel/backlight.c, этап 9) */
 typedef enum {
     BL_NONE = 0,     /* управлять нечем */
@@ -2152,6 +2171,18 @@ void kernel_cmd_lid(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 
 /* --- kernel/backlight.c (яркость, этап 9) --- */
 extern BACKLIGHT_INFO g_backlight;
+extern HDA_INFO g_hda;
+void hda_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+INT32 hda_volume(INT32 v);
+void hda_mute_toggle(void);
+UINT32 hda_queued(void);
+UINT32 hda_write(const INT16 *s, UINT32 bytes);
+void hda_wait_room(UINT32 ms);
+void hda_test_tone(SIMPLE_TEXT_OUTPUT_INTERFACE *out, UINT32 ms);
+void kernel_cmd_sound(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
+void hda_proc_gone(UINT32 pid);
+struct KPROC;
+INT64 sys_audio(struct KPROC *p, UINT64 op, UINT64 a1, UINT64 a2);
 void backlight_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 INT32 backlight_get(void);
 INT32 backlight_set(INT32 pct);
@@ -2375,6 +2406,8 @@ void kbd_usb_boot_report(
     UINT8 prev[6]
 );
 void kbd_repeat_tick(void);
+void kbd_raw(UINT8 usage, BOOLEAN down);
+BOOLEAN kbd_raw_dequeue(UINT8 *usage, BOOLEAN *down);
 UINT8 kbd_led_bits(void);
 extern BOOLEAN g_kbd_num;
 extern BOOLEAN g_kbd_scroll;

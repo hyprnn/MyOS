@@ -725,3 +725,35 @@ UEFI: всё — EfiLoaderData, а что ядру не трогать, пере
 - Меняешь `MYOS_BOOT_INFO` — увеличь `MYOS_BOOT_VERSION`.
 - QEMU с `-bios OVMF.fd` без pflash пишет `NvVars` на загрузочный
   диск; `autotest.py` каждый раз делает свежий образ.
+
+## Звук (этап 10, А) — как устроено
+
+* `drivers/hda.c`: PCI 04:03, BAR0 (0x4000, UC); у Intel снимается
+  NSNPEN (бит 11 конфигурации 0x78), в память - `clflush`. Сброс
+  GCTL.CRST; STATESTS - кодеки. Кольца CORB/RIRB в одной странице
+  (RINTCNT 0xFF, после каждого ответа RIRBSTS=0x05 - иначе контроллер
+  перестаёт писать ответы, так и в QEMU); кольца молчат - немедленные
+  команды ICOI/ICII/ICIS (`g_immediate`). Кодек: первый с AFG и
+  выходными пинами (HDMI-кодек пропускается). Пины: конфигурация по
+  умолчанию (устройство 0 line out / 1 speaker / 2 HP, связь != 1),
+  путь до ЦАП поиском в глубину через смесители/переключатели;
+  питание D0, CONN_SEL, усилители 0 дБ без mute, EAPD, PIN_CTL
+  (HP 0xC0, иначе 0x40), ЦАП: формат 0x0011, поток 1.
+* Поток вывода - первый после входных (GCAP), BDL из 4 кусков по
+  16 КиБ, CBL 64 КиБ, RUN без прерываний. Поток ядра `hda` раз в 10 мс:
+  `hda_advance` (LPIB -> `g_played`, сыгранное обнуляется), раз в
+  0.5 с - гнездо наушников (F09 бит 31) -> динамик выкл/вкл.
+  `hda_write` пишет впереди контроллера (запас 4 КиБ; если отстали -
+  с позиции +2 КиБ), громкость программная (квадрат ручки).
+* `SYS_AUDIO` 43 (`sys_audio`): OPEN (один владелец, `owner_pid`;
+  `proc_reap` -> `hda_proc_gone`), WRITE (кусками по 4 КиБ, ждёт место),
+  CLOSE, DRAIN, INFO (`struct myos_audio_info`), VOLUME (-1 узнать,
+  -2 mute). Обёртки: `user/lib/sys.c` и `user/posix/audio.c`.
+* `user/posix/apps/play.c`: WAV (RIFF, PCM/EXTENSIBLE 8/16/24), MP3
+  (`third_party/minimp3`, CC0), пересчёт частоты линейной интерполяцией
+  (32.32), прогресс `\r`.
+* Клавиши: PS/2 E0 20/2E/30 -> HID 0x7F/0x81/0x80 -> `kbd_press_usage`
+  -> `hda_mute_toggle`/`hda_volume`. Значок на панели задач (wm.c).
+* Проверка: прогон `sound` (q35 + ich9-intel-hda + hda-duplex,
+  `-audiodev wav`), после него `check_sound` ищет в WAV куски звука и
+  их частоты; клавиши громкости - прогоны `sound` (USB) и `ps2`.

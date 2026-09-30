@@ -33,8 +33,22 @@ static WIN *win_of(KPROC *p, UINT64 id)
 /* Отобразить буфер окна (buf_phys, buf_pages) в память программы по
    адресу va с правами user+write */
 extern BOOLEAN proc_map_shared(KPROC *p, UINT64 va, UINT64 phys, UINTN pages);
+extern void proc_unmap_shared(KPROC *p, UINT64 va, UINTN pages);
+extern KMUTEX g_wm_mutex;
 
+static INT64 win_sys_create_locked(KPROC *p, UINT64 uw, UINT64 uh, UINT64 utitle);
+
+/* окно заводится в несколько шагов (открыть, заменить буфер, отдать
+   программе) - композитор не должен рисовать его посередине */
 INT64 win_sys_create(KPROC *p, UINT64 uw, UINT64 uh, UINT64 utitle)
+{
+    kmutex_lock(&g_wm_mutex);
+    INT64 r = win_sys_create_locked(p, uw, uh, utitle);
+    kmutex_unlock(&g_wm_mutex);
+    return r;
+}
+
+static INT64 win_sys_create_locked(KPROC *p, UINT64 uw, UINT64 uh, UINT64 utitle)
 {
     if (!g_wm_running)
         return MYOS_ENOGUI;
@@ -167,10 +181,15 @@ INT64 win_sys_close(KPROC *p, UINT64 id)
     if (w == NULL)
         return MYOS_EINVAL;
 
-    /* отвязать от программы, чтобы wm_close не трогал её память
-       повторно; страницы буфера освободит wm_close (buf_phys) */
+    kmutex_lock(&g_wm_mutex);
+
+    /* буфер окна - прочь из памяти программы, потом отвязать окно от
+       неё; страницы буфера освободит wm_close (buf_phys) */
+    proc_unmap_shared(p, MYOS_WIN_ADDR(w->id), w->buf_pages);
     w->proc = NULL;
     wm_close(w);
+
+    kmutex_unlock(&g_wm_mutex);
 
     return 0;
 }

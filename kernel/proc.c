@@ -166,6 +166,22 @@ BOOLEAN proc_map_shared(KPROC *p, UINT64 va, UINT64 phys, UINTN pages)
     return TRUE;
 }
 
+/* Убрать такие страницы из памяти программы (окно закрыто, а сама
+   программа работает дальше): иначе она писала бы в уже свободную
+   память. Программа однопоточная - сбросить TLB своего ядра хватает. */
+void proc_unmap_shared(KPROC *p, UINT64 va, UINTN pages)
+{
+    for (UINTN i = 0; i < pages; i++) {
+
+        UINT64 *e = uvm_pte(p->pml4, va + i * 4096u, FALSE);
+
+        if (e != NULL && (*e & UPTE_SHARED)) {
+            *e = 0;
+            __asm__ __volatile__("invlpg (%0)" : : "r"(va + i * 4096u) : "memory");
+        }
+    }
+}
+
 /* Физический адрес страницы программы (0 - не отображена) */
 static UINT64 uvm_phys(KPROC *p, UINT64 va)
 {
@@ -588,6 +604,9 @@ void proc_reap(KPROC *p)
 {
     if (p == NULL || !p->used)
         return;
+
+    /* играла звук - звук свободен (этап 10) */
+    hda_proc_gone(p->pid);
 
     for (UINTN i = 0; i < PROC_FDS; i++)
         if (p->fds[i] >= 0) {

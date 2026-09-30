@@ -127,6 +127,8 @@ const char *strerror(int e)
     case MYOS_EHOSTNOTFOUND: return "host not found";
     case MYOS_EAGAIN:        return "nothing arrived in time";
     case MYOS_EINTR:         return "interrupted";
+    case MYOS_EBUSY:         return "busy - another program is using it";
+    case MYOS_ENODEV:        return "no such device";
     default:             return "error";
     }
 }

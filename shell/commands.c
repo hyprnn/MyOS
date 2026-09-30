@@ -179,6 +179,41 @@ void run_command(
 
         kernel_cmd_battery(out);
 
+    /* этап 10: звук (Intel HD Audio) */
+    } else if (streq(line, "sound") || starts_with(line, "sound ")) {
+
+        char arg[16];
+        UINTN k = 0;
+
+        if (line[5] == ' ')
+            for (CHAR16 *c = line + 6; *c && k + 1 < sizeof(arg); c++)
+                arg[k++] = (*c < 128) ? (char)*c : '?';
+
+        arg[k] = '\0';
+        kernel_cmd_sound(out, arg);
+
+    } else if (streq(line, "volume") || starts_with(line, "volume ")) {
+
+        const CHAR16 *a = line + 6;
+        while (*a == L' ')
+            a++;
+
+        if (*a == L'+' || *a == L'-') {
+            hda_volume((INT32)g_hda.volume + (*a == L'+' ? 10 : -10) < 0 ? 0
+                       : (INT32)g_hda.volume + (*a == L'+' ? 10 : -10));
+        } else if (*a == L'm') {
+            hda_mute_toggle();
+        } else if (*a >= L'0' && *a <= L'9') {
+            INT32 v = 0;
+            while (*a >= L'0' && *a <= L'9')
+                v = v * 10 + (INT32)(*a++ - L'0');
+            hda_volume(v);
+        } else if (*a != 0) {
+            print(out, "Usage: volume [0..100 | + | - | mute]\n");
+        }
+
+        kprintf(out, "Volume: %u%%%s\n", g_hda.volume, g_hda.muted ? " (muted)" : "");
+
     /* этап 10: крышка ноутбука - закрыли, экран гаснет */
     } else if (streq(line, "lid") || starts_with(line, "lid ")) {
 
@@ -376,6 +411,8 @@ void run_command(
             "  battery       - battery charge, AC adapter, lid (ACPI via uACPI)\n"
             "  brightness [N|+|-|debug] - screen brightness, 5..100% (also Fn keys)\n"
             "  lid [test close|open|off] - laptop lid: closed = screen off\n"
+            "  sound [test]  - sound card; test = 440 Hz tone; play <file.wav|mp3>\n"
+            "  volume [N|+|-|mute] - sound volume (also the volume keys)\n"
             "  cpu           - CPU load and interrupt counters\n"
             "  ps            - threads: state, CPU share, stack, what they wait for\n"
             "  threadtest    - live test: preemption, fair sharing, mutex\n"

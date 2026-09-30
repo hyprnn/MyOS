@@ -52,6 +52,14 @@ int  waitpid_info(int pid, struct myos_waitinfo *wi, int flags)
     return (int)syscall3(SYS_WAIT, pid, (long)wi, flags);
 }
 int  readkey(long timeout_ms)                 { return (int)syscall3(SYS_READKEY, timeout_ms, 0, 0); }
+/* звук (этап 10) */
+int  audio_open(void)                           { return (int)syscall3(SYS_AUDIO, MYOS_AUDIO_OPEN, 0, 0); }
+long audio_write(const void *buf, size_t n)     { return syscall3(SYS_AUDIO, MYOS_AUDIO_WRITE, (long)buf, (long)n); }
+int  audio_close(void)                          { return (int)syscall3(SYS_AUDIO, MYOS_AUDIO_CLOSE, 0, 0); }
+int  audio_drain(void)                          { return (int)syscall3(SYS_AUDIO, MYOS_AUDIO_DRAIN, 0, 0); }
+int  audio_info(struct myos_audio_info *i)      { return (int)syscall3(SYS_AUDIO, MYOS_AUDIO_INFO, (long)i, 0); }
+int  audio_volume(int v)                        { return (int)syscall3(SYS_AUDIO, MYOS_AUDIO_VOLUME, v, 0); }
+
 int  kcmd(const char *line, const char *out_path, int flags)
 {
     return (int)syscall3(SYS_KCMD, (long)line, (long)out_path, flags);

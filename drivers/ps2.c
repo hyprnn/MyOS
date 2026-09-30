@@ -65,6 +65,9 @@ UINT8 ps2_e0_to_hid(UINT8 code)
 {
     switch (code) {
     case 0x1C: return 0x58;   /* KP Enter */
+    case 0x20: return 0x7F;   /* без звука (Mute) */
+    case 0x2E: return 0x81;   /* тише */
+    case 0x30: return 0x80;   /* громче */
     case 0x1D: return 0xE4;   /* RCtrl */
     case 0x35: return 0x54;   /* KP / */
     case 0x38: return 0xE6;   /* RAlt */
@@ -117,6 +120,10 @@ void ps2_handle_byte(UINT8 b)
 
     if (u == 0)
         return;
+
+    /* для игр - и нажатие, и отпускание (автоповтор PS/2 - повторные
+       "нажато", игре это не мешает) */
+    kbd_raw(u, !released);
 
     if (u >= 0xE0 && u <= 0xE7) {
 

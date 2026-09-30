@@ -145,7 +145,8 @@ PAPPS      := $(sort $(basename $(notdir $(wildcard user/posix/apps/*.c))))
 # crt0 - всегда; остальное - из архива: программа без сети не тащит socket.o
 POSIX_CRT0 := build/user/posix/crt0.o
 POSIX_LIB  := build/user/posix/libposix.a
-POSIX_OBJS := build/user/posix/os.o build/user/posix/socket.o build/user/posix/fs.o
+POSIX_OBJS := build/user/posix/os.o build/user/posix/socket.o build/user/posix/fs.o \
+              build/user/posix/audio.o
 # Сеть для программ на полной libc (этап 9):
 # * BearSSL ещё раз - с picolibc: время - time(), случайные числа -
 #   getentropy() (своя правка sysrng.c), AES-NI/SSE2 включены;

@@ -184,6 +184,62 @@ class VM:
 BIG_DATA = bytes((i * 7) & 255 for i in range(300000))
 
 
+def tone_wav(hz, sec, rate=44100):
+    """WAV: тон hz, sec секунд, 16 бит стерео (для прогона sound)"""
+    import io, math, struct, wave
+    n = int(rate * sec)
+    buf = io.BytesIO()
+    w = wave.open(buf, 'wb')
+    w.setnchannels(2)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    w.writeframes(b''.join(struct.pack('<hh', v, v) for v in
+                           (int(12000 * math.sin(2 * math.pi * hz * i / rate)) for i in range(n))))
+    w.close()
+    return buf.getvalue()
+
+
+def check_sound(path, expect):
+    """Звук, который MyOS "сыграла" (QEMU пишет выход звуковой карты в
+    WAV): куски звука, разделённые тишиной, и частота каждого (по
+    переходам через ноль). expect - [(Гц, секунд), ...] по порядку."""
+    import struct, wave
+    try:
+        w = wave.open(path)
+    except Exception as e:
+        return ['no sound file: %s' % e]
+    rate = w.getframerate()
+    data = w.readframes(w.getnframes())
+    s = struct.unpack('<%dh' % (len(data) // 2), data)[0::w.getnchannels()]
+    segs, start, quiet = [], None, 0
+    for i, v in enumerate(s):
+        if abs(v) > 300:
+            if start is None:
+                start = i
+            quiet = 0
+        elif start is not None:
+            quiet += 1
+            if quiet > rate // 10:
+                segs.append((start, i - quiet))
+                start = None
+    if start is not None:
+        segs.append((start, len(s)))
+    got = []
+    for a, b in segs:
+        seg = s[a:b]
+        if len(seg) < rate // 20:
+            continue
+        zc = sum(1 for i in range(1, len(seg)) if (seg[i - 1] < 0) != (seg[i] < 0))
+        got.append((zc / 2 / (len(seg) / rate), len(seg) / rate))
+    desc = ', '.join('%.0f Hz %.2f s' % g for g in got)
+    if len(got) != len(expect):
+        return ['expected %d sounds, got %d: %s' % (len(expect), len(got), desc)]
+    for (hz, sec), (ghz, gsec) in zip(expect, got):
+        if abs(ghz - hz) > hz * 0.03 or abs(gsec - sec) > 0.15 * sec + 0.05:
+            return ['expected %d Hz %.2f s, got %s' % (hz, sec, desc)]
+    return [], desc
+
+
 def make_test_disk(path, mib, bits, scheme, label, extra=None):
     """Диск с FAT и файлами "как с Linux": короткое и длинное имя,
     папка, большой файл (300 000 байт, много кластеров)"""
@@ -682,6 +738,10 @@ def main():
             ({'mouse': 20}, '', 1),
             ('cpu\n', 're:PS/2 keyboard \\(IRQ 1\\) +[1-9]', 15),
             ('', 're:PS/2 mouse / touchpad \\(IRQ 12\\) +[1-9]', 5),
+            # клавиши громкости ноутбука (PS/2: E0 30 / E0 2E / E0 20)
+            ({'key': 'volumeup'}, 'hda: volume 80%', 10),
+            ({'key': 'volumedown'}, 'hda: volume 70%', 10),
+            ({'key': 'audiomute'}, 'hda: muted', 10),
         ], [], ['qemu-xhci']))
         # Рабочий стол (этап 7): композитор, окна, окно программы.
         # Экран теста 1280x800; панель задача снизу, кнопка "Пуск" слева.
@@ -910,6 +970,33 @@ def main():
                       '-device', 'e1000,netdev=n0',
                       '-drive', 'if=none,id=nstick,format=raw,file=@WORK@/netstick.img'],
                      ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=nstick']))
+        # звук (этап 10): Intel HDA в QEMU, выход кодека QEMU пишет в WAV.
+        # sound test (440 Гц 1 с), play WAV (1000 Гц 1.2 с, 44100 Гц -
+        # пересчёт в 48000), play MP3 (880 Гц 1.5 с); после прогона в
+        # WAV должны быть ровно эти три звука (check_sound ниже)
+        runs.append(('sound', [
+            (None, "Type 'help'", 90),
+            ('', 're:sound: Intel HDA 8086:293e, codec 0: 1af4:0022, outputs: .*line out', 5),
+            ('sound\n', 're:48000 Hz, 16 bit, stereo; volume 70%', 10),
+            ('sound test\n', 'Done.', 20),
+            ('volume 100\n', 'Volume: 100%', 10),
+            # клавиши громкости (USB-клавиатура: HID 0x81/0x7F/0x80)
+            ({'key': 'volumedown'}, 'hda: volume 90%', 10),
+            ({'key': 'audiomute'}, 'hda: muted', 10),
+            ({'key': 'audiomute'}, 'hda: unmuted', 10),
+            ({'key': 'volumeup'}, 'hda: volume 100%', 10),
+            ('play /usb0p1/tone.wav\n', 'Playing /usb0p1/tone.wav: WAV, 44100 Hz, 16 bit, stereo', 20),
+            ('', 'Done: 0:01 played.', 20),
+            ('play /usb0p1/tone.mp3\n', 're:Playing /usb0p1/tone.mp3: MP3, 32000 Hz, 96 kbit/s, stereo', 20),
+            ('', 'Done: 0:01 played.', 20),
+            ('play /usb0p1/tone.mp3 &\n', 'Playing', 20),
+            ('play -t 500\n', 'sound is busy', 20),
+            ('', "re:'play' exited with code 0", 20),
+            ('sound\n', 're:underruns 0', 10),
+        ], ['-machine', 'q35', '-audiodev', 'wav,id=snd0,path=@WORK@/sound.wav',
+            '-device', 'ich9-intel-hda', '-device', 'hda-duplex,audiodev=snd0',
+            '-drive', 'if=none,id=sstick,format=raw,file=@WORK@/sndstick.img'],
+            ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=sstick']))
         # все ядра процессора (этап 10): 4 ядра - все проснулись
         runs.append(('smp', [
             (None, 'CPU cores: 4 of 4 running', 90),
@@ -1164,6 +1251,10 @@ def main():
     make_test_disk(os.path.join(work, 'stick2.img'), 40, 16, 'none', 'STICK2')
     make_test_disk(os.path.join(work, 'sata.img'), 40, 16, 'gpt', 'SATADISK')
     make_test_disk(os.path.join(work, 'nvme.img'), 80, 32, 'gpt', 'NVME')
+    make_test_disk(os.path.join(work, 'sndstick.img'), 40, 16, 'mbr', 'SOUND',
+                   {'tone.wav': tone_wav(1000, 1.2),
+                    'tone.mp3': open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                  'test-tone.mp3'), 'rb').read()})
     make_test_disk(os.path.join(work, 'netstick.img'), 64, 32, 'mbr', 'NETSTICK',
                    {'ca.pem': open(os.path.join(TLS_DIR, 'ca.pem'), 'rb').read()})
 
@@ -1179,6 +1270,15 @@ def main():
         if not r:
             ok = False
             break
+
+    # звук: что "услышала" QEMU после прогона sound
+    if ok and any(r[0] == 'sound' for r in runs):
+        res = check_sound(os.path.join(work, 'sound.wav'), [(440, 1.0), (1000, 1.2), (880, 1.5), (880, 1.5)])
+        problems = res[0] if isinstance(res, tuple) else res
+        print('%-4s %-14s -> %s' % ('PASS' if not problems else 'FAIL', '[sound.wav]',
+                                    res[1] if not problems else '; '.join(problems)))
+        if problems:
+            ok = False
 
     # диски после запусков storage: проверка "как в Linux"
     if ok and not a.quick and not a.only:

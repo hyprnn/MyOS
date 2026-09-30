@@ -32,6 +32,15 @@ struct myos_embed_file {
     unsigned long        size;
 };
 
+/* Звук (этап 10, user/posix/audio.c): 48000 Гц, 16 бит, стерео.
+   Ответы - как у ядра: 0 / отрицательная ошибка MYOS_E*. */
+int  audio_open(void);                               /* занять звук */
+long audio_write(const void *buf, unsigned long n);  /* ждёт места -> байт */
+int  audio_close(void);
+int  audio_drain(void);                              /* дождаться конца */
+int  audio_info(struct myos_audio_info *i);
+int  audio_volume(int v);                            /* -1 узнать, -2 вкл/выкл */
+
 /* Ошибку MYOS_E* - в errno (для своих обёрток): errno = ..., ответ -1 */
 int myos_set_errno(long myos_err);
 
