@@ -1228,6 +1228,8 @@ typedef struct {
     UINT16  pch;             /* семейство чипсета (LPC & 0xFF80) */
     UINT32  ctl1, r54, r58;  /* регистры ШИМ при загрузке (для debug) */
     const char *why;         /* почему не свой ШИМ */
+    BOOLEAN blanked;         /* погашена (крышка закрыта, этап 10) */
+    INT32   saved_pct;       /* яркость до гашения - вернуть при открытии */
 } BACKLIGHT_INFO;
 
 /* ACPI: то, что нужно для выключения (kernel/power.c) */
@@ -2146,6 +2148,7 @@ void acpi_dev_note_log(BOOLEAN error, const char *msg);
 void acpi_dev_poweroff(void);
 BOOLEAN acpi_battery_brief(char *buf, UINTN cap, BOOLEAN *charging);
 void kernel_cmd_battery(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kernel_cmd_lid(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 
 /* --- kernel/backlight.c (яркость, этап 9) --- */
 extern BACKLIGHT_INFO g_backlight;
@@ -2153,6 +2156,7 @@ void backlight_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 INT32 backlight_get(void);
 INT32 backlight_set(INT32 pct);
 INT32 backlight_step(INT32 dir);
+BOOLEAN backlight_blank(BOOLEAN off);
 void kernel_cmd_brightness(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg);
 
 /* --- kernel/tz.c --- */

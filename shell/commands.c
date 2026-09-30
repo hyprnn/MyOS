@@ -179,6 +179,19 @@ void run_command(
 
         kernel_cmd_battery(out);
 
+    /* этап 10: крышка ноутбука - закрыли, экран гаснет */
+    } else if (streq(line, "lid") || starts_with(line, "lid ")) {
+
+        char arg[24];
+        UINTN k = 0;
+
+        if (line[3] == ' ')
+            for (CHAR16 *c = line + 4; *c && k + 1 < sizeof(arg); c++)
+                arg[k++] = (*c < 128) ? (char)*c : '?';
+
+        arg[k] = '\0';
+        kernel_cmd_lid(out, arg);
+
     /* этап 9: яркость экрана ноутбука */
     } else if (streq(line, "brightness") || starts_with(line, "brightness ")) {
 
@@ -362,6 +375,7 @@ void run_command(
             "  acpi          - ACPI tables: CPU cores, I/O APIC, HPET, PCIe, power\n"
             "  battery       - battery charge, AC adapter, lid (ACPI via uACPI)\n"
             "  brightness [N|+|-|debug] - screen brightness, 5..100% (also Fn keys)\n"
+            "  lid [test close|open|off] - laptop lid: closed = screen off\n"
             "  cpu           - CPU load and interrupt counters\n"
             "  ps            - threads: state, CPU share, stack, what they wait for\n"
             "  threadtest    - live test: preemption, fair sharing, mutex\n"

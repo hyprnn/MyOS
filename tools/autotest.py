@@ -967,6 +967,16 @@ def main():
             ('brightness 40\n', 'Brightness: 40%', 10),
             ('brightness -\n', 'Brightness: 30%', 10),
             ('brightness 1\n', 'Brightness: 10%', 10),
+            # крышка (этап 10, В): поток power опрашивает _LID сам; "lid
+            # test close" - как закрыть крышку: экран гаснет (у ACPI _BCM -
+            # самый тусклый уровень), открыли - прежняя яркость
+            ('brightness 40\n', 'Brightness: 40%', 10),
+            ('lid\n', 're:Lid: open; 0 changes, 0 notifies from the firmware, polled [1-9]', 10),
+            ('lid test close\n', 'lid: closed - screen dimmed (ACPI _BCM)', 10),
+            ('', 'Screen: dimmed (brightness 40% comes back when the lid opens)', 5),
+            ('brightness\n', 'Brightness: 10%', 10),
+            ('lid test open\n', 'lid: opened - screen on, brightness 40%', 10),
+            ('lid test off\n', 'Screen: on, brightness 40%', 10),
             # значок батареи на панели задач: зелёная заливка 80%
             ('start\n', 're:wm: started', 20),
             ({'screen': [((0x20, 0xA0, 0x20), 8, 40)]}, '', 15),

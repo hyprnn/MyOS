@@ -255,6 +255,9 @@ INT32 backlight_get(void)
    Возвращает, что получилось, или -1. */
 INT32 backlight_set(INT32 pct)
 {
+    /* яркость поставили сами (команда, Fn) - экран уже не "погашен" */
+    g_backlight.blanked = FALSE;
+
     if (pct < (INT32)BL_MIN_PCT)
         pct = (INT32)BL_MIN_PCT;
     if (pct > 100)
@@ -299,10 +302,91 @@ INT32 backlight_set(INT32 pct)
     return got;
 }
 
+/*
+ * Погасить подсветку (off) или вернуть прежнюю яркость - крышка
+ * ноутбука (этап 10, В). TRUE - получилось.
+ *
+ * Свой ШИМ: доля 0 - светодиоды не горят вовсе. Бит "ШИМ включён"
+ * (CTL1, бит 31) не трогаем: выключение и включение ШИМ у разных
+ * панелей требует ещё и порядка подачи питания (так делает i915), а
+ * доля 0 гасит экран так же, и вернуть её - одна запись в регистр.
+ * Нижний предел BL_MIN_PCT здесь не действует: он защищает от
+ * "невидимого" экрана, а при закрытой крышке экран и не нужен.
+ *
+ * ACPI (_BCM): погасить совсем нельзя - ставим самый тусклый уровень
+ * из _BCL (так делают и другие ОС без драйвера видеокарты).
+ */
+BOOLEAN backlight_blank(BOOLEAN off)
+{
+    if (g_backlight.mode == BL_NONE)
+        return FALSE;
+
+    if (!off) {
+
+        if (!g_backlight.blanked)
+            return TRUE;
+
+        INT32 pct = g_backlight.saved_pct > 0 ? g_backlight.saved_pct : 100;
+        return backlight_set(pct) >= 0;     /* снимет и blanked */
+    }
+
+    if (g_backlight.blanked)
+        return TRUE;
+
+    INT32 now = backlight_get();
+
+    if (now < 0)
+        return FALSE;
+
+    BOOLEAN ok = FALSE;
+
+    kmutex_lock(&g_bl_mutex);
+
+    if (g_backlight.mode == BL_NATIVE) {
+
+        UINT32 m = 0, d = 0;
+
+        if (bl_native_read(&m, &d)) {
+            bl_native_write(m, 0);
+            ok = TRUE;
+        }
+
+    } else {
+
+        /* самый тусклый уровень _BCL */
+        UINT32 lvl = g_bl_levels[0];
+
+        for (UINTN i = 1; i < g_bl_nlevels; i++)
+            if (g_bl_levels[i] < lvl)
+                lvl = g_bl_levels[i];
+
+        uacpi_object *arg = uacpi_object_create_integer(lvl);
+
+        if (arg != NULL) {
+            uacpi_object_array args = { &arg, 1 };
+            if (uacpi_execute(g_bl_acpi_node, "_BCM", &args) == UACPI_STATUS_OK) {
+                g_backlight.acpi_last = lvl;
+                ok = TRUE;
+            }
+            uacpi_object_unref(arg);
+        }
+    }
+
+    kmutex_unlock(&g_bl_mutex);
+
+    if (ok) {
+        g_backlight.saved_pct = now;
+        g_backlight.blanked = TRUE;
+    }
+
+    return ok;
+}
+
 /* На сколько шагов сдвинуть: +1/-1 = 10% (у ACPI - к соседнему уровню) */
 INT32 backlight_step(INT32 dir)
 {
-    INT32 cur = backlight_get();
+    /* Fn+яркость на погашенном экране: считать от прежней яркости */
+    INT32 cur = g_backlight.blanked ? g_backlight.saved_pct : backlight_get();
 
     if (cur < 0)
         return -1;

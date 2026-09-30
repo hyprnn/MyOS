@@ -26,6 +26,11 @@
  * батарею; значения лежат в g_acpid - их показывают команда battery
  * и значок на панели задач. Нажата кнопка питания - он же выключает
  * машину (как Linux и Windows по умолчанию).
+ *
+ * Крышка (этап 10, В): закрыли - подсветка гаснет, открыли - прежняя
+ * яркость. Крышка присылает Notify(LID0, 0x80), но не у всех ноутбуков
+ * эта цепочка через EC работает, поэтому поток power ещё и раз в
+ * секунду спрашивает _LID сам (это быстро: один метод AML).
  */
 #include "myos.h"
 #include <uacpi/uacpi.h>
@@ -56,6 +61,11 @@ static volatile UINT32 g_power_kick;
 static volatile BOOLEAN g_power_button_pending;
 static volatile BOOLEAN g_bat_dirty;
 static KTHREAD *g_power_thread;
+
+/* крышка: "lid test close|open" подменяет ответ _LID (0 - не
+   подменять), чтобы проверить реакцию без настоящей крышки (в QEMU) */
+static volatile UINT32 g_lid_test;      /* 0 нет, 1 закрыта, 2 открыта */
+static UINT32 g_lid_notifies, g_lid_polls;
 
 /* uACPI сообщила о предупреждении/ошибке (acpi_os.c) - запомнить
    последнее, его покажет battery */
@@ -585,16 +595,60 @@ static void acpi_dev_refresh(BOOLEAN need_info)
     if (g_ac_node != NULL && uacpi_eval_simple_integer(g_ac_node, "_PSR", &v) == UACPI_STATUS_OK)
         g_acpid.ac_online = (v != 0);
 
-    if (g_lid_node != NULL && uacpi_eval_simple_integer(g_lid_node, "_LID", &v) == UACPI_STATUS_OK) {
-        BOOLEAN open = (v != 0);
-        if (open != g_acpid.lid_open)
-            g_acpid.lid_changes++;
-        g_acpid.lid_open = open;
-    }
-
     g_acpid.bat_updated_ms = kx_uptime_us() / 1000u;
 
     kmutex_unlock(&g_acpid_mutex);
+}
+
+/*
+ * Крышка: узнать, открыта ли (_LID или подмена "lid test"), и если
+ * положение сменилось - погасить или зажечь подсветку. Зовут поток
+ * power (каждую секунду и после Notify) и команды battery/lid.
+ */
+static void lid_check(void)
+{
+    BOOLEAN open;
+
+    if (g_lid_test != 0) {
+
+        open = (g_lid_test == 2);
+
+    } else {
+
+        if (g_lid_node == NULL)
+            return;
+
+        uacpi_u64 v = 0;
+
+        kmutex_lock(&g_acpid_mutex);
+        uacpi_status st = uacpi_eval_simple_integer(g_lid_node, "_LID", &v);
+        kmutex_unlock(&g_acpid_mutex);
+
+        if (st != UACPI_STATUS_OK)
+            return;
+
+        g_lid_polls++;
+        open = (v != 0);
+    }
+
+    if (open == g_acpid.lid_open)
+        return;
+
+    g_acpid.lid_open = open;
+    g_acpid.lid_changes++;
+
+    if (!open) {
+        BOOLEAN ok = backlight_blank(TRUE);
+        klog("lid: closed - %s\n", ok ? (g_backlight.mode == BL_ACPI ? "screen dimmed (ACPI _BCM)"
+                                                                  : "screen off")
+                                      : "no backlight control");
+    } else {
+        BOOLEAN ok = backlight_blank(FALSE);
+        if (ok)
+            klog("lid: opened - screen on, brightness %d%%\n", backlight_get());
+        else
+            klog("lid: opened\n");
+    }
 }
 
 /* Для значка на панели: "87%" и заряжается ли. FALSE - батареи нет. */
@@ -636,6 +690,8 @@ static uacpi_status dev_notify(uacpi_handle ctx, uacpi_namespace_node *node, uac
             g_acpid.pwrbtn_presses++;
             g_power_button_pending = TRUE;
         }
+    } else if (kind == 3) {
+        g_lid_notifies++;          /* крышку перечитает поток power */
     } else {
         g_bat_dirty = TRUE;
     }
@@ -738,6 +794,7 @@ static void power_thread(void *arg)
 {
     (void)arg;
     UINT32 seen = g_power_kick;
+    UINT64 last_bat = 0;
 
     for (;;) {
 
@@ -755,15 +812,24 @@ static void power_thread(void *arg)
             kx_shutdown();
         }
 
-        BOOLEAN dirty = g_bat_dirty;
-        g_bat_dirty = FALSE;
+        lid_check();
 
-        acpi_dev_refresh(dirty);
+        /* батарея - после Notify или раз в 15 с (её методы AML ходят в
+           EC и небыстрые; крышка - дёшево, её каждую секунду) */
+        UINT64 now = kx_uptime_us() / 1000u;
+
+        if (g_bat_dirty || now - last_bat >= 15000u) {
+            BOOLEAN dirty = g_bat_dirty;
+            g_bat_dirty = FALSE;
+            acpi_dev_refresh(dirty);
+            last_bat = now;
+        }
 
         UINT64 fl = kx_irq_save();
 
         while (g_power_kick == seen) {
-            if (!sched_block((const void *)&g_power_kick, "power", 15000))
+            if (!sched_block((const void *)&g_power_kick, "power",
+                             (g_lid_node != NULL || g_lid_test != 0) ? 1000 : 15000))
                 break;   /* таймаут - плановый опрос */
         }
 
@@ -940,19 +1006,22 @@ void kernel_cmd_battery(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     if (g_acpid.have_ac)
         kprintf(out, "AC adapter: %s\n", g_acpid.ac_online ? "plugged in" : "unplugged");
 
+    lid_check();
+
     if (g_acpid.have_lid)
         kprintf(out, "Lid: %s\n", g_acpid.lid_open ? "open" : "closed");
 
-    if (g_acpid.have_ec)
+    if (g_acpid.have_ec) {
         kprintf(out, "EC: ports 0x%x/0x%x, GPE %d%s; %llu reads, %llu writes, "
                      "%llu events, %llu timeouts\n",
                 g_acpid.ec_data, g_acpid.ec_cmd, g_acpid.ec_gpe,
                 g_acpid.ec_glk ? ", global lock" : "",
                 g_acpid.ec_reads, g_acpid.ec_writes, g_acpid.ec_queries, g_acpid.ec_timeouts);
-    if (g_ec_dead)
-        print(out, "  EC stopped answering - MyOS gave up on it (battery data may be missing)\n");
-    else
+        if (g_ec_dead)
+            print(out, "  EC stopped answering - MyOS gave up on it (battery data may be missing)\n");
+    } else {
         print(out, "EC: none\n");
+    }
 
     kprintf(out, "Power button: %s, pressed %u times\n",
             g_acpid.pwrbtn_fixed ? "fixed event" : g_acpid.pwrbtn_devices ? "PNP0C0C device" : "none",
@@ -966,4 +1035,73 @@ void kernel_cmd_battery(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
     if (g_acpid.last_msg[0])
         kprintf(out, "  last message: %s\n", g_acpid.last_msg);
+}
+
+/*
+ * Команда lid: положение крышки и что с экраном.
+ *   lid                  - состояние
+ *   lid test close|open  - притвориться, что крышку закрыли/открыли
+ *                          (проверка без настоящей крышки, в QEMU)
+ *   lid test off         - снова слушать настоящую крышку
+ */
+void kernel_cmd_lid(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
+{
+    if (!g_acpid.ok) {
+        kprintf(out, "ACPI (uACPI) is not running: %s\n", g_acpid.why ? g_acpid.why : "?");
+        return;
+    }
+
+    while (*arg == ' ')
+        arg++;
+
+    if (arg[0] == 't' && arg[1] == 'e' && arg[2] == 's' && arg[3] == 't') {
+
+        const char *w = arg + 4;
+        while (*w == ' ')
+            w++;
+
+        if (kstreq(w, "close") || kstreq(w, "closed")) {
+            g_lid_test = 1;
+        } else if (kstreq(w, "open")) {
+            g_lid_test = 2;
+        } else if (kstreq(w, "off")) {
+            g_lid_test = 0;
+            /* настоящей крышки нет - считать открытой (и зажечь экран) */
+            if (g_lid_node == NULL && !g_acpid.lid_open) {
+                g_lid_test = 2;
+                lid_check();
+                g_lid_test = 0;
+            }
+        } else {
+            print(out, "Usage: lid test close | open | off\n");
+            return;
+        }
+
+        /* сразу, не дожидаясь потока power */
+        lid_check();
+        power_kick();
+    } else if (*arg != '\0') {
+        print(out, "Usage: lid [test close | open | off]\n");
+        return;
+    } else {
+        lid_check();
+    }
+
+    if (!g_acpid.have_lid && g_lid_test == 0) {
+        print(out, "No lid found (not a laptop, or the firmware has no PNP0C0D device).\n");
+        return;
+    }
+
+    kprintf(out, "Lid: %s%s; %u changes, %u notifies from the firmware, polled %u times\n",
+            g_acpid.lid_open ? "open" : "closed",
+            g_lid_test ? " (test - 'lid test off' to use the real lid)" : "",
+            g_acpid.lid_changes, g_lid_notifies, g_lid_polls);
+
+    if (g_backlight.mode == BL_NONE)
+        print(out, "Screen: no backlight control - it stays on\n");
+    else if (g_backlight.blanked)
+        kprintf(out, "Screen: %s (brightness %d%% comes back when the lid opens)\n",
+                g_backlight.mode == BL_ACPI ? "dimmed" : "off", g_backlight.saved_pct);
+    else
+        kprintf(out, "Screen: on, brightness %d%%\n", backlight_get());
 }

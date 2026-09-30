@@ -655,6 +655,17 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   на узле с `_BCM` (обработчик на корне) — шаг ±10% / соседний уровень.
   Минимум 5%. Проверка: `LCD0` в `tools/test-battery.asl`, прогон
   `acpi-power`.
+* **Крышка** (этап 10, В; `kernel/acpi_dev.c`): `lid_check` — `_LID`
+  узла PNP0C0D (или подмена `lid test close|open`, `g_lid_test`); при
+  смене — `backlight_blank(TRUE/FALSE)`. Зовут поток power (каждую
+  секунду, если крышка есть: Notify от крышки приходит не у всех — через
+  EC; батарея по-прежнему раз в 15 с или после Notify), команды
+  `battery` и `lid`. `acpi_dev_refresh` крышку больше не читает (иначе
+  смена положения прошла бы мимо `lid_check`). `backlight_blank`: свой
+  ШИМ — доля 0 (бит включения CTL1 не трогаем, предел 5% не действует),
+  ACPI — самый тусклый уровень `_BCL`; прежняя яркость — `saved_pct`,
+  `backlight_set` снимает `blanked`, Fn при погашенном экране считает от
+  `saved_pct`. Проверка — прогон `acpi-power` (`lid test`).
 * **Настройки** (`kernel/settings.c`): том загрузки = диск FAT, где по пути
   `g_boot.kernel_path` лежит файл размером `g_boot.kernel_file_size`;
   настройки — в его `EFI/MyOS/` (папка создаётся при первой записи).
