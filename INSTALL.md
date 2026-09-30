@@ -13,7 +13,7 @@ rEFInd — см. раздел [«Другой загрузчик»](#11-друг
 
 ```bash
 sudo pacman -S --needed base-devel git
-git clone -b claude/stage-8-internet-wifi-farsah https://github.com/hyprnn/MyOS.git
+git clone https://github.com/hyprnn/MyOS.git
 cd MyOS
 make -j$(nproc)
 sudo tools/install-arch.sh --menu
@@ -132,11 +132,11 @@ sudo pacman -S --needed base-devel git
 **Через git** (так проще обновлять — `git pull`):
 
 ```bash
-git clone -b claude/stage-8-internet-wifi-farsah https://github.com/hyprnn/MyOS.git
+git clone https://github.com/hyprnn/MyOS.git
 cd MyOS
 ```
 
-**Архивом:** на GitHub выбрать ветку `claude/stage-8-internet-wifi-farsah`
+**Архивом:** на GitHub (ветка `main`)
 → Code → Download ZIP, распаковать и перейти в папку. Учти: в папке из
 архива **нет git**, поэтому `git pull` там не работает — для обновления
 придётся скачать архив заново.
