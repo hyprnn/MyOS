@@ -281,6 +281,55 @@ UINT64 pmm_alloc_pages(UINT64 count, UINT64 limit)
 }
 
 
+/*
+ * Одна страница НИЖЕ 1 МБ - для трамплина запуска ядер процессора
+ * (smp.c): сигнал SIPI умеет указать только такой адрес. Обычный
+ * pmm_alloc_pages первый мегабайт не выдаёт никогда (там живёт
+ * всякое старое - таблицы BIOS, EBDA), поэтому здесь - отдельный
+ * поиск по карте памяти: только свободная RAM (Conventional) и
+ * бывшая память прошивки (BootServices), не страница 0 и не то, что
+ * загрузчик оставил ядру. Выданная страница больше никому не нужна.
+ */
+UINT64 pmm_alloc_low_page(void)
+{
+    static UINT64 given;
+
+    if (given != 0)
+        return given;
+
+    for (UINTN i = 0; i < g_kmm_map_count; i++) {
+
+        UINT32 t = g_kmm_map[i].type;
+
+        if (t != 7 && t != 3 && t != 4)
+            continue;
+
+        UINT64 first = g_kmm_map[i].phys / KMM_PAGE;
+        UINT64 end = first + g_kmm_map[i].pages;
+
+        for (UINT64 p = first; p < end && p < 0x9Fu; p++) {
+
+            if (p < 8u)          /* первые 32 КБ - не трогаем (таблицы BIOS) */
+                continue;
+
+            BOOLEAN busy = FALSE;
+
+            for (UINT32 r = 0; r < g_boot.nreserved && r < MYOS_MAX_RESERVED; r++) {
+                UINT64 rf = g_boot.reserved[r].phys / KMM_PAGE;
+                if (p >= rf && p < rf + g_boot.reserved[r].pages)
+                    busy = TRUE;
+            }
+
+            if (!busy) {
+                given = p * KMM_PAGE;
+                return given;
+            }
+        }
+    }
+
+    return 0;
+}
+
 void pmm_free_pages(UINT64 phys, UINT64 count)
 {
     if (!g_kmm_ready)

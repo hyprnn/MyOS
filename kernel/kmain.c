@@ -244,7 +244,7 @@ void kmain_stage2(void)
                 bad ? " (some with BAD checksums - ignored)" : ", all checksums OK");
 
         if (g_acpi.have_madt)
-            kprintf(out, "  CPU cores: %u (MADT); MyOS uses one of them for now\n",
+            kprintf(out, "  CPU cores: %u in the MADT table (started below, in [cpus])\n",
                     (UINT32)g_acpi.ncpus_enabled);
     } else {
         kprintf(out, "  no usable ACPI tables: %s\n", g_acpi.why);
@@ -406,6 +406,10 @@ void kmain_stage2(void)
        sleep) - настоящий сон: процессор отдаётся другим потокам
        или idle. */
     sched_start(out);
+
+    /* --- остальные ядра процессора (этап 10) --- */
+    kmain_section(out, "[cpus]");
+    smp_start(out);
 
     /* --- ввод --- */
     kmain_section(out, "[input]");

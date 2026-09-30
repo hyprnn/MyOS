@@ -345,6 +345,8 @@ void kx_load_tick(void)
 
 void kernel_cmd_cpu(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
+    smp_describe(out);
+
     if (g_cpu_load_valid)
         kprintf(out, "CPU load (last second, measured while this shell waited): %u.%u%%\n",
                 g_cpu_load_permille / 10u, g_cpu_load_permille % 10u);

@@ -883,6 +883,17 @@ def main():
                       '-device', 'e1000,netdev=n0',
                       '-drive', 'if=none,id=nstick,format=raw,file=@WORK@/netstick.img'],
                      ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=nstick']))
+        # все ядра процессора (этап 10): 4 ядра - все проснулись
+        runs.append(('smp', [
+            (None, 'CPU cores: 4 of 4 running', 90),
+            ('', "Type 'help'", 30),
+            ('cpu\n', 'cpu3: APIC id 3, online', 15),
+        ], ['-smp', '4']))
+        runs.append(('smp-q35', [
+            (None, 'CPU cores: 4 of 4 running', 90),
+            ('', "Type 'help'", 30),
+        ], ['-smp', '4', '-machine', 'q35']))
+
         # ACPI через uACPI (этап 9): поддельная батарея из своей таблицы
         # SSDT (tools/test-battery.asl), потом "нажать кнопку питания"
         # (system_powerdown) - MyOS должна выключиться сама (_PTS, S5)

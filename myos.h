@@ -1221,6 +1221,23 @@ typedef struct {
     UINT16  hpet_min_tick;
 } ACPI_INFO;
 
+/* Ядра процессора (kernel/smp.c, этап 10) */
+#define KX_MAX_CPUS 32
+
+typedef struct {
+    BOOLEAN  used;               /* есть в MADT (и включено прошивкой) */
+    BOOLEAN  bsp;                /* загрузочное ядро (cpu0) */
+    volatile BOOLEAN online;     /* проснулось и настроилось */
+    UINT32   apic_id;            /* номер Local APIC (из MADT) */
+    UINT32   apic_id_seen;       /* ...и какой оно назвало само */
+    const char *why;             /* почему не запустилось */
+    UINT64   started_tsc;
+    UINT64   stack_top;          /* основной стек ядра */
+    UINT64   ist_df, ist_nmi, ist_mc;   /* аварийные стеки */
+    UINT64   gdt[8] __attribute__((aligned(16)));
+    KX_TSS   tss __attribute__((aligned(16)));
+} KX_CPU;
+
 /* ACPI-устройства через uACPI (kernel/acpi_dev.c, этап 9) */
 #define ACPI_MAX_BATTERIES 2
 
@@ -2462,6 +2479,13 @@ UINT64 acpi_pmtimer_measure_tsc_hz(void);
 UINT32 acpi_current_apic_id(void);
 void kernel_cmd_acpi(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 
+/* --- kernel/smp.c (ядра процессора, этап 10) --- */
+extern KX_CPU g_cpus[KX_MAX_CPUS];
+extern UINT32 g_ncpus, g_ncpus_found;
+void smp_start(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void smp_describe(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
+void kx_lapic_send_ipi(UINT32 apic_id, UINT32 low);
+
 /* --- kernel/acpi_os.c, kernel/acpi_dev.c (uACPI, этап 9) --- */
 extern UINT64 g_acpi_sci_count, g_acpi_work_done, g_acpi_work_lost;
 void acpi_os_start(void);
@@ -2669,6 +2693,7 @@ BOOLEAN pmm_init(void);
 UINT64 pmm_alloc_pages(UINT64 count, UINT64 limit);
 void pmm_free_pages(UINT64 phys, UINT64 count);
 UINT64 pmm_alloc_zeroed(UINT64 count, UINT64 limit);
+UINT64 pmm_alloc_low_page(void);
 const char *kmm_type_name(UINT32 t);
 BOOLEAN pmm_free_type(UINT32 t);
 UINT64 pmm_release_loader_temp(void);
