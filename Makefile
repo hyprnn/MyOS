@@ -85,6 +85,9 @@ UCFLAGS := -O2 -ffreestanding -fno-stack-protector -fno-stack-check -fno-pic -fn
 ULDFLAGS:= -nostdlib -static -z noexecstack -z max-page-size=0x1000 -T user/user.ld
 APPS    := $(sort $(basename $(notdir $(wildcard user/apps/*.c))))
 ULIB    := $(patsubst user/lib/%,build/user/lib/%.o,$(basename $(wildcard user/lib/*.c user/lib/*.S)))
+# Мини-libc - архивом: компоновщик берёт из него только те файлы, что
+# нужны программе (ls не тянет шрифт окон, hello - команды файлов)
+ULIB_A  := build/user/libmyos.a
 APP_ELFS:= $(APPS:%=build/user/%)
 
 # TLS (HTTPS) для программ: BearSSL (third_party/bearssl, MIT) + обёртка
@@ -260,9 +263,14 @@ $(TLS_LIB): $(TLS_OBJS) $(BSSL_OBJS)
 	@rm -f $@
 	@ar rcs $@ $^
 
-build/user/%: build/user/apps/%.o $(ULIB) $(TLS_LIB) user/user.ld
+$(ULIB_A): $(filter-out build/user/lib/crt0.o,$(ULIB))
+	@echo "  AR  $@"
+	@rm -f $@
+	@ar rcs $@ $^
+
+build/user/%: build/user/apps/%.o build/user/lib/crt0.o $(ULIB_A) $(TLS_LIB) user/user.ld
 	@echo "  LD  [user] $@"
-	@$(LD) $(ULDFLAGS) -o $@ build/user/lib/crt0.o $(filter-out build/user/lib/crt0.o,$(ULIB)) $< $(TLS_LIB)
+	@$(LD) $(ULDFLAGS) -o $@ build/user/lib/crt0.o $< $(TLS_LIB) $(ULIB_A)
 
 build/user/picolibc/%.o: $(PICO_DIR)/src/%
 	@mkdir -p $(dir $@)

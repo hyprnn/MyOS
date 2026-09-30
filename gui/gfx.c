@@ -18,6 +18,7 @@
  */
 #include "myos.h"
 #include "font8x16.h"
+#include "icons16.h"
 
 
 /* ================================================================
@@ -338,31 +339,9 @@ INT32 gfx_text_width(const char *s)
 
 
 /* ================================================================
- * Значки 16x16 (буквы-цвета, палитра Windows 95)
+ * Значки 16x16 (буквы-цвета, палитра Windows 95; данные и цвета
+ * букв - в icons16.h, общем с программами)
  * ================================================================ */
-
-static BOOLEAN icon_color(char c, UINT32 *col)
-{
-    switch (c) {
-    case 'k': *col = 0x000000; return TRUE;
-    case 'w': *col = 0xFFFFFF; return TRUE;
-    case 'g': *col = 0xC0C0C0; return TRUE;
-    case 'd': *col = 0x808080; return TRUE;
-    case 'b': *col = 0x000080; return TRUE;
-    case 'B': *col = 0x0000FF; return TRUE;
-    case 't': *col = 0x008080; return TRUE;
-    case 'c': *col = 0x00FFFF; return TRUE;
-    case 'y': *col = 0xFFFF00; return TRUE;
-    case 'o': *col = 0x808000; return TRUE;
-    case 'r': *col = 0xFF0000; return TRUE;
-    case 'm': *col = 0x800000; return TRUE;
-    case 'G': *col = 0x00FF00; return TRUE;
-    case 'n': *col = 0x008000; return TRUE;
-    case 'p': *col = 0x800080; return TRUE;
-    case 'P': *col = 0xFF00FF; return TRUE;
-    default:  return FALSE;          /* '.' - прозрачно */
-    }
-}
 
 /*
  * Значок в (x, y), каждый "пиксель" значка - квадрат scale x scale.
@@ -375,7 +354,7 @@ void gfx_icon(GFX *g, INT32 x, INT32 y, const char *const *rows, UINT32 scale, B
 
             UINT32 col;
 
-            if (!icon_color(rows[r][c], &col))
+            if (!icon16_color(rows[r][c], &col))
                 continue;
 
             for (UINT32 dy = 0; dy < scale; dy++)

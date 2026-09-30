@@ -690,7 +690,9 @@ def main():
         runs.append(('desktop', [
             (None, "Type 'help'", 90),
             ('start\n', 're:wm: started', 20),
-            ('', "re:wm: window 1 .* opened", 5),
+            # первое окно - "О системе": это уже программа /bin/about (Д4)
+            ('', "re:started pid [0-9]+ 'about' \\(/bin/about\\)", 10),
+            ('', 're:winproc: pid [0-9]+ got window', 10),
             # открыть меню "Пуск"
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
@@ -706,12 +708,27 @@ def main():
             ('cat /ram/p.txt\n', 're:term: 9592 primes', 15),
             ('crash loop\n', 're:term: .*Ctrl\\+C', 15),
             ({'key': 'ctrl-c'}, 're:term: \\*\\*\\* crash .* stopped with Ctrl\\+C', 10),
+            # Блокнот - программа (Д4): своё окно, Ctrl+S пишет файл,
+            # Esc закрывает, и терминал снова наш
+            ('notepad /ram/n.txt\n', 're:winproc: pid [0-9]+ got window', 10),
+            ('hello\n', '', 1),
+            ({'key': 'ctrl-s'}, 'notepad: saved /ram/n.txt, 6 bytes', 10),
+            ({'key': 'esc'}, "re:'notepad' exited with code 0", 10),
+            ('cat /ram/n.txt\n', 'term: hello', 10),
             # снова меню -> "Часы" (6-й пункт, y=549+5*20=649..669)
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
             ({'goto': (60, 655)}, '', 0.3),
             ({'click': 1}, 're:wm: launch clock', 8),
             ('', 're:winproc: pid [0-9]+ got window', 10),
+            # Сапёр (8-й пункт, y=689..709) - тоже программа: окно, Esc
+            ({'goto': (20, 786)}, '', 0.3),
+            ({'click': 1}, '', 0.4),
+            ({'goto': (60, 699)}, '', 0.3),
+            ({'click': 1}, 're:wm: launch mine', 8),
+            ('', "re:started pid [0-9]+ 'mines' \\(/bin/mines\\)", 10),
+            ('', 're:winproc: pid [0-9]+ got window', 10),
+            ({'key': 'esc'}, "re:'mines' exited with code 0", 10),
             # мышь двигается - композитор жив
             ({'mouse': 15}, '', 1),
             # выход из рабочего стола: меню "Пуск" -> "Выход" (11-й, y=549+10*20=749..769)
@@ -907,6 +924,19 @@ def main():
             ('echo one >> /ram/bin.txt\n', '', 2),
             ('cd /ram\n', '', 1),
             ('pwd\n', 're:\n/ram\r?\n', 10),
+            # команды файлов - программы /bin (Д3); "ls /" /bin/ls просит
+            # у ядра (kcmd KERNEL), и его вывод идёт в файл программы
+            ('ls / > vol.txt\n', 're:started pid [0-9]+ .ls. \\(/bin/ls\\)', 15),
+            ('cat vol.txt bin.txt\n', 're:RAM disk(.|\n)*burn', 15),
+            ('write w.txt hello   "two  spaces"\n', 'w.txt is now 18 bytes', 15),
+            ('append w.txt more\n', 'w.txt is now 23 bytes', 15),
+            ('cp w.txt w2.txt\n', 'Copied, 23 bytes.', 15),
+            ('mv w2.txt w3.txt\n', 'Moved.', 15),
+            ('size w3.txt\n', '23 bytes', 15),
+            ('touch w3.txt\n', 'File already exists.', 15),
+            ('rm w3.txt\n', 'Deleted.', 15),
+            ('mkdir sub\n', 'this file system cannot do that', 15),
+            ('ls\n', 're:/ram:(.|\n)*w\.txt(.|\n)*file\(s\)', 15),
             ('history\n', 're:[0-9]+ +cd /ram', 10),
             ('nosuchcmd\n', 'Unknown command: nosuchcmd', 10),
             ('', 're:done: primes 3000000', 60),

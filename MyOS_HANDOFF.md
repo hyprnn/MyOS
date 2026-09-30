@@ -94,7 +94,7 @@ make test       # tools/autotest.py: 17 запусков QEMU (~6 мин): ос�
 | `kernel/` | `kmain.c` порядок запуска; `kernel.ld`; `vmm.c` таблицы страниц (код RX, rodata R, данные RW+NX, RAM WB, не-RAM ниже 4 ГиБ UC, экран WC через PAT, нижняя половина пуста), стеки с защитными страницами; `pmm.c` страницы (свободны также BootServices*/Loader*); `kmalloc.c` слабы 16..1024 + крупные страницами; `cpu.c` GDT+TSS (IST1 #DF, IST2 NMI, IST3 #MC), IDT, экран паники с разбором #PF/#DF; `acpi.c` разбор ACPI (RSDP→XSDT/RSDT, контрольные суммы, MADT: ядра/I/O APIC/переназначения IRQ, FADT: порты PM, таймер PM, регистр сброса, век RTC, MCFG: ECAM, HPET: запуск и замер TSC; команда `acpi`); `tz.c` часовые пояса: CMOS хранит UTC, `krt_get_time` отдаёт местное время Москвы (UTC+3) или Иерусалима (UTC+2/+3, израильские правила летнего времени; проверено против zoneinfo на 2015–2035), переключение `tz msk|jer|toggle`, клик по часам в GUI или T; по умолчанию Москва, выбор не сохраняется (диска нет); `power.c` CMOS-часы (век из FADT), reboot (регистр FADT → 0xCF9 → 8042 → triple fault), shutdown (`_S5_` из DSDT/SSDT, QEMU-порты); `shim.c` таблица `g_kst` для шелла/GUI (свои BootServices/RuntimeServices, без прошивки); `kcon.c`, `time.c`, `kcmds.c` (kinfo/usb/mousetest/mem/boot/vm/crash) |
 | `drivers/` | `pci.c` (порты или ECAM после `pci_use_ecam` со сверкой), `xhci_common.c` (общие с загрузчиком), `usb.c` (ядро xHCI: кольца, `kx_pump`, синхронные операции под замком, перечисление с route string/TT, горячее подключение, `kx_service`, MSI), `usbhid.c` (клавиатуры/мыши, трубы прерываний, светодиоды), `usbhub.c` (хабы USB2/USB3), `usbmsd.c` (флешки: Bulk-Only + SCSI, `usb_disk_read`, команда `disk`), `hid.c`, `keyboard.c` (+NumLock/ScrollLock), `ps2.c` (IRQ 1/12, PS/2-мышь/тачпад с колесом, светодиоды); сеть: `e1000.c`, `rtl8169.c`, `usbnet.c`; Wi-Fi: `rtw8821c.c` + `rtw8821c_table.c` (Realtek RTL8821CE) |
 | `firmware/` | прошивки, вклеенные в ядро (`firmware.S`): `rtw88/rtw8821c_fw.bin` + `LICENCE.rtlwifi_firmware.txt` |
-| `gui/` | `gui.c` цикл `start`, `desktop.c` (вывод кадра без мигания: `gui_present_frame`/`gui_present_cursor`), `draw.c`, `minesweeper*.c`, `terminal.c` (+`gui_term_exec`) |
+| `gui/` | `wm.c` композитор и рабочий стол, `gfx.c` рисование, `apps.c` Проводник и запуск программ, `tty.c` окно-терминал, `icons.c`, `fb.c` (прямо в видеопамять: консоль, паника, `mousetest`). Первый GUI (`gui.c`, `desktop.c`, `draw.c`, `terminal.c`, `explorer.c`, `minesweeper*.c`, `shortcuts.c`, `gstring.c`) удалён на этапе 10 (Д5) |
 | `shell/` | `commands.c`, `console.c`, `readline.c`, `fs.c`, `fetch.c`, `editor.c`, `calc.c`, `history.c` |
 | `net/` | этап 8: `net.h` (типы стека, NETIF), `net.c` (интерфейсы, очередь приёма, поток net, прерывания карт, `lo`), `arp.c`, `ip.c` (+ICMP), `udp.c`, `tcp.c`/`tcp.h`, `dhcp.c`, `dns.c`, `socket.c`, `netcmd.c` (`net`, SYS_NETINFO/NETCTL, индикатор GUI), `wpa.c`/`wifi.h` (WPA2), `wifi.c` (`wifi`), `wlan.c`/`wlan.h` (802.11-клиент, `WLAN_HW`), `wlan_sim.c` (программная точка доступа) |
 | `drivers/e1000.c`, `rtl8169.c`, `usbnet.c` | сетевые карты: Intel, Realtek, USB-модемы |
@@ -304,6 +304,19 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   и закрывает окно, когда шелл вышел; закрыли окно — всем его процессам
   `proc_kill`. `print()` пишет в историю экрана консоли только если вывод
   — `g_kcon_out`. Старый терминал с восемью командами из apps.c удалён.
+* **Команды файлов — программы** (Д3): `user/apps/{ls,cat,cp,mv,rm,rmdir,
+  mkdir,touch,write,append,size}.c`, общее — `user/lib/files.c`
+  (`path_normalize` как `vfs_normalize`, `copy_file` как `fs_copy`,
+  `file_err`, `file_put_words`); сообщения — как у версий ядра (и
+  `strerror` мини-libc — как `vfs_strerror`). Ядро уступает эти имена:
+  `kcmd_is_program` в начале `run_command` (только при `kcmd_probe`, без
+  `MYOS_KCMD_KERNEL`, и если `/bin/<имя>` есть) → «не моё», шелл
+  запускает программу. Шелл ядра (аварийный) выполняет версии из
+  `shell/fs.c`. `ls /` — `kcmd("ls /", 0, MYOS_KCMD_KERNEL)`; вывод
+  `kcmd` без своего файла идёт в `out_kfd` программы (`ls / > f`).
+  `struct myos_dirent`: бывший `pad` — `wdate`/`wtime` (формат FAT).
+  `vfs_forget_dev` → `proc_forget_volume`: cwd программ на пропавшем
+  томе → `/`.
 * Проверка: прогон `smp` — `&`, `jobs`, `>`, `>>`, `cd`/`pwd`,
   `history`, неизвестная команда; прогон `desktop` — в окне-терминале
   `cpu`, `hello`, `>` и `cat`, `crash loop` + Ctrl+C; весь autotest идёт
@@ -362,8 +375,8 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   17 вызовов (`sysnum.h`): exit write read open close sleep uptime
   sbrk getpid time readdir mkdir unlink rename yield stat getkey.
   fd 0/1/2 — консоль шелла (`PROC_IO_CONSOLE`) или терминал GUI
-  (`PROC_IO_GUI`: вывод строками через `g_proc_gui_sink`, ввод —
-  `proc_gui_input`), 3+ — файлы VFS.
+  (`PROC_IO_GUI`; с этапа 10 это программа с окном без терминала:
+  вывод строками в журнал ядра, ввода нет), 3+ — файлы VFS.
 * `fs/binfs.c`: том `/bin` из `build/apps.S` (.incbin всех
   `build/user/*`). make кладёт копии и в `esp/APPS/`.
 * Шелл: неизвестная команда → `proc_shell_try` (ищет /bin/имя, путь
@@ -385,22 +398,26 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   gfx_fill/blit/bevel/button/text/icon; сглаженный шрифт 8x16
   (`font8x16.h`, 16 градаций, латиница+кириллица, генератор
   `tools/mkfont.py` из DejaVu Sans Mono - нужен только при
-  регенерации). UTF-8 (utf8_next/put/len). `gui/icons.c` - значки
-  16x16 буквами-цветами.
+  регенерации). UTF-8 (utf8_next/put/len). Значки 16x16 буквами-цветами
+  - `icons16.h` (данные + `icon16_find`/`icon16_color`), `gui/icons.c` -
+  только `gui_icon`. Шрифт и значки общие с программами:
+  `user/lib/gfx.c` - тот же API `gfx_*` (типы int) для буфера окна.
 * `gui/wm.c`: композитор. `g_windows[16]`, z-порядок, фокус,
   перетаскивание. Кадр собирается в back_buf (RAM), на экран идут
   только изменившиеся точки (shadow) + курсор-стрелка поверх -
   без мигания. Ввод: мышь (перетаскивание заголовка, крестик,
   фокус, ярлыки, панель задач, меню «Пуск»), клавиши - активному
   окну. Цикл `wm_start` спит между событиями (sched_sleep_ms).
-  `start` теперь зовёт `wm_start` (старый `gui_start`/`gui/*.c`
-  остались в дереве, но не используются).
+  `start` зовёт `wm_start`; первый GUI (`gui_start` и его файлы)
+  удалён на этапе 10 (Д5).
 * `gui/apps.c`: родные окна (WIN_CLASS = paint+event+tick+close):
-  Терминал (свой поток запускает /bin, вывод через
-  `g_proc_gui_sink`), Блокнот (правка UTF-8, Ctrl+S), Проводник
-  (VFS), Сапёр (логика в gui/minesweeper.c), О системе; ярлыки и
-  меню «Пуск». Графические программы (clock/paint/life)
-  запускаются без окна терминала (`app_run_bare`).
+  Терминал (`/bin/sh` в окне, `gui/tty.c`), Проводник (VFS); ярлыки
+  и меню «Пуск».
+  Блокнот, Сапёр, О системе - с этапа 10 (Д4) программы
+  `user/apps/{notepad,mines,about}.c`; `app_open_notepad/minesweeper/
+  about` только запускают их. Графические программы запускаются без
+  окна терминала (`app_run_bare`: вывод - в журнал COM1). Значок окна
+  программы на панели задач - `WIN.icon` = `gui_icon(имя программы)`.
 * Окна программ: `kernel/winproc.c` + 5 системных вызовов
   (`SYS_WIN_*`). Буфер окна - общие физические страницы,
   отображённые и ядру (P2V), и программе (`proc_map_shared`,

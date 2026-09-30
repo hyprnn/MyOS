@@ -6,6 +6,67 @@
 
 
 /* ============================================================
+ * Команды, которые стали программами (этап 10, Д3)
+ * ============================================================ */
+
+/*
+ * Раньше ls, cat, cp... были только кодом ядра (shell/fs.c). Теперь
+ * это программы в /bin - как в Linux: ошибка в них не роняет систему,
+ * и их легко заменить. Шелл-программа сначала спрашивает ядро (kcmd),
+ * а уже потом ищет программу, поэтому ядро должно "уступить" эти
+ * имена: ответить "не моё". Уступаем, только если:
+ *   - команду прислала шелл-программа (kcmd_probe), а не шелл ядра:
+ *     аварийный шелл работает, даже если /bin пустой;
+ *   - нет флага MYOS_KCMD_KERNEL ("выполни именно ты": так /bin/ls
+ *     просит список томов - иначе ядро снова запустило бы /bin/ls);
+ *   - программа с этим именем действительно есть в /bin.
+ * Остальные команды файлов (cd, pwd, df, dir, stat...) - ядра.
+ */
+static const char *const g_file_programs[] = {
+    "ls", "cat", "cp", "mv", "rm", "rmdir", "mkdir", "touch",
+    "write", "append", "size",
+};
+
+static BOOLEAN kcmd_is_program(const CHAR16 *line)
+{
+    KPROC *p = g_kcur->proc;
+
+    if (p == NULL || !p->kcmd_probe || p->kcmd_kernel)
+        return FALSE;
+
+    /* первое слово строки (ASCII) */
+    char name[16];
+    UINTN n = 0;
+
+    while (line[n] == L' ')
+        line++;
+
+    for (; line[n] != 0 && line[n] != L' '; n++) {
+        if (n + 1 >= sizeof(name) || line[n] > 127)
+            return FALSE;
+        name[n] = (char)line[n];
+    }
+
+    name[n] = '\0';
+
+    for (UINTN i = 0; i < sizeof(g_file_programs) / sizeof(g_file_programs[0]); i++) {
+
+        if (!kstreq(name, g_file_programs[i]))
+            continue;
+
+        char path[32];
+        VFS_DIRENT e;
+
+        ksnprintf(path, sizeof(path), "/bin/%s", name);
+
+        return vfs_stat(path, &e) == VFS_OK && !e.node.is_dir;
+    }
+
+    return FALSE;
+}
+
+
+/* ============================================================
  * Command dispatcher
  * ============================================================ */
 
@@ -480,6 +541,17 @@ void run_command(
      * append, edit, rm, mv, cp, size, df - см. shell/fs.c (через
      * VFS: RAM-диск /ram, флешки, разделы дисков)
      * -------------------------------------------------------- */
+
+    /* --------------------------------------------------------
+     * Этап 10, Д3: команды файлов - программы /bin/ls, /bin/cp...
+     * Шелл-программе (kcmd) отвечаем "не моё" - она запустит
+     * программу. Версии ядра ниже остались для аварийного шелла
+     * (и для "ls /": список томов знает только ядро).
+     * -------------------------------------------------------- */
+
+    } else if (kcmd_is_program(line)) {
+
+        g_kcur->proc->kcmd_unknown = TRUE;
 
     } else if (fs_shell_command(st, line)) {
 

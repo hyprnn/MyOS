@@ -108,10 +108,10 @@ static EFI_SYSTEM_TABLE *ls;           /* таблица прошивки */
 static SIMPLE_TEXT_OUTPUT_INTERFACE *lout;
 static MYOS_BOOT_INFO *lbi;            /* паспорт (в памяти ядра) */
 
-static GUI_ALLOCATE_PAGES l_alloc_pages;
-static GUI_ALLOCATE_POOL l_alloc_pool;
-static GUI_FREE_POOL l_free_pool;
-static GUI_GET_MEMORY_MAP l_get_map;
+static EFI_BS_ALLOCATE_PAGES l_alloc_pages;
+static EFI_BS_ALLOCATE_POOL l_alloc_pool;
+static EFI_BS_FREE_POOL l_free_pool;
+static EFI_BS_GET_MEMORY_MAP l_get_map;
 
 /* Когда паспорт ещё не выделен, журнал копится здесь */
 static char l_early_log[512];
@@ -636,10 +636,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
     ls = st;
     lout = st->ConOut;
 
-    l_alloc_pages = (GUI_ALLOCATE_PAGES)st->BootServices->AllocatePages;
-    l_alloc_pool = (GUI_ALLOCATE_POOL)st->BootServices->AllocatePool;
-    l_free_pool = (GUI_FREE_POOL)st->BootServices->FreePool;
-    l_get_map = (GUI_GET_MEMORY_MAP)st->BootServices->GetMemoryMap;
+    l_alloc_pages = (EFI_BS_ALLOCATE_PAGES)st->BootServices->AllocatePages;
+    l_alloc_pool = (EFI_BS_ALLOCATE_POOL)st->BootServices->AllocatePool;
+    l_free_pool = (EFI_BS_FREE_POOL)st->BootServices->FreePool;
+    l_get_map = (EFI_BS_GET_MEMORY_MAP)st->BootServices->GetMemoryMap;
 
     lout->Reset(lout, FALSE);
     lout->ClearScreen(lout);
@@ -855,8 +855,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st)
     /* --- 10. ExitBootServices. Между GetMemoryMap и Exit ничего
        нельзя выделять и печатать (печать тоже может выделить
        память) - иначе ключ карты устареет и Exit откажет. --- */
-    GUI_EXIT_BOOT_SERVICES exit_bs =
-        (GUI_EXIT_BOOT_SERVICES)st->BootServices->ExitBootServices;
+    EFI_BS_EXIT_BOOT_SERVICES exit_bs =
+        (EFI_BS_EXIT_BOOT_SERVICES)st->BootServices->ExitBootServices;
 
     BOOLEAN exited = FALSE;
 

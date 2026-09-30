@@ -54,6 +54,13 @@ int  waitpid_info(int pid, struct myos_waitinfo *wi, int flags);  /* 1 конч�
 int  readkey(long timeout_ms);                          /* -1 - ждать сколько угодно */
 int  kcmd(const char *line, const char *out_path, int flags);     /* 1 - команда ядра */
 
+/* user/lib/files.c - общее для команд файлов (ls, cp, mv, write...) */
+const char *path_base(const char *p);                   /* "a/b/c.txt" -> "c.txt" */
+int  path_normalize(const char *path, char *out, size_t cap);   /* без "." и ".." */
+void file_err(const char *what, const char *path, int e);       /* "cp x: no such..." */
+int  copy_file(const char *from, const char *to, unsigned long long *copied);
+int  file_put_words(int argc, char **argv, int first, int append); /* write, append */
+
 /* --- строки (user/lib/string.c) --- */
 size_t strlen(const char *s);
 int    strcmp(const char *a, const char *b);
@@ -142,3 +149,40 @@ void  gpx(unsigned int *buf, int w, int h, int x, int y, unsigned int col);
 void  gfill(unsigned int *buf, int w, int h, int x, int y, int rw, int rh, unsigned int col);
 void  gtext(unsigned int *buf, int w, int h, int x, int y, const char *s, unsigned int col);
 int   gtextw(const char *s);
+
+/* --- рисование как у окон ядра (этап 10, user/lib/gfx.c): шрифт 8x16
+   с кириллицей, рамки Win95, значки 16x16 --- */
+#ifndef FONT_W
+#define FONT_W 8
+#define FONT_H 16
+#endif
+#define GFX_WHITE  0xFFFFFFu
+#define GFX_LIGHT  0xDFDFDFu
+#define GFX_FACE   0xC0C0C0u     /* серый фон окон и кнопок */
+#define GFX_SHADOW 0x808080u
+#define GFX_BLACK  0x000000u
+#define GFX_NAVY   0x000080u
+
+typedef struct {
+    unsigned int *px;
+    int w, h, stride;
+    int cx0, cy0, cx1, cy1;      /* отсечение (clip) */
+} GFX;
+
+void gfx_init(GFX *g, unsigned int *px, int w, int h);
+void gfx_noclip(GFX *g);
+void gfx_clip(GFX *g, int x, int y, int w, int h);
+void gfx_fill(GFX *g, int x, int y, int w, int h, unsigned int col);
+void gfx_pixel(GFX *g, int x, int y, unsigned int col);
+void gfx_bevel(GFX *g, int x, int y, int w, int h, int raised);
+void gfx_button(GFX *g, int x, int y, int w, int h, int pressed);
+void gfx_glyph(GFX *g, int x, int y, unsigned int cp, unsigned int col);
+int  gfx_text(GFX *g, int x, int y, const char *s, unsigned int col);      /* -> ширина */
+int  gfx_text_fit(GFX *g, int x, int y, const char *s, unsigned int col, int max_chars);
+int  gfx_text_bold(GFX *g, int x, int y, const char *s, unsigned int col);
+int  gfx_text_width(const char *s);
+void gfx_icon(GFX *g, int x, int y, const char *const *rows, int scale, int selected);
+const char *const *gfx_icon_rows(const char *name);    /* "logo", "mine"...; нет - "app" */
+unsigned int utf8_next(const char **s);
+int  utf8_put(unsigned int c, char *out);                /* out >= 4 байт */
+int  utf8_len(const char *s);

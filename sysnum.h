@@ -131,7 +131,8 @@ struct myos_dirent {
     char               name[128];
     unsigned long long size;
     unsigned int       is_dir;
-    unsigned int       pad;
+    unsigned short     wdate;   /* дата изменения, как в FAT: (год-1980)<<9 | месяц<<5 | день; 0 - нет */
+    unsigned short     wtime;   /* время: часы<<11 | минуты<<5 | секунды/2 */
 };
 
 /* --- сеть (этап 8) --- */
@@ -228,6 +229,9 @@ struct myos_waitinfo {
 #define MYOS_SCAN_ESC      0x17
 
 #define MYOS_KCMD_APPEND   1   /* вывод в файл - дописывать */
+#define MYOS_KCMD_KERNEL   2   /* выполнить версию ядра, даже если в /bin есть
+                                  программа с этим именем (ls / - список томов
+                                  знает только ядро, и /bin/ls просит его) */
 
 /* --- окна (этап 7) --- */
 struct myos_rect {

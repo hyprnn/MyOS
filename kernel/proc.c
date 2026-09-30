@@ -36,8 +36,6 @@ KPROC *volatile g_fg_proc = NULL;        /* программа "на перед�
                                             (её завершает Ctrl+C) */
 static UINT32 g_next_pid = 1;
 const char *g_proc_last_error = "";     /* почему не запустилась (для шелла) */
-void (*g_proc_gui_sink)(const char *line) = NULL;   /* куда программы GUI
-                                                        пишут строки (терминал) */
 
 /* биты записи таблицы страниц (как в vmm.c) */
 #define UPTE_P     (1ull << 0)
@@ -737,7 +735,6 @@ KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *
     ksnprintf(p->path, sizeof(p->path), "%s", path);
     ksnprintf(p->cwd, sizeof(p->cwd), "%s", cwd ? cwd : g_cwd);
     p->io = io;
-    p->gui_line = (io == PROC_IO_GUI) ? g_proc_gui_sink : NULL;
     p->started_ms = g_kticks;
 
     /* своя PML4: нижняя половина пустая, верхняя - ядро */
@@ -813,10 +810,10 @@ void proc_exit_current(INT64 code)
 
     if (p != NULL) {
 
-        /* остаток вывода в окно GUI */
-        if (p->io == PROC_IO_GUI && p->outlen > 0 && p->gui_line) {
+        /* остаток вывода графической программы - в журнал */
+        if (p->io == PROC_IO_GUI && p->outlen > 0) {
             p->outline[p->outlen] = '\0';
-            p->gui_line(p->outline);
+            klog("%s: %s\n", p->name, p->outline);
             p->outlen = 0;
         }
 
@@ -881,6 +878,38 @@ void proc_kill(KPROC *p)
     }
 }
 
+/*
+ * Том /name пропал (флешку вынули): у кого из программ текущая папка
+ * на нём - тех в корень, как и шелл ядра (vfs_forget_dev). Иначе
+ * шелл-программа так и показывала бы "/usb1>" несуществующего диска.
+ */
+void proc_forget_volume(const char *name)
+{
+    UINTN n = 0;
+
+    while (name[n])
+        n++;
+
+    for (UINTN i = 0; i < PROC_MAX; i++) {
+
+        KPROC *q = &g_procs[i];
+
+        if (!q->used)
+            continue;
+
+        BOOLEAN inside = (q->cwd[0] == '/');
+
+        for (UINTN k = 0; inside && k < n; k++)
+            if (q->cwd[1 + k] != name[k])
+                inside = FALSE;
+
+        if (inside && (q->cwd[1 + n] == '\0' || q->cwd[1 + n] == '/')) {
+            q->cwd[0] = '/';
+            q->cwd[1] = '\0';
+        }
+    }
+}
+
 /* Ctrl+C (из обработчика клавиатуры) */
 void proc_ctrl_c(void)
 {
@@ -898,30 +927,6 @@ void proc_ctrl_c(void)
         proc_kill(p);
     }
 }
-
-/* Строка, набранная в окне GUI, - программе на ввод */
-BOOLEAN proc_gui_input(KPROC *p, const char *line)
-{
-    if (p == NULL || p->exited)
-        return FALSE;
-
-    UINT64 fl = kx_irq_save();
-    UINTN n = 0;
-
-    for (; line[n] && n + 1 < PROC_IN_MAX - 1; n++)
-        p->inbuf[n] = line[n];
-
-    p->inbuf[n++] = '\n';
-    p->inlen = n;
-    p->inready = TRUE;
-
-    kx_irq_restore(fl);
-
-    sched_wake_all(p);
-
-    return TRUE;
-}
-
 
 /* ================================================================
  * Поиск программы и запуск из шелла

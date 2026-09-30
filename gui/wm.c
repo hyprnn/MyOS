@@ -410,7 +410,8 @@ static void draw_taskbar(void)
         BOOLEAN active = (w == g_focus) && !w->minimized;
 
         gfx_button(g, bx, y + 4, bw, TASK_H - 8, active);
-        gfx_icon(g, bx + 3, y + 5, w->cls ? w->cls->icon : gui_icon("app"), 1, FALSE);
+        gfx_icon(g, bx + 3, y + 5, w->cls ? w->cls->icon : w->icon ? w->icon : gui_icon("app"),
+                 1, FALSE);
         gfx_text_fit(g, bx + 22, y + 7, w->title, D_BLACK, 15);
 
         bx += bw + 4;
@@ -863,7 +864,7 @@ void wm_start(EFI_SYSTEM_TABLE *st)
 
     klog("wm: started, %ux%u\n", SCR_W, SCR_H);
 
-    /* первое окно - терминал, как в прошлом GUI */
+    /* первое окно - "О системе" (программа /bin/about, этап 10) */
     app_open_about();
 
     UINTN idle = 0;

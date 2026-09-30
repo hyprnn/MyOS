@@ -145,8 +145,8 @@ static void proc_out(KPROC *p, const char *s, UINTN n)
 {
     if (p->io == PROC_IO_GUI) {
 
-        /* окно GUI: копим строку, отдаём по '\n'; длинную -
-           переносим по последнему пробелу (окно узкое) */
+        /* графическая программа без терминала (часы, Блокнот...):
+           её редкие сообщения - строками в журнал ядра (COM1) */
         for (UINTN i = 0; i < n; i++) {
 
             char c = s[i];
@@ -154,40 +154,14 @@ static void proc_out(KPROC *p, const char *s, UINTN n)
             if (c == '\r')
                 continue;
 
-            if (c == '\n') {
+            if (c != '\n')
+                p->outline[p->outlen++] = c;
+
+            if (c == '\n' || p->outlen + 1 >= sizeof(p->outline)) {
                 p->outline[p->outlen] = '\0';
-                if (p->gui_line)
-                    p->gui_line(p->outline);
+                klog("%s: %s\n", p->name, p->outline);
                 p->outlen = 0;
-                continue;
             }
-
-            if (p->outlen >= GUI_TERM_LINE_LEN || p->outlen + 1 >= sizeof(p->outline)) {
-
-                UINTN cut = p->outlen;
-
-                for (UINTN k = p->outlen; k > p->outlen / 2; k--)
-                    if (p->outline[k - 1] == ' ') {
-                        cut = k;
-                        break;
-                    }
-
-                char rest[64];
-                UINTN rn = 0;
-
-                for (UINTN k = cut; k < p->outlen; k++)
-                    rest[rn++] = p->outline[k];
-
-                p->outline[cut] = '\0';
-                if (p->gui_line)
-                    p->gui_line(p->outline);
-
-                for (UINTN k = 0; k < rn; k++)
-                    p->outline[k] = rest[k];
-                p->outlen = rn;
-            }
-
-            p->outline[p->outlen++] = c;
         }
 
         return;
@@ -264,46 +238,6 @@ static INTN proc_read_console(KPROC *p, char *dst, UINTN n)
         dst[i] = line[i];
 
     return (INTN)len;
-}
-
-/* Строка из окна GUI (её кладёт proc_gui_input) */
-static INTN proc_read_gui(KPROC *p, char *dst, UINTN n)
-{
-    /* подсказка без '\n' ("Your guess: ") - показать сейчас, иначе
-       человек не увидит вопроса */
-    if (p->outlen > 0 && p->gui_line) {
-        p->outline[p->outlen] = '\0';
-        p->gui_line(p->outline);
-        p->outlen = 0;
-    }
-
-    UINT64 fl = kx_irq_save();
-
-    while (!p->inready && !p->killed)
-        sched_block(p, "keyboard (GUI)", 0);
-
-    if (p->killed) {
-        kx_irq_restore(fl);
-        return 0;
-    }
-
-    UINTN k = (p->inlen < n) ? p->inlen : n;
-
-    for (UINTN i = 0; i < k; i++)
-        dst[i] = p->inbuf[i];
-
-    /* остаток строки - на следующее чтение */
-    for (UINTN i = k; i < p->inlen; i++)
-        p->inbuf[i - k] = p->inbuf[i];
-
-    p->inlen -= k;
-
-    if (p->inlen == 0)
-        p->inready = FALSE;
-
-    kx_irq_restore(fl);
-
-    return (INTN)k;
 }
 
 static INTN fd_kernel(KPROC *p, INT64 fd)
@@ -432,7 +366,8 @@ static INTN rd_cb(void *ctx, const VFS_DIRENT *e)
     c->out->name[k] = '\0';
     c->out->size = e->node.size;
     c->out->is_dir = e->node.is_dir ? 1u : 0u;
-    c->out->pad = 0;
+    c->out->wdate = e->node.wdate;
+    c->out->wtime = e->node.wtime;
     c->found = TRUE;
 
     return 1;       /* дальше не нужно */
@@ -884,6 +819,11 @@ static INT64 sys_kcmd(KPROC *p, UINT64 uline, UINT64 upath, UINT32 flags)
     EFI_SYSTEM_TABLE st = *g_st;
     BOOLEAN to_file = (upath != 0);
 
+    /* Программу саму запустили с "> файл" (например, /bin/ls, которая
+       просит ядро "ls /"): вывод команды ядра - туда же, куда и её
+       собственный. Файл программы закроет proc_reap, не мы. */
+    BOOLEAN to_prog_file = (!to_file && p->out_kfd >= 0);
+
     /* шелл в окне-терминале: вывод команды - в это окно */
     if (p->io == PROC_IO_TTY)
         st.ConOut = tty_output(p->tty);
@@ -902,6 +842,15 @@ static INT64 sys_kcmd(KPROC *p, UINT64 uline, UINT64 upath, UINT32 flags)
         fo.o.ClearScreen = kcmd_file_nop;
         fo.kfd = kfd;
         st.ConOut = &fo.o;
+
+    } else if (to_prog_file) {
+
+        fo.o = *st.ConOut;
+        fo.o.OutputString = kcmd_file_string;
+        fo.o.SetAttribute = kcmd_file_nop_attr;
+        fo.o.ClearScreen = kcmd_file_nop;
+        fo.kfd = p->out_kfd;
+        st.ConOut = &fo.o;
     }
 
     CHAR16 line[LINE_MAX];
@@ -912,10 +861,12 @@ static INT64 sys_kcmd(KPROC *p, UINT64 uline, UINT64 upath, UINT32 flags)
 
     p->kcmd_probe = TRUE;
     p->kcmd_unknown = FALSE;
+    p->kcmd_kernel = (flags & MYOS_KCMD_KERNEL) != 0;
 
     run_command(&st, line);
 
     p->kcmd_probe = FALSE;
+    p->kcmd_kernel = FALSE;
 
     ksnprintf(p->cwd, sizeof(p->cwd), "%s", g_cwd);
 
@@ -975,7 +926,8 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
             if (p->io == PROC_IO_TTY && p->tty != NULL)
                 r = tty_read_line(p->tty, p, (char *)(UINTN)a2, (UINTN)a3);
             else
-                r = (p->io == PROC_IO_GUI) ? proc_read_gui(p, (char *)(UINTN)a2, (UINTN)a3)
+                /* у графической программы без терминала ввода нет */
+                r = (p->io == PROC_IO_GUI) ? 0
                                            : proc_read_console(p, (char *)(UINTN)a2, (UINTN)a3);
         } else {
             INTN kfd = fd_kernel(p, (INT64)a1);

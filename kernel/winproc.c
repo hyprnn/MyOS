@@ -86,6 +86,11 @@ INT64 win_sys_create(KPROC *p, UINT64 uw, UINT64 uh, UINT64 utitle)
     win->buf_pages = pages;
     win->proc = p;
 
+    /* значок на панели задач - по имени программы ("notepad", "mines",
+       "clock"...): Блокнот и Сапёр стали программами (этап 10, Д4), а
+       выглядеть на панели должны как раньше */
+    win->icon = gui_icon(p->name);
+
     for (UINTN i = 0; i < (UINTN)w * (UINTN)h; i++)
         win->buf[i] = 0x000000u;
 

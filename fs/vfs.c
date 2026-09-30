@@ -388,6 +388,9 @@ void vfs_forget_dev(UINTN dev)
             g_cwd[1] = '\0';
         }
 
+        /* и у программ (шелл-программа, этап 10) */
+        proc_forget_volume(m->name);
+
         exfat_release(m);
         m->used = FALSE;
         m->gone = TRUE;

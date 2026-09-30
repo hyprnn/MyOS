@@ -201,7 +201,7 @@ typedef struct {
  * ExitBootServices (а команда "xhci" тестируется именно
  * до этого), прошивка (OVMF) сама всё ещё жива и может
  * (если у неё есть встроенный UsbMouseDxe - см. коммент
- * про EFI_SIMPLE_POINTER_PROTOCOL в gui_start) в фоне,
+ * про EFI_SIMPLE_POINTER_PROTOCOL в первом GUI) в фоне,
  * по таймеру/прерыванию, периодически опрашивать этот же
  * самый xHCI-контроллер (читать те же PORTSC/Event Ring),
  * чтобы поставлять данные в EFI_SIMPLE_POINTER_PROTOCOL.
@@ -230,7 +230,7 @@ typedef struct {
  * Локальные typedef'ы для приведения голых VOID* из
  * EFI_BOOT_SERVICES (см. пояснение про это в efi.h) -
  * объявлены прямо тут, а не переиспользуют одноимённые
- * GUI_*, потому что те определены значительно ниже по
+ * EFI_BS_*, потому что те определены значительно ниже по
  * файлу (после этой функции), а typedef должен быть виден
  * до использования.
  */
@@ -258,119 +258,38 @@ typedef EFI_STATUS (EFIAPI *XHCI_FREE_POOL)(VOID *Buffer);
 
 
 /* ============================================================
- * Графическая оболочка ("start")
- *
- *   - рабочий стол с иконками (About / Fetch / Help / Exit),
- *   - панель задач внизу экрана с живыми часами,
- *   - клик по иконке открывает своё окно с текстом,
- *   - у окна есть кнопка закрытия "X",
- *   - курсор двигается стрелками (без мыши),
- *   - Enter работает как клик левой кнопкой мыши,
- *   - Esc закрывает открытое окно, а если окон нет —
- *     выходит из GUI обратно в консоль.
- *
- * Текст рисуется собственным простым битмап-шрифтом
- * 5x7 (см. таблицу gui_font ниже) — никаких внешних
- * зависимостей, просто прямая запись пикселей в
- * framebuffer GOP. Никакого оконного менеджера, никаких
- * слоёв, полный перерисов каждого кадра.
+ * Курсор и мышь
+ * (Первый GUI - gui/gui.c с шрифтом 5x7 и перерисовкой всего кадра -
+ * удалён на этапе 10 (Д5); рабочий стол - gui/wm.c, этап 7.)
  * ============================================================ */
 
-#define GUI_CURSOR_SIZE   12
-#define GUI_CURSOR_STEP   12
+#define GUI_CURSOR_SIZE   12     /* курсор-квадрат `mousetest` (gui/fb.c) */
 
 /* Чувствительность мыши: условных "пикселей на мм" движения.
    Подбиралось на глаз - если курсор летает слишком быстро/
    медленно на конкретном устройстве, поправить это число. */
 #define GUI_MOUSE_PIXELS_PER_MM 8
 
-#define GUI_TASKBAR_H     22
-#define GUI_MENU_H        14
-
-/* Пункты меню "Start" теперь рисуются не как значки
-   на столе, а как строки выпадающего списка. */
-#define GUI_ICON_W        110  /* ширина пункта меню */
-#define GUI_ICON_H         18  /* высота пункта меню */
-#define GUI_ICON_GAP        0
-#define GUI_ICON_COUNT      8
-
-#define GUI_ACT_ABOUT        0
-#define GUI_ACT_FETCH        1
-#define GUI_ACT_HELP         2
-#define GUI_ACT_NOTEPAD      3
-#define GUI_ACT_TERMINAL     4
-#define GUI_ACT_EXPLORER     5
-#define GUI_ACT_MINESWEEPER  6
-#define GUI_ACT_EXIT         7
-
-/* Не пункт меню Start, а отдельное "окно" контента:
-   открывается кликом по файлу в Проводнике. Держим его
-   после всех пунктов меню, чтобы не путать с иконками. */
-#define GUI_ACT_FILEVIEW  8
-#define GUI_ACT_PROGRAM   100   /* ярлык программы из /bin */
-
-/* ============================================================
- * Сапёр (Minesweeper)
- *
- * Поле фиксированного размера 9x9 с 10 минами (уровень
- * "новичок" классического сапёра) - этого достаточно на
- * любом разумном разрешении экрана, а размер клетки под
- * конкретное окно подбирается динамически в
- * gui_ms_compute_layout(), см. ниже.
- *
- * Управление - в стиле всего остального интерфейса (без
- * мыши): стрелки двигают общий курсор, Enter открывает
- * клетку под курсором (или жмёт улыбающийся смайлик/клетку
- * меню), а клавиша F ставит/снимает флажок на клетке под
- * курсором.
- * ============================================================ */
-#define GUI_MS_COLS    9
-#define GUI_MS_ROWS    9
-#define GUI_MS_MINES   10
-
-/* "Проводник": сколько строк файлов максимум показываем
-   в окне (плюс заголовок и, если файлов больше, строка
-   "... и ещё N"). */
-#define GUI_EXPLORER_MAX_ROWS   22
-#define GUI_EXPLORER_LINE_LEN   48
-
-/* Окно "просмотра файла", открываемое кликом по строке
-   в Проводнике: показывает содержимое файла построчно. */
-#define GUI_FILEVIEW_MAX_ROWS   22
-#define GUI_FILEVIEW_LINE_LEN   60
-
-/* Терминал внутри GUI: своё окно с чёрным viewport'ом
-   и живым вводом, а не выход из GUI в текстовый режим -
-   как отдельное приложение (наподобие kitty), а не
-   отдельный режим ОС. */
-#define GUI_TERM_MAX_LINES   40
-#define GUI_TERM_LINE_LEN    46
-
 /*
- * В efi.h AllocatePool/FreePool объявлены как
- * VOID* (см. заглушки в EFI_BOOT_SERVICES), поэтому
- * приводим их к нормальным сигнатурам сами —
- * это нужно для двойной буферизации кадра (фикс
- * мерцания при перерисовке).
+ * Сигнатуры функций Boot Services для загрузчика (loader/loader.c):
+ * в efi.h AllocatePages/AllocatePool/FreePool/GetMemoryMap/
+ * ExitBootServices объявлены голыми VOID* (см. заглушки в
+ * EFI_BOOT_SERVICES) - приводим их к настоящим сигнатурам сами.
+ * MemoryMap - VOID*: записи карты разбирает сам загрузчик.
  */
-typedef EFI_STATUS (EFIAPI *GUI_ALLOCATE_POOL)(
+typedef EFI_STATUS (EFIAPI *EFI_BS_ALLOCATE_PAGES)(
+    UINTN Type, UINTN MemoryType, UINTN Pages, UINT64 *Memory
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_BS_ALLOCATE_POOL)(
     UINTN PoolType, UINTN Size, VOID **Buffer
 );
 
-typedef EFI_STATUS (EFIAPI *GUI_FREE_POOL)(
+typedef EFI_STATUS (EFIAPI *EFI_BS_FREE_POOL)(
     VOID *Buffer
 );
 
-#define GUI_EFI_BOOT_SERVICES_DATA 4
-
-/*
- * Аналогично приводим GetMemoryMap/ExitBootServices - в efi.h
- * это тоже голые VOID* (см. заглушки в EFI_BOOT_SERVICES).
- * MemoryMap оставляем как VOID*: для самого ExitBootServices
- * важен только корректный MapKey, разбирать записи карты
- * памяти по дескрипторам этому шагу пока не нужно.
- */
-typedef EFI_STATUS (EFIAPI *GUI_GET_MEMORY_MAP)(
+typedef EFI_STATUS (EFIAPI *EFI_BS_GET_MEMORY_MAP)(
     UINTN *MemoryMapSize,
     VOID *MemoryMap,
     UINTN *MapKey,
@@ -378,96 +297,10 @@ typedef EFI_STATUS (EFIAPI *GUI_GET_MEMORY_MAP)(
     UINT32 *DescriptorVersion
 );
 
-typedef EFI_STATUS (EFIAPI *GUI_EXIT_BOOT_SERVICES)(
+typedef EFI_STATUS (EFIAPI *EFI_BS_EXIT_BOOT_SERVICES)(
     EFI_HANDLE ImageHandle,
     UINTN MapKey
 );
-
-/*
- * AllocatePages - тоже голый VOID* в efi.h. Нужна отдельно от
- * AllocatePool: буферы xHCI (Device Context Base Address Array,
- * Command Ring) обязаны лежать на 64-байтной границе (спека
- * xHCI), а AllocatePool такого не гарантирует. AllocatePages
- * всегда отдаёт память, выровненную по границе страницы (4 КиБ) -
- * с большим запасом достаточно.
- */
-typedef EFI_STATUS (EFIAPI *GUI_ALLOCATE_PAGES)(
-    UINTN Type,
-    UINTN MemoryType,
-    UINTN Pages,
-    UINT64 *Memory
-);
-
-#define GUI_ALLOCATE_ANY_PAGES 0
-
-
-/* Автоматически сгенерированный компактный битмап-шрифт 5x7. */
-typedef struct { char ch; UINT8 rows[7]; } GUI_GLYPH;
-
-#define GUI_FONT_COUNT (sizeof(gui_font) / sizeof(gui_font[0]))
-
-
-typedef struct {
-    INTN x, y;
-    UINTN w, h;
-    const char *label;
-    UINT8 action;
-} GUI_ICON;
-
-
-typedef struct {
-    const char *title;
-    const char **lines;
-    UINTN line_count;
-} GUI_WINDOW_CONTENT;
-
-
-/*
- * Состояние поля Сапёра. Живёт локально в gui_start()
- * (как и term_lines/explorer_buf), сюда только объявление
- * типа - конкретный экземпляр создаётся в gui_start().
- */
-typedef struct {
-    UINT8 mine[GUI_MS_ROWS][GUI_MS_COLS];
-    UINT8 adj[GUI_MS_ROWS][GUI_MS_COLS];
-    UINT8 revealed[GUI_MS_ROWS][GUI_MS_COLS];
-    UINT8 flagged[GUI_MS_ROWS][GUI_MS_COLS];
-
-    BOOLEAN generated;  /* мины расставлены? (лениво, после 1-го клика) */
-    BOOLEAN over;       /* игра закончена (выигрыш или проигрыш)       */
-    BOOLEAN won;
-
-    UINTN flags_used;
-    UINTN revealed_count;
-    UINTN timer;
-
-    INTN boom_r, boom_c; /* какая мина взорвалась (для красной клетки) */
-} GUI_MS_STATE;
-
-
-/*
- * Геометрия окна Сапёра, пересчитывается заново на каждый
- * кадр из общего win_x/win_y/win_w/win_h (то же самое окно,
- * что и у всех остальных программ) - один источник истины
- * для отрисовки И для определения клика по клетке/смайлику.
- */
-typedef struct {
-    INTN  field_x, field_y;
-    UINTN field_w, field_h;
-
-    INTN  head_x, head_y;
-    UINTN head_w, head_h;
-
-    INTN  grid_x, grid_y;
-    UINTN cell;
-
-    INTN  smile_x, smile_y;
-    UINTN smile_size;
-
-    INTN  led1_x, led1_y;
-    INTN  led2_x, led2_y;
-    UINTN led_w, led_h;
-} GUI_MS_LAYOUT;
 
 
 
@@ -1089,7 +922,8 @@ typedef struct VFS_MOUNT {
 
 /* Куда программа пишет и откуда читает (fd 0, 1, 2) */
 #define PROC_IO_CONSOLE 0      /* текстовая консоль шелла */
-#define PROC_IO_GUI     1      /* окно терминала GUI */
+#define PROC_IO_GUI     1      /* программа с окном без терминала: вывод -
+                                  строками в журнал ядра, ввода нет */
 #define PROC_IO_TTY     2      /* окно-терминал рабочего стола (gui/tty.c) */
 
 /* Терминал рабочего стола (gui/tty.c, этап 10) */
@@ -1120,14 +954,9 @@ typedef struct KPROC {
     UINT64           syscalls;
 
     UINT32           io;                  /* PROC_IO_* */
-    /* вывод в окно GUI - строками */
-    void           (*gui_line)(const char *line);
-    char             outline[64];
+    /* PROC_IO_GUI: вывод копится строкой, строка - в журнал ядра */
+    char             outline[128];
     UINTN            outlen;
-    /* ввод из окна GUI: строка, которую набрали в терминале */
-    char             inbuf[PROC_IN_MAX];
-    volatile UINTN   inlen;
-    volatile BOOLEAN inready;
 
     /* этап 10: программы запускает шелл-программа (/bin/sh) */
     struct KPROC    *parent;              /* кто запустил (ждёт через SYS_WAIT) */
@@ -1138,6 +967,8 @@ typedef struct KPROC {
     BOOLEAN          was_fg;              /* её запустили на переднем плане */
     BOOLEAN          kcmd_probe;          /* SYS_KCMD: неизвестная команда - */
     BOOLEAN          kcmd_unknown;        /*   не печатать, а сказать шеллу */
+    BOOLEAN          kcmd_kernel;         /* MYOS_KCMD_KERNEL: не отдавать команду
+                                             программе из /bin (см. kcmd_is_program) */
     KTTY            *tty;                 /* PROC_IO_TTY: окно-терминал */
 } KPROC;
 
@@ -1744,9 +1575,6 @@ extern UINTN g_scrollback_line_len;
 extern int g_scrollback_view;
 extern BOOLEAN g_scrollback_replaying;
 extern UINT64 g_tsc_hz;
-extern const GUI_GLYPH gui_font[];
-extern UINT32 g_ms_rng;
-extern BOOLEAN g_gui_draw_cursor;
 extern EFI_SYSTEM_TABLE *g_st;
 extern volatile UINT32 *g_kfb;
 extern UINT32 g_kfb_w;
@@ -2041,7 +1869,7 @@ void cmd_history(
     EFI_SYSTEM_TABLE *st
 );
 
-/* --- gui/draw.c --- */
+/* --- gui/fb.c: рисование прямо в видеопамять (консоль, паника) --- */
 UINT32 gui_pack(
     EFI_GRAPHICS_PIXEL_FORMAT fmt,
     UINT8 r, UINT8 g, UINT8 b
@@ -2055,243 +1883,13 @@ void gui_fill_rect(
     UINTN w, UINTN h,
     UINT32 color
 );
-void gui_draw_border(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    INTN x, INTN y,
-    UINTN w, UINTN h,
-    UINT32 color
-);
-void gui_draw_bevel(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    INTN x, INTN y,
-    UINTN w, UINTN h,
-    UINT32 c_hi,      
-    UINT32 c_light,   
-    UINT32 c_shadow,  
-    UINT32 c_dark,    
-    BOOLEAN raised
-);
-const GUI_GLYPH *gui_find_glyph(char c);
-UINTN gui_draw_char(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    INTN x, INTN y,
-    UINTN scale,
-    UINT32 color,
-    char c
-);
-UINTN gui_draw_text(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    INTN x, INTN y,
-    UINTN scale,
-    UINT32 color,
-    const char *s
-);
-UINTN gui_text_width(const char *s, UINTN scale);
-UINTN gui_uint_to_str(UINT64 v, char *buf);
-UINTN gui_hex_to_str(UINT64 v, UINTN digits, char *buf);
-UINTN gui_uint2_to_str(UINT32 v, char *buf);
-BOOLEAN gui_point_in_rect(
-    INTN px, INTN py,
-    INTN x, INTN y, UINTN w, UINTN h
-);
-UINT32 gui_ms_rand(void);
-
-/* --- gui/minesweeper.c --- */
-void gui_ms_seed(EFI_SYSTEM_TABLE *st);
-void gui_ms_reset(GUI_MS_STATE *ms);
-void gui_ms_generate(
-    GUI_MS_STATE *ms, int safe_r, int safe_c
-);
-void gui_ms_reveal(GUI_MS_STATE *ms, int start_r, int start_c);
-void gui_ms_toggle_flag(GUI_MS_STATE *ms, int r, int c);
-void gui_ms_compute_layout(
-    INTN win_x, INTN win_y, UINTN win_w, UINTN win_h,
-    GUI_MS_LAYOUT *L
-);
-UINT32 gui_ms_number_color(
-    EFI_GRAPHICS_PIXEL_FORMAT fmt, UINT8 n
-);
-void gui_draw_icon_mine(
-    volatile UINT32 *fb,
-    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
-    INTN x, INTN y,
-    UINT32 body, UINT32 hi
-);
-void gui_draw_icon_flag(
-    volatile UINT32 *fb,
-    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
-    INTN x, INTN y,
-    UINT32 pole, UINT32 flag, UINT32 base
-);
-void gui_draw_face(
-    volatile UINT32 *fb,
-    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
-    EFI_GRAPHICS_PIXEL_FORMAT fmt,
-    INTN x, INTN y, int mode
-);
-
-/* --- gui/desktop.c --- */
 void gui_draw_cursor_at(
     volatile UINT32 *fb,
     UINT32 stride, UINT32 fb_w, UINT32 fb_h,
     EFI_GRAPHICS_PIXEL_FORMAT fmt,
     INTN x, INTN y
 );
-void gui_present_cursor(
-    volatile UINT32 *fb, volatile UINT32 *back,
-    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
-    EFI_GRAPHICS_PIXEL_FORMAT fmt,
-    INTN ox, INTN oy, INTN nx, INTN ny
-);
-UINTN gui_present_frame(
-    volatile UINT32 *fb, volatile UINT32 *back, UINT32 *shadow,
-    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
-    EFI_GRAPHICS_PIXEL_FORMAT fmt,
-    INTN cx, INTN cy, BOOLEAN full
-);
-void gui_blit_rect(
-    volatile UINT32 *dst,
-    volatile UINT32 *src,
-    UINT32 stride, UINT32 fb_w, UINT32 fb_h,
-    INTN x, INTN y, UINTN w, UINTN h
-);
-void gui_draw_desktop(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    EFI_GRAPHICS_PIXEL_FORMAT fmt,
-    const GUI_ICON *icons,
-    UINTN icon_count,
-    BOOLEAN menu_open,
-    INTN btn_x, INTN btn_y, UINTN btn_w, UINTN btn_h,
-    INTN cur_x, INTN cur_y,
-    const char *clock_text,
-    INTN shortcut_sel
-);
-void gui_draw_window(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    EFI_GRAPHICS_PIXEL_FORMAT fmt,
-    INTN win_x, INTN win_y,
-    UINTN win_w, UINTN win_h,
-    INTN btn_x, INTN btn_y,
-    UINTN btn_size,
-    const GUI_WINDOW_CONTENT *content,
-    INTN cur_x, INTN cur_y
-);
-int gui_streq(const char *a, const char *b);
 
-/* --- gui/gstring.c --- */
-void gui_term_push(
-    char lines[][GUI_TERM_LINE_LEN + 1],
-    UINTN *count,
-    const char *text
-);
-int gui_starts_with(const char *s, const char *prefix);
-UINTN gui_take_word(const char *s, char *out, UINTN max);
-void gui_char_to_char16(
-    const char *src,
-    CHAR16 *dst,
-    UINTN max
-);
-UINTN gui_char16_to_char(
-    const CHAR16 *src,
-    char *dst,
-    UINTN max
-);
-void gui_str_copy8(
-    char *dst,
-    const char *src,
-    UINTN max
-);
-
-/* --- gui/terminal.c --- */
-/* Долгая команда терминала GUI (SLEEP, SPIN) выполняется в своём
-   потоке, а GUI тем временем живёт: часы идут, мышь двигается
-   (этап 4, gui/terminal.c) */
-typedef enum {
-    GUI_JOB_NONE = 0,
-    GUI_JOB_SLEEP,
-    GUI_JOB_SPIN,
-    GUI_JOB_PROC         /* программа из /bin в ring 3 (этап 6) */
-} GUI_JOB_KIND;
-
-typedef struct {
-    volatile BOOLEAN running;    /* поток задания ещё работает */
-    volatile BOOLEAN cancel;     /* попросили остановиться (выход из GUI) */
-    volatile UINT32  version;    /* +1 на каждую новую строку от задания:
-                                    GUI знает, что пора перерисовать */
-    GUI_JOB_KIND     kind;
-    UINT64           arg;        /* секунды */
-    char             name[GUI_TERM_LINE_LEN + 1];   /* "SLEEP 10" */
-    char           (*lines)[GUI_TERM_LINE_LEN + 1]; /* куда писать */
-    UINTN           *count;
-    UINT64           started_ms;
-    KTHREAD         *thread;
-    UINT32           tid;
-    /* GUI_JOB_PROC */
-    char             path[VFS_PATH_MAX];
-    char             args[GUI_TERM_LINE_LEN + 1];
-    KPROC *volatile  proc;
-} GUI_TERM_JOB;
-
-extern GUI_TERM_JOB g_term_job;
-extern KMUTEX g_term_mutex;
-void gui_term_job_stop(void);
-void gui_term_clear(UINTN *count);
-
-BOOLEAN gui_term_exec(
-    EFI_SYSTEM_TABLE *st,
-    const char *cmd,
-    char lines[][GUI_TERM_LINE_LEN + 1],
-    UINTN *count
-);
-void gui_draw_terminal(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    EFI_GRAPHICS_PIXEL_FORMAT fmt,
-    INTN win_x, INTN win_y,
-    UINTN win_w, UINTN win_h,
-    INTN btn_x, INTN btn_y,
-    UINTN btn_size,
-    const char lines[][GUI_TERM_LINE_LEN + 1],
-    UINTN line_count,
-    const char *input,
-    const char *clock_text,
-    const char *status
-);
-void gui_draw_minesweeper(
-    volatile UINT32 *fb,
-    UINT32 stride,
-    UINT32 fb_w,
-    UINT32 fb_h,
-    EFI_GRAPHICS_PIXEL_FORMAT fmt,
-    INTN win_x, INTN win_y,
-    UINTN win_w, UINTN win_h,
-    INTN btn_x, INTN btn_y,
-    UINTN btn_size,
-    const GUI_MS_STATE *ms,
-    INTN cur_x, INTN cur_y
-);
-
-/* --- gui/minesweeper_draw.c --- */
 /* ================================================================
  * Оконная система (этап 7): gui/gfx.c, gui/wm.c, gui/apps.c
  * ================================================================ */
@@ -2362,6 +1960,7 @@ typedef struct WIN {
     void           *state;                   /* данные родного окна */
 
     struct KPROC   *proc;                    /* окно программы (иначе NULL) */
+    const char *const *icon;                 /* значок окна программы (по её имени) */
     /* очередь событий окна программы */
     struct myos_event evq[32];
     volatile UINTN  ev_head, ev_tail;
@@ -2406,55 +2005,6 @@ INT64 win_sys_event(struct KPROC *p, UINT64 id, UINT64 uevent, UINT64 wait_ms);
 INT64 win_sys_close(struct KPROC *p, UINT64 id);
 INT64 win_sys_title(struct KPROC *p, UINT64 id, UINT64 utitle);
 void win_proc_cleanup(struct KPROC *p);
-
-/* Ярлыки рабочего стола (gui/shortcuts.c) */
-typedef struct {
-    const char        *label;
-    const char *const *icon;        /* 16 строк по 16 букв-цветов */
-    UINTN              action;      /* GUI_ACT_* */
-    const char        *program;     /* для GUI_ACT_PROGRAM: имя в /bin */
-} GUI_SHORTCUT;
-
-UINTN gui_shortcut_count(void);
-const GUI_SHORTCUT *gui_shortcut(UINTN i);
-INTN gui_shortcut_at(INTN x, INTN y);
-void gui_draw_shortcuts(volatile UINT32 *fb, UINT32 stride, UINT32 fb_w, UINT32 fb_h,
-                        EFI_GRAPHICS_PIXEL_FORMAT fmt, INTN selected);
-void gui_term_run_program(EFI_SYSTEM_TABLE *st, const char *cmdline,
-                          char lines[][GUI_TERM_LINE_LEN + 1], UINTN *count);
-void gui_term_program_input(const char *line, char lines[][GUI_TERM_LINE_LEN + 1],
-                            UINTN *count);
-
-/* Проводник (gui/explorer.c): папка VFS -> строки окна */
-typedef struct {
-    char   path[VFS_PATH_MAX];                     /* какая папка открыта */
-    char   buf[GUI_EXPLORER_MAX_ROWS + 1][GUI_EXPLORER_LINE_LEN];
-    char   names[GUI_EXPLORER_MAX_ROWS + 1][VFS_NAME_MAX];   /* настоящие имена */
-    INT8   kind[GUI_EXPLORER_MAX_ROWS + 1];        /* 0 - файл, 1 - папка,
-                                                      2 - "..", -1 - просто текст */
-    UINTN  count;
-} GUI_EXPLORER;
-
-UINTN gui_explorer_fill(GUI_EXPLORER *ex, const char **lines);
-BOOLEAN gui_explorer_click(GUI_EXPLORER *ex, UINTN row, char *file_path, UINTN cap);
-UINTN gui_open_fileview_path(const char *path, char fileview_buf[][GUI_FILEVIEW_LINE_LEN],
-                             const char **fileview_lines, char *title_buf, UINTN title_cap);
-UINTN gui_open_fileview(
-    int idx,
-    char fileview_buf[][GUI_FILEVIEW_LINE_LEN],
-    const char **fileview_lines,
-    char *title_buf
-);
-
-/* --- gui/gui.c --- */
-INTN gui_hover_key(
-    BOOLEAN in_minesweeper,
-    BOOLEAN menu_open_on_desktop,
-    GUI_ICON *icons,
-    INTN win_x, INTN win_y, UINTN win_w, UINTN win_h,
-    INTN cur_x, INTN cur_y
-);
-void gui_start(EFI_SYSTEM_TABLE *st);
 
 /* --- drivers/hid.c --- */
 UINT32 hid_extract_bits(
@@ -2703,7 +2253,7 @@ void proc_check_kill(void);
 void proc_exit_current(INT64 code) __attribute__((noreturn));
 void proc_kill(KPROC *p);
 void proc_ctrl_c(void);
-BOOLEAN proc_gui_input(KPROC *p, const char *line);
+void proc_forget_volume(const char *name);
 BOOLEAN proc_find_program(const char *name, char *path, UINTN cap);
 INT64 kx_syscall_dispatch(UINT64 *frame);
 void kx_user_fault(KX_ISR_FRAME *f);
@@ -2712,7 +2262,6 @@ BOOLEAN proc_shell_try(EFI_SYSTEM_TABLE *st, const CHAR16 *line);
 BOOLEAN uptr_ok(KPROC *p, UINT64 addr, UINT64 len, BOOLEAN write);
 BOOLEAN proc_map_heap_page(KPROC *p, UINT64 va);
 extern const char *g_proc_last_error;
-extern void (*g_proc_gui_sink)(const char *line);
 
 /* --- fs/binfs.c --- */
 extern const VFS_OPS g_bin_ops;
