@@ -501,7 +501,7 @@ void kmain_stage2(void)
     print(out, "\nMyOS is running on its own kernel - no firmware underneath.\n");
     set_color(out, 0x07);
     print(out, "Type 'help' for the list of commands, or 'fetch' for a system summary.\n");
-    print(out, "New: disks and folders - ls /, cd /usb0p1, mkdir, cat, write, cp, df, disk.\n\n");
+    print(out, "New: sound (play song.mp3, volume, sound test), DOOM and a Frutiger Aero desktop - type 'start'.\n\n");
 
     /* --- шелл - программа /bin/sh (этап 10); ядро присматривает за
        ним, а если его нет или он падает - аварийный шелл ядра --- */

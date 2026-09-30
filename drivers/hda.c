@@ -940,6 +940,26 @@ void hda_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
     pci_enable_device(b, d, f);
 
+    /* прошивка могла оставить контроллер "спать" (D3): режим питания
+       PCI - в D0 (регистр PMCSR ёмкости Power Management, биты 1:0) */
+    UINT8 pm = pci_find_cap(b, d, f, 0x01);
+
+    if (pm != 0) {
+        UINT32 pmcsr = pci_config_read32(b, d, f, pm + 4u);
+        if (pmcsr & 3u) {
+            pci_config_write32(b, d, f, pm + 4u, pmcsr & ~3u);
+            sched_sleep_ms(10);          /* выход из D3 - до 10 мс */
+        }
+    }
+
+    /* Intel: TCSEL (0x44, биты 2:0) = 0 - как делает Linux для всех
+       контроллеров Intel HDA: иначе у части кодеков в звуке треск */
+    if ((id & 0xFFFFu) == 0x8086u) {
+        UINT32 tc = pci_config_read32(b, d, f, 0x44);
+        if (tc & 7u)
+            pci_config_write32(b, d, f, 0x44, tc & ~7u);
+    }
+
     UINT64 bar = pci_read_bar_address(b, d, f, 0x10);
 
     if (bar == 0) {

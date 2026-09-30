@@ -199,7 +199,9 @@ sudo tools/install-arch.sh --menu
    `/boot/efi`.
 2. Проверяет: запущен от root; файлы есть; `BOOTX64.EFI` — правда
    загрузчик MyOS (а не чужой, например от Ventoy); места хватает.
-3. Копирует два файла в `<раздел EFI>/EFI/MyOS/`.
+3. Копирует два файла в `<раздел EFI>/EFI/MyOS/`; если места больше
+   8 МБ — ещё и бесплатный `DOOM1.WAD` (4 МБ, shareware DOOM: `doom`
+   найдёт его там сам).
 4. Пишет пункт меню `<раздел EFI>/loader/entries/myos.conf`:
    ```
    title   MyOS

@@ -183,11 +183,43 @@ void aero_outline(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, UINT32 col, UINT32
  * Размыть уже нарисованное в прямоугольнике - "матовое стекло" Vista:
  * сквозь заголовок видно, что позади, но не читается (текст окна позади
  * не мешает заголовку). Размытие "ящиком" радиуса r: сначала по строкам,
- * потом по столбцам, по два прохода (почти как гаусс).
+ * потом по столбцам, по два прохода (почти как гаусс). Скользящая сумма:
+ * на каждый пиксель - одно сложение и одно вычитание, как бы ни был
+ * велик радиус.
  */
+static void blur_line(UINT32 *p, UINTN step, INT32 n, INT32 r, UINT32 *tmp)
+{
+    for (INT32 i = 0; i < n; i++)
+        tmp[i] = p[(UINTN)i * step];
+
+    UINT32 sr = 0, sg = 0, sb = 0;
+    UINT32 cnt = (UINT32)(2 * r + 1);
+
+    /* окно [-r, r] вокруг 0 (края - повтор крайнего пикселя) */
+    for (INT32 k = -r; k <= r; k++) {
+        UINT32 c = tmp[k < 0 ? 0 : k >= n ? n - 1 : k];
+        sr += (c >> 16) & 0xFF;
+        sg += (c >> 8) & 0xFF;
+        sb += c & 0xFF;
+    }
+
+    for (INT32 i = 0; i < n; i++) {
+
+        p[(UINTN)i * step] = ((sr / cnt) << 16) | ((sg / cnt) << 8) | (sb / cnt);
+
+        /* сдвинуть окно: ушёл i-r, пришёл i+r+1 */
+        UINT32 out = tmp[i - r < 0 ? 0 : i - r];
+        UINT32 in = tmp[i + r + 1 >= n ? n - 1 : i + r + 1];
+
+        sr += ((in >> 16) & 0xFF) - ((out >> 16) & 0xFF);
+        sg += ((in >> 8) & 0xFF) - ((out >> 8) & 0xFF);
+        sb += (in & 0xFF) - (out & 0xFF);
+    }
+}
+
 void aero_blur(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, INT32 r)
 {
-    static UINT32 line[4096];
+    static UINT32 tmp[4096];
 
     /* только внутри отсечения */
     if (x < g->cx0) { w -= g->cx0 - x; x = g->cx0; }
@@ -197,50 +229,13 @@ void aero_blur(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, INT32 r)
     if (w <= 2 || h <= 2 || w > 4096 || h > 4096)
         return;
 
+    UINT32 *base = &g->px[(UINTN)y * g->stride + (UINTN)x];
+
     for (int pass = 0; pass < 2; pass++) {
-
-        /* по строкам */
-        for (INT32 j = 0; j < h; j++) {
-
-            UINT32 *row = &g->px[(UINTN)(y + j) * g->stride + (UINTN)x];
-
-            for (INT32 i = 0; i < w; i++)
-                line[i] = row[i];
-
-            for (INT32 i = 0; i < w; i++) {
-                UINT32 sr = 0, sg = 0, sb = 0, n = 0;
-                for (INT32 k = i - r; k <= i + r; k++) {
-                    INT32 kk = k < 0 ? 0 : k >= w ? w - 1 : k;
-                    UINT32 c = line[kk];
-                    sr += (c >> 16) & 0xFF;
-                    sg += (c >> 8) & 0xFF;
-                    sb += c & 0xFF;
-                    n++;
-                }
-                row[i] = ((sr / n) << 16) | ((sg / n) << 8) | (sb / n);
-            }
-        }
-
-        /* по столбцам */
-        for (INT32 i = 0; i < w; i++) {
-
-            for (INT32 j = 0; j < h; j++)
-                line[j] = g->px[(UINTN)(y + j) * g->stride + (UINTN)(x + i)];
-
-            for (INT32 j = 0; j < h; j++) {
-                UINT32 sr = 0, sg = 0, sb = 0, n = 0;
-                for (INT32 k = j - r; k <= j + r; k++) {
-                    INT32 kk = k < 0 ? 0 : k >= h ? h - 1 : k;
-                    UINT32 c = line[kk];
-                    sr += (c >> 16) & 0xFF;
-                    sg += (c >> 8) & 0xFF;
-                    sb += c & 0xFF;
-                    n++;
-                }
-                g->px[(UINTN)(y + j) * g->stride + (UINTN)(x + i)] =
-                    ((sr / n) << 16) | ((sg / n) << 8) | (sb / n);
-            }
-        }
+        for (INT32 j = 0; j < h; j++)
+            blur_line(base + (UINTN)j * g->stride, 1, w, r, tmp);
+        for (INT32 i = 0; i < w; i++)
+            blur_line(base + i, g->stride, h, r, tmp);
     }
 }
 

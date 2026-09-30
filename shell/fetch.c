@@ -545,6 +545,17 @@ void cmd_fetch(
         kprintf(out, "     : %s\n", net);
     }
 
+    /* --------------------------------------------------------
+     * Sound (этап 10)
+     * -------------------------------------------------------- */
+
+    if (g_hda.ok) {
+        print_label(out, "Sound");
+        kprintf(out, "       : Intel HD Audio, codec %04x:%04x, volume %u%%%s\n",
+                g_hda.codec_vendor >> 16, g_hda.codec_vendor & 0xFFFFu, g_hda.volume,
+                g_hda.muted ? " (muted)" : "");
+    }
+
 
     /* --------------------------------------------------------
      * Current date/time

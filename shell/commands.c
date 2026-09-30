@@ -391,6 +391,8 @@ void run_command(
             "  edit <file>   - type text into a file, end with '.'\n"
             "  guess         - guess-the-number game\n"
             "  primes [N]    - count prime numbers (a long job)\n"
+            "  play <file>   - play a .wav or .mp3 file (play -t 440: a tone)\n"
+            "  doom          - DOOM (1993) with sound, in a desktop window\n"
             "  crash [how]   - a program that breaks on purpose (null, write,\n"
             "                  kernel, cli, div, stack, loop); Ctrl+C stops a program\n"
         );

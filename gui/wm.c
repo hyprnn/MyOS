@@ -611,6 +611,41 @@ static void draw_taskbar(void)
     gfx_text(g, (INT32)SCR_W - 84, y + 7, lang, D_WHITE);
 }
 
+/* "Отпечаток" того, что показывает панель задач справа: сменился -
+   панель надо перерисовать */
+static UINT64 taskbar_signature(void)
+{
+    UINT64 h = 1469598103934665603ull;
+    char buf[48];
+    EFI_TIME t;
+
+#define SIG_MIX(v) (h = (h ^ (UINT64)(v)) * 1099511628211ull)
+
+    if (rtc_read(&t)) {
+        SIG_MIX(t.Hour);
+        SIG_MIX(t.Minute);
+    }
+
+    SIG_MIX(g_hda.volume);
+    SIG_MIX(g_hda.muted);
+    SIG_MIX(g_kbd_layout);
+
+    net_gui_indicator(buf, sizeof(buf));
+    for (const char *c = buf; *c; c++)
+        SIG_MIX(*c);
+
+    BOOLEAN ch = FALSE;
+    if (acpi_battery_brief(buf, sizeof(buf), &ch)) {
+        for (const char *c = buf; *c; c++)
+            SIG_MIX(*c);
+        SIG_MIX(ch);
+    }
+
+#undef SIG_MIX
+
+    return h;
+}
+
 static void draw_start_menu(void)
 {
     GFX *g = &g_screen;
@@ -919,6 +954,10 @@ static void on_mouse_move(void)
         return;
     }
 
+    /* открыто меню "Пуск" - подсветка пункта под мышью */
+    if (g_menu_open)
+        g_dirty = TRUE;
+
     /* движение над содержимым активного окна */
     WIN *w = win_top_at(g_mx, g_my);
     INT32 cx, cy;
@@ -1119,7 +1158,18 @@ void wm_start(EFI_SYSTEM_TABLE *st)
             for (UINTN i = 0; i < WM_MAX_WINDOWS; i++)
                 if (g_windows[i].used && g_windows[i].cls && g_windows[i].cls->tick)
                     g_windows[i].cls->tick(&g_windows[i]);
-            g_dirty = TRUE;        /* обновить часы на панели задач */
+
+            /* панель задач: перерисовать, только если на ней что-то
+               поменялось (минута, звук, сеть, батарея, раскладка) -
+               весь кадр со стеклом и тенями 10 раз в секунду "впустую"
+               жёг процессор (и батарею ноутбука) */
+            static UINT64 last_sig = 0;
+            UINT64 sig = taskbar_signature();
+
+            if (sig != last_sig) {
+                last_sig = sig;
+                g_dirty = TRUE;
+            }
         }
 
         if (g_dirty) {
