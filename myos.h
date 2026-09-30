@@ -1952,6 +1952,17 @@ INTN font_index(UINT32 cp);
 UINT32 font_alpha(INTN idx, UINT32 x, UINT32 y);
 const char *const *gui_icon(const char *name);
 
+/* Стиль Frutiger Aero (gui/aero.c, этап 10): стекло, глянец, обои */
+void aero_panel(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h,
+                UINT32 top, UINT32 bot, UINT32 a, INT32 rt, INT32 rb);
+void aero_outline(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, UINT32 col, UINT32 a, INT32 rt, INT32 rb);
+void aero_shadow(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h);
+void aero_blur(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, INT32 r);
+void aero_orb(GFX *g, INT32 cx, INT32 cy, INT32 r, UINT32 base, UINT32 glow);
+void aero_gloss(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, UINT32 a_top);
+void aero_text_glow(GFX *g, INT32 x, INT32 y, const char *s, UINT32 col, UINT32 glow);
+void aero_wallpaper(UINT32 *buf, UINT32 w, UINT32 h);
+
 /* Событие окну (в формате struct myos_event из sysnum.h) */
 #define WIN_TITLE_MAX  64
 #define WM_MAX_WINDOWS 16

@@ -165,8 +165,8 @@ int   gtextw(const char *s);
 #endif
 #define GFX_WHITE  0xFFFFFFu
 #define GFX_LIGHT  0xDFDFDFu
-#define GFX_FACE   0xC0C0C0u     /* серый фон окон и кнопок */
-#define GFX_SHADOW 0x808080u
+#define GFX_FACE   0xEEF3F8u     /* фон окон: светлый, чуть голубой (Frutiger Aero) */
+#define GFX_SHADOW 0x8A9AAAu
 #define GFX_BLACK  0x000000u
 #define GFX_NAVY   0x000080u
 

@@ -11,7 +11,7 @@
  */
 #include "myos.h"
 
-#define C_FACE   0xC0C0C0u
+#define C_FACE   0xEEF3F8u     /* фон окон (Frutiger Aero) */
 #define C_WHITE  0xFFFFFFu
 #define C_BLACK  0x000000u
 #define C_NAVY   0x000080u
@@ -357,17 +357,22 @@ void apps_draw_shortcuts(GFX *g)
         desk_cell(i, &cx, &cy);
 
         INT32 ix = cx + (DESK_CELL_W - DESK_ICON) / 2;
-
-        gfx_icon(g, ix, cy, gui_icon(g_desk[i].icon), 2, (INTN)i == g_desk_sel);
-
         INT32 tw = gfx_text_width(g_desk[i].label);
         INT32 tx = cx + (DESK_CELL_W - tw) / 2;
         INT32 ty = cy + DESK_ICON + 2;
 
-        if ((INTN)i == g_desk_sel)
-            gfx_fill(g, tx - 2, ty, tw + 4, FONT_H, C_NAVY);
+        /* выделенный значок - голубое стекло под ним (Frutiger Aero) */
+        if ((INTN)i == g_desk_sel) {
+            aero_panel(g, cx + 4, cy - 3, DESK_CELL_W - 8, DESK_ICON + FONT_H + 8,
+                       0xCDEBFFu, 0x6FB4EAu, 150, 5, 5);
+            aero_outline(g, cx + 4, cy - 3, DESK_CELL_W - 8, DESK_ICON + FONT_H + 8,
+                         0xFFFFFFu, 170, 5, 5);
+        }
 
-        gfx_text(g, tx, ty, g_desk[i].label, C_WHITE);
+        gfx_icon(g, ix, cy, gui_icon(g_desk[i].icon), 2, FALSE);
+
+        /* белая надпись с тёмной обводкой - читается и на небе, и на траве */
+        aero_text_glow(g, tx, ty, g_desk[i].label, C_WHITE, 0x0B2238u);
     }
 }
 

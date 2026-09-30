@@ -103,32 +103,55 @@ static void gfx_blend(GFX *g, int x, int y, unsigned int c, unsigned int a)
  * Объёмные рамки в духе Windows 95 (как у окон ядра)
  * ================================================================ */
 
+static unsigned int lerp(unsigned int c0, unsigned int c1, unsigned int t)   /* t: 0..256 */
+{
+    unsigned int r = (((c0 >> 16) & 0xFF) * (256 - t) + ((c1 >> 16) & 0xFF) * t) >> 8;
+    unsigned int g = (((c0 >> 8) & 0xFF) * (256 - t) + ((c1 >> 8) & 0xFF) * t) >> 8;
+    unsigned int b = ((c0 & 0xFF) * (256 - t) + (c1 & 0xFF) * t) >> 8;
+    return (r << 16) | (g << 8) | b;
+}
+
+/* контур со срезанными угловыми пикселями (скругление в 1 пиксель) */
+static void soft_frame(GFX *g, int x, int y, int w, int h, unsigned int col)
+{
+    gfx_fill(g, x + 1, y, w - 2, 1, col);
+    gfx_fill(g, x + 1, y + h - 1, w - 2, 1, col);
+    gfx_fill(g, x, y + 1, 1, h - 2, col);
+    gfx_fill(g, x + w - 1, y + 1, 1, h - 2, col);
+}
+
 /*
- * Рамка в 2 пикселя: выпуклая (raised) - светлый верх-лево, тёмный
- * низ-право; вдавленная - наоборот.
+ * Рамки и кнопки в стиле Frutiger Aero (как у ядра, gui/gfx.c):
+ * выпуклая - светлая кромка, "вдавленное" поле - голубовато-серый
+ * контур, как у полей ввода Vista.
  */
 void gfx_bevel(GFX *g, int x, int y, int w, int h, int raised)
 {
-    unsigned int tl1 = raised ? GFX_LIGHT : GFX_SHADOW;
-    unsigned int tl2 = raised ? GFX_WHITE : GFX_BLACK;
-    unsigned int br1 = raised ? GFX_BLACK : GFX_WHITE;
-    unsigned int br2 = raised ? GFX_SHADOW : GFX_LIGHT;
+    if (w < 3 || h < 3)
+        return;
 
-    gfx_fill(g, x, y, w, 1, tl1);
-    gfx_fill(g, x, y, 1, h, tl1);
-    gfx_fill(g, x + 1, y + 1, w - 2, 1, tl2);
-    gfx_fill(g, x + 1, y + 1, 1, h - 2, tl2);
-    gfx_fill(g, x, y + h - 1, w, 1, br1);
-    gfx_fill(g, x + w - 1, y, 1, h, br1);
-    gfx_fill(g, x + 1, y + h - 2, w - 2, 1, br2);
-    gfx_fill(g, x + w - 2, y + 1, 1, h - 2, br2);
+    if (raised) {
+        soft_frame(g, x, y, w, h, 0x9DB1C6u);
+        soft_frame(g, x + 1, y + 1, w - 2, h - 2, GFX_WHITE);
+    } else {
+        soft_frame(g, x, y, w, h, 0x7F9DB9u);
+        gfx_fill(g, x + 1, y + 1, w - 2, 1, 0xDCE4EDu);
+    }
 }
 
-/* Серая кнопка: заливка + рамка */
+/* Кнопка: градиент почти белый -> светло-серо-голубой; нажатая - голубая */
 void gfx_button(GFX *g, int x, int y, int w, int h, int pressed)
 {
-    gfx_fill(g, x, y, w, h, GFX_FACE);
-    gfx_bevel(g, x, y, w, h, !pressed);
+    unsigned int top = pressed ? 0xC9E4F8u : 0xFCFDFEu;
+    unsigned int bot = pressed ? 0x8DC0EAu : 0xD9E3EDu;
+
+    for (int j = 0; j < h; j++)
+        gfx_fill(g, x, y + j, w, 1, lerp(top, bot, h > 1 ? (unsigned int)(j * 256 / (h - 1)) : 0));
+
+    if (!pressed && h > 6)
+        gfx_fill(g, x + 1, y + 1, w - 2, 1, GFX_WHITE);
+
+    soft_frame(g, x, y, w, h, pressed ? 0x3C7FB1u : 0x8397ACu);
 }
 
 

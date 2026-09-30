@@ -130,37 +130,63 @@ void gfx_blit(GFX *g, INT32 x, INT32 y, const UINT32 *src, INT32 w, INT32 h, UIN
 
 #define C_WHITE  0xFFFFFFu
 #define C_LIGHT  0xDFDFDFu
-#define C_FACE   0xC0C0C0u
+#define C_FACE   0xEEF3F8u     /* фон окон: светлый, чуть голубой (Aero) */
 #define C_SHADOW 0x808080u
 #define C_BLACK  0x000000u
 
 /*
- * Рамка в 2 пикселя: выпуклая (raised) - светлый верх-лево, тёмный
- * низ-право; вдавленная - наоборот. Так в 1995 году рисовалась любая
- * кнопка и окно.
+ * Кнопки и рамки в стиле Frutiger Aero (этап 10; раньше - объёмные
+ * рамки Windows 95): светлый градиент, тонкий голубовато-серый контур
+ * со срезанными углами (скругление в 1 пиксель), блик сверху.
+ *   raised  - выпуклая панель (светлая кромка внутри);
+ *   !raised - "вдавленное" поле (текст, список): контур потемнее.
  */
-void gfx_bevel(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, BOOLEAN raised)
+static UINT32 aero_lerp(UINT32 c0, UINT32 c1, UINT32 t)   /* t: 0..256 */
 {
-    UINT32 tl1 = raised ? C_LIGHT : C_SHADOW;
-    UINT32 tl2 = raised ? C_WHITE : C_BLACK;
-    UINT32 br1 = raised ? C_BLACK : C_WHITE;
-    UINT32 br2 = raised ? C_SHADOW : C_LIGHT;
-
-    gfx_fill(g, x, y, w, 1, tl1);
-    gfx_fill(g, x, y, 1, h, tl1);
-    gfx_fill(g, x + 1, y + 1, w - 2, 1, tl2);
-    gfx_fill(g, x + 1, y + 1, 1, h - 2, tl2);
-    gfx_fill(g, x, y + h - 1, w, 1, br1);
-    gfx_fill(g, x + w - 1, y, 1, h, br1);
-    gfx_fill(g, x + 1, y + h - 2, w - 2, 1, br2);
-    gfx_fill(g, x + w - 2, y + 1, 1, h - 2, br2);
+    UINT32 r = (((c0 >> 16) & 0xFF) * (256 - t) + ((c1 >> 16) & 0xFF) * t) >> 8;
+    UINT32 g = (((c0 >> 8) & 0xFF) * (256 - t) + ((c1 >> 8) & 0xFF) * t) >> 8;
+    UINT32 b = ((c0 & 0xFF) * (256 - t) + (c1 & 0xFF) * t) >> 8;
+    return (r << 16) | (g << 8) | b;
 }
 
-/* Серая кнопка: заливка + рамка */
+/* контур со срезанными угловыми пикселями */
+static void soft_frame(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, UINT32 col)
+{
+    gfx_fill(g, x + 1, y, w - 2, 1, col);
+    gfx_fill(g, x + 1, y + h - 1, w - 2, 1, col);
+    gfx_fill(g, x, y + 1, 1, h - 2, col);
+    gfx_fill(g, x + w - 1, y + 1, 1, h - 2, col);
+}
+
+void gfx_bevel(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, BOOLEAN raised)
+{
+    if (w < 3 || h < 3)
+        return;
+
+    if (raised) {
+        soft_frame(g, x, y, w, h, 0x9DB1C6u);
+        soft_frame(g, x + 1, y + 1, w - 2, h - 2, C_WHITE);
+    } else {
+        soft_frame(g, x, y, w, h, 0x7F9DB9u);        /* как поле ввода Vista */
+        gfx_fill(g, x + 1, y + 1, w - 2, 1, 0xDCE4EDu);
+    }
+}
+
+/* Кнопка: градиент от почти белого к светло-серо-голубому; нажатая -
+   голубая (как выделение в Aero) */
 void gfx_button(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, BOOLEAN pressed)
 {
-    gfx_fill(g, x, y, w, h, C_FACE);
-    gfx_bevel(g, x, y, w, h, !pressed);
+    UINT32 top = pressed ? 0xC9E4F8u : 0xFCFDFEu;
+    UINT32 bot = pressed ? 0x8DC0EAu : 0xD9E3EDu;
+
+    for (INT32 j = 0; j < h; j++)
+        gfx_fill(g, x, y + j, w, 1, aero_lerp(top, bot, h > 1 ? (UINT32)(j * 256 / (h - 1)) : 0));
+
+    /* блик на верхней половине */
+    if (!pressed && h > 6)
+        gfx_fill(g, x + 1, y + 1, w - 2, 1, C_WHITE);
+
+    soft_frame(g, x, y, w, h, pressed ? 0x3C7FB1u : 0x8397ACu);
 }
 
 

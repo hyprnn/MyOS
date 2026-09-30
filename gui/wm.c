@@ -40,6 +40,8 @@ static BOOLEAN g_stop = FALSE;
 
 /* экран */
 static UINT32 *g_back = NULL;       /* собранный кадр, 0x00RRGGBB */
+static UINT32 *g_wall = NULL;       /* обои (aero_wallpaper), рисуются один раз */
+static UINT32  g_wall_w, g_wall_h;
 static UINT32 *g_shadow = NULL;     /* что сейчас на экране (упаковано) */
 static UINT32 SCR_W, SCR_H, SCR_STRIDE;
 static EFI_GRAPHICS_PIXEL_FORMAT SCR_FMT;
@@ -392,30 +394,65 @@ void wm_invalidate_desktop(void)
  * Отрисовка рамки окна и кадра
  * ================================================================ */
 
+/*
+ * Рамка окна в стиле Frutiger Aero: мягкая тень, стеклянная
+ * полупрозрачная рамка (сквозь неё видны обои и окна позади) с
+ * градиентом и бликом, скруглённый верх, тёмный контур и светлая
+ * внутренняя кромка, красная глянцевая кнопка закрытия. Размеры -
+ * прежние (WIN_BORDER, WIN_TITLE_H): программы и автотесты от них
+ * зависят.
+ */
+#define CLOSE_W 30
+#define CLOSE_H 17
+
+static void close_rect(WIN *w, INT32 *bx, INT32 *by)
+{
+    *bx = w->x + WIN_FRAME_W(w->cw) - WIN_BORDER - CLOSE_W - 2;
+    *by = w->y + 1;
+}
+
 static void draw_window_frame(WIN *w, BOOLEAN active)
 {
     GFX *g = &g_screen;
     INT32 fw = WIN_FRAME_W(w->cw);
     INT32 fh = WIN_FRAME_H(w->ch);
+    INT32 th = WIN_BORDER + WIN_TITLE_H;
 
-    gfx_fill(g, w->x, w->y, fw, fh, D_FACE);
-    gfx_bevel(g, w->x, w->y, fw, fh, TRUE);
+    UINT32 top = active ? 0xBFE3F9u : 0xE3EBF1u;
+    UINT32 mid = active ? 0x7DB8E6u : 0xC3D2DEu;
+    UINT32 bot = active ? 0x4E8FCBu : 0xA9BCCBu;
+    UINT32 alpha = active ? 205u : 185u;
 
-    /* заголовок: активное - синий, неактивное - серое */
-    UINT32 bar = active ? D_NAVY : D_GRAY;
+    aero_shadow(g, w->x, w->y, fw, fh);
 
-    gfx_fill(g, w->x + WIN_BORDER, w->y + WIN_BORDER,
-             w->cw, WIN_TITLE_H, bar);
+    /* матовое стекло: то, что позади заголовка и рамки, - размыть */
+    aero_blur(g, w->x, w->y, fw, th, 4);
+    aero_blur(g, w->x, w->y + th, WIN_BORDER, fh - th, 2);
+    aero_blur(g, w->x + fw - WIN_BORDER, w->y + th, WIN_BORDER, fh - th, 2);
+    aero_blur(g, w->x, w->y + fh - WIN_BORDER, fw, WIN_BORDER, 2);
 
-    gfx_text_bold(g, w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 2, w->title,
-                  active ? D_WHITE : D_FACE);
+    aero_panel(g, w->x, w->y, fw, th, top, mid, alpha, 8, 0);
+    aero_panel(g, w->x, w->y + th, fw, fh - th, mid, bot, alpha, 0, 4);
+    aero_gloss(g, w->x + 3, w->y + 2, fw - 6, WIN_TITLE_H / 2, active ? 120u : 90u);
+    aero_outline(g, w->x, w->y, fw, fh, 0x16283Du, 190, 8, 4);
+    aero_outline(g, w->x + 1, w->y + 1, fw - 2, fh - 2, 0xFFFFFFu, 110, 7, 3);
 
-    /* кнопка закрытия */
-    INT32 bx = w->x + fw - WIN_BORDER - 18;
-    INT32 by = w->y + WIN_BORDER + 2;
+    /* заголовок: тёмный текст с белой "подсветкой" снизу-справа */
+    INT32 bx, by;
+    close_rect(w, &bx, &by);
 
-    gfx_button(g, bx, by, 16, 16, FALSE);
-    gfx_glyph(g, bx + 4, by, 0x00D7 /* × */, D_BLACK);
+    gfx_clip(g, w->x + WIN_BORDER, w->y, bx - w->x - WIN_BORDER - 4, th);
+    gfx_text(g, w->x + WIN_BORDER + 7, w->y + WIN_BORDER + 3, w->title, 0xF4FAFFu);
+    gfx_text(g, w->x + WIN_BORDER + 6, w->y + WIN_BORDER + 2, w->title,
+             active ? 0x0C1D30u : 0x33414Eu);
+    gfx_noclip(g);
+
+    /* кнопка закрытия: красное стекло (у неактивного - блёклое) */
+    aero_panel(g, bx, by, CLOSE_W, CLOSE_H, active ? 0xF0A090u : 0xE6D4D0u,
+               active ? 0xC7372Au : 0xC9B2AEu, 245, 3, 3);
+    aero_gloss(g, bx + 1, by + 1, CLOSE_W - 2, CLOSE_H / 2, 110);
+    aero_outline(g, bx, by, CLOSE_W, CLOSE_H, 0x5A1A12u, 200, 3, 3);
+    gfx_glyph(g, bx + CLOSE_W / 2 - 4, by, 0x00D7 /* × */, 0xFFFFFFu);
 
     /* содержимое (буфера нет - окно как раз закрывается) */
     if (w->buf != NULL)
@@ -423,19 +460,31 @@ static void draw_window_frame(WIN *w, BOOLEAN active)
                  w->buf, w->cw, w->ch, (UINT32)w->cw);
 }
 
+/* "Пилюля" стекла на панели задач (кнопки окон, значки справа) */
+static void glass_pill(GFX *g, INT32 x, INT32 y, INT32 w, INT32 h, BOOLEAN lit)
+{
+    aero_panel(g, x, y, w, h, lit ? 0x8FC8F0u : 0x5A7896u, lit ? 0x2F6FB0u : 0x243A52u,
+               lit ? 220u : 150u, 4, 4);
+    aero_gloss(g, x + 1, y + 1, w - 2, h / 2, lit ? 90u : 55u);
+    aero_outline(g, x, y, w, h, 0x0A1420u, 170, 4, 4);
+}
+
 static void draw_taskbar(void)
 {
     GFX *g = &g_screen;
     INT32 y = (INT32)SCR_H - TASK_H;
 
-    gfx_fill(g, 0, y, (INT32)SCR_W, TASK_H, D_FACE);
-    gfx_bevel(g, 0, y, (INT32)SCR_W, TASK_H, TRUE);
+    /* тёмное стекло: сквозь панель видны обои; сверху светлая кромка */
+    aero_panel(g, 0, y, (INT32)SCR_W, TASK_H, 0x3A5570u, 0x0B1624u, 200, 0, 0);
+    aero_gloss(g, 0, y, (INT32)SCR_W, TASK_H / 2, 45);
+    aero_panel(g, 0, y, (INT32)SCR_W, 1, 0xFFFFFFu, 0xFFFFFFu, 120, 0, 0);
 
-    /* кнопка "Пуск" со значком MyOS */
-    gfx_button(g, 3, y + 3, START_W, TASK_H - 6, g_menu_open);
-    INT32 sx = g_menu_open ? 6 : 5;
-    gfx_icon(g, sx + 2, y + 4, gui_icon("logo"), 1, FALSE);
-    gfx_text_bold(g, sx + 22, y + 6, "Пуск", D_BLACK);
+    /* кнопка "Пуск": глянцевый шарик со знаком MyOS и надпись
+       (нажимается вся полоса 3..3+START_W, как и раньше) */
+    aero_orb(g, 17, y + TASK_H / 2, 11, g_menu_open ? 0x2E9E3Eu : 0x1F7FD0u,
+             g_menu_open ? 0xB8F5A0u : 0x9FE3FFu);
+    gfx_icon(g, 9, y + TASK_H / 2 - 8, gui_icon("logo"), 1, FALSE);
+    aero_text_glow(g, 33, y + 6, "Пуск", D_WHITE, 0x0A2340u);
 
     /* кнопки окон (порядок - по id, устойчивый) */
     INT32 bx = START_W + 10;
@@ -446,10 +495,10 @@ static void draw_taskbar(void)
         WIN *w = &g_windows[g_zi_idx[k]];
         BOOLEAN active = (w == g_focus) && !w->minimized;
 
-        gfx_button(g, bx, y + 4, bw, TASK_H - 8, active);
+        glass_pill(g, bx, y + 3, bw, TASK_H - 6, active);
         gfx_icon(g, bx + 3, y + 5, w->cls ? w->cls->icon : w->icon ? w->icon : gui_icon("app"),
                  1, FALSE);
-        gfx_text_fit(g, bx + 22, y + 7, w->title, D_BLACK, 15);
+        gfx_text_fit(g, bx + 22, y + 6, w->title, D_WHITE, 15);
 
         bx += bw + 4;
         if (bx + bw > (INT32)SCR_W - 280)
@@ -460,8 +509,8 @@ static void draw_taskbar(void)
     char net[24];
     net_gui_indicator(net, sizeof(net));
     INT32 nw = gfx_text_width(net);
-    gfx_button(g, (INT32)SCR_W - 96 - nw - 12, y + 4, nw + 12, TASK_H - 8, FALSE);
-    gfx_text(g, (INT32)SCR_W - 96 - nw - 6, y + 7, net, D_BLACK);
+    glass_pill(g, (INT32)SCR_W - 96 - nw - 12, y + 3, nw + 12, TASK_H - 6, FALSE);
+    gfx_text(g, (INT32)SCR_W - 96 - nw - 6, y + 7, net, D_WHITE);
 
     /* батарея (этап 9, ACPI): значок-"батарейка" и проценты - левее
        сети; у компьютера без батареи (и в QEMU) значка нет. Сами
@@ -483,16 +532,16 @@ static void draw_taskbar(void)
         for (const char *c = bat; *c >= '0' && *c <= '9'; c++)
             pct = pct * 10u + (UINT32)(*c - '0');
 
-        gfx_button(g, bx2, y + 4, bw2, TASK_H - 8, FALSE);
+        glass_pill(g, bx2, y + 3, bw2, TASK_H - 6, FALSE);
 
         /* корпус 18x10 с "носиком" справа, внутри - заливка по заряду:
            зелёная, красная если мало (15% и меньше) */
         INT32 ix = bx2 + 6;
-        gfx_fill(g, ix, iy, 18, 1, D_BLACK);
-        gfx_fill(g, ix, iy + 9, 18, 1, D_BLACK);
-        gfx_fill(g, ix, iy, 1, 10, D_BLACK);
-        gfx_fill(g, ix + 17, iy, 1, 10, D_BLACK);
-        gfx_fill(g, ix + 18, iy + 3, 2, 4, D_BLACK);
+        gfx_fill(g, ix, iy, 18, 1, D_WHITE);
+        gfx_fill(g, ix, iy + 9, 18, 1, D_WHITE);
+        gfx_fill(g, ix, iy, 1, 10, D_WHITE);
+        gfx_fill(g, ix + 17, iy, 1, 10, D_WHITE);
+        gfx_fill(g, ix + 18, iy + 3, 2, 4, D_WHITE);
 
         INT32 fill = (INT32)(pct > 100u ? 100u : pct) * 14 / 100;
         if (fill < 1)
@@ -506,7 +555,7 @@ static void draw_taskbar(void)
             gfx_fill(g, ix + 8, iy + 5, 2, 4, 0xF0D000u);
         }
 
-        gfx_text(g, ix + 22 + 4, y + 7, bat, D_BLACK);
+        gfx_text(g, ix + 22 + 4, y + 7, bat, D_WHITE);
     }
 
     /* звук (этап 10): динамик и громкость; без звука - красный крест */
@@ -520,13 +569,13 @@ static void draw_taskbar(void)
         INT32 sx = right - sw;
         INT32 iy = y + 8;
 
-        gfx_button(g, sx, y + 4, sw, TASK_H - 8, FALSE);
+        glass_pill(g, sx, y + 3, sw, TASK_H - 6, FALSE);
 
         /* динамик: "коробочка" и раструб */
         INT32 ix = sx + 6;
-        gfx_fill(g, ix, iy + 4, 3, 5, D_BLACK);
+        gfx_fill(g, ix, iy + 4, 3, 5, D_WHITE);
         for (INT32 k = 0; k < 4; k++)
-            gfx_fill(g, ix + 3 + k, iy + 3 - k, 1, 7 + 2 * k, D_BLACK);
+            gfx_fill(g, ix + 3 + k, iy + 3 - k, 1, 7 + 2 * k, D_WHITE);
 
         if (g_hda.muted || g_hda.volume == 0) {
             for (INT32 k = 0; k < 5; k++) {
@@ -536,12 +585,12 @@ static void draw_taskbar(void)
         } else {
             /* "волны" - по громкости */
             if (g_hda.volume > 0)
-                gfx_fill(g, ix + 9, iy + 5, 1, 3, D_BLACK);
+                gfx_fill(g, ix + 9, iy + 5, 1, 3, D_WHITE);
             if (g_hda.volume > 50)
-                gfx_fill(g, ix + 11, iy + 3, 1, 7, D_BLACK);
+                gfx_fill(g, ix + 11, iy + 3, 1, 7, D_WHITE);
         }
 
-        gfx_text(g, ix + 12 + 4, y + 7, vol, g_hda.muted ? D_GRAY : D_BLACK);
+        gfx_text(g, ix + 12 + 4, y + 7, vol, g_hda.muted ? 0x9AA8B6u : D_WHITE);
     }
 
     /* часы справа + индикатор раскладки */
@@ -552,14 +601,14 @@ static void draw_taskbar(void)
         tz_to_local(&t);
         ksnprintf(clock, sizeof(clock), "%02u:%02u", t.Hour, t.Minute);
         INT32 cw = gfx_text_width(clock);
-        gfx_button(g, (INT32)SCR_W - cw - 16, y + 4, cw + 12, TASK_H - 8, FALSE);
-        gfx_text(g, (INT32)SCR_W - cw - 10, y + 7, clock, D_BLACK);
+        glass_pill(g, (INT32)SCR_W - cw - 16, y + 3, cw + 12, TASK_H - 6, FALSE);
+        gfx_text(g, (INT32)SCR_W - cw - 10, y + 7, clock, D_WHITE);
     }
 
     const char *lang = g_kbd_layout ? "РУ" : "EN";
     INT32 lw = gfx_text_width(lang);
-    gfx_button(g, (INT32)SCR_W - 90, y + 4, lw + 12, TASK_H - 8, FALSE);
-    gfx_text(g, (INT32)SCR_W - 84, y + 7, lang, D_BLACK);
+    glass_pill(g, (INT32)SCR_W - 90, y + 3, lw + 12, TASK_H - 6, FALSE);
+    gfx_text(g, (INT32)SCR_W - 84, y + 7, lang, D_WHITE);
 }
 
 static void draw_start_menu(void)
@@ -569,13 +618,17 @@ static void draw_start_menu(void)
     INT32 x = 3;
     INT32 y = (INT32)SCR_H - TASK_H - h;
 
-    gfx_fill(g, x, y, MENU_W, h, D_FACE);
-    gfx_bevel(g, x, y, MENU_W, h, TRUE);
+    /* светлое стекло со скруглением, тень */
+    aero_shadow(g, x, y, MENU_W, h);
+    aero_panel(g, x, y, MENU_W, h, 0xF4FAFFu, 0xCFE4F5u, 238, 7, 7);
+    aero_outline(g, x, y, MENU_W, h, 0x1E3550u, 200, 7, 7);
+    aero_outline(g, x + 1, y + 1, MENU_W - 2, h - 2, 0xFFFFFFu, 150, 6, 6);
 
-    /* синяя боковая полоса с вертикальной надписью MyOS */
-    gfx_fill(g, x + 3, y + 3, MENU_SIDE, h - 6, D_NAVY);
+    /* боковая полоса: насыщенная лазурь с вертикальной надписью MyOS */
+    aero_panel(g, x + 3, y + 3, MENU_SIDE, h - 6, 0x1F6FC0u, 0x0E3A78u, 245, 4, 4);
+    aero_gloss(g, x + 3, y + 3, MENU_SIDE / 2, h - 6, 60);
 
-    const char *word = "MyOS 95";
+    const char *word = "MyOS Aero";
     INT32 ty = y + h - 12;
 
     for (const char *s = word; *s; s++) {
@@ -591,11 +644,14 @@ static void draw_start_menu(void)
         BOOLEAN hover = g_mx >= ix && g_mx < x + MENU_W - 3 &&
                         g_my >= iy && g_my < iy + MENU_ITEM_H;
 
-        if (hover)
-            gfx_fill(g, ix, iy, MENU_W - MENU_SIDE - 8, MENU_ITEM_H, D_NAVY);
+        /* наведённый пункт - голубая глянцевая подсветка */
+        if (hover) {
+            aero_panel(g, ix, iy, MENU_W - MENU_SIDE - 8, MENU_ITEM_H, 0xD8EFFFu, 0x8CC6F2u, 230, 3, 3);
+            aero_outline(g, ix, iy, MENU_W - MENU_SIDE - 8, MENU_ITEM_H, 0x3C7FC0u, 200, 3, 3);
+        }
 
         gfx_icon(g, ix + 2, iy + 2, gui_icon(g_menu[i].icon), 1, FALSE);
-        gfx_text(g, ix + 22, iy + 3, g_menu[i].label, hover ? D_WHITE : D_BLACK);
+        gfx_text(g, ix + 22, iy + 3, g_menu[i].label, 0x0C1D30u);
     }
 }
 
@@ -605,7 +661,11 @@ static void compose(void)
     GFX *g = &g_screen;
 
     gfx_noclip(g);
-    gfx_fill(g, 0, 0, (INT32)SCR_W, (INT32)SCR_H, D_TEAL);
+
+    if (g_wall != NULL)
+        gfx_blit(g, 0, 0, g_wall, (INT32)SCR_W, (INT32)SCR_H, SCR_W);
+    else
+        gfx_fill(g, 0, 0, (INT32)SCR_W, (INT32)SCR_H, D_TEAL);
 
     /* ярлыки рабочего стола */
     apps_draw_shortcuts(g);
@@ -797,11 +857,10 @@ static void on_mouse_down(void)
     wm_focus(w);
 
     /* крестик */
-    INT32 fw = WIN_FRAME_W(w->cw);
-    INT32 bx = w->x + fw - WIN_BORDER - 18;
-    INT32 by = w->y + WIN_BORDER + 2;
+    INT32 bx, by;
+    close_rect(w, &bx, &by);
 
-    if (g_mx >= bx && g_mx < bx + 16 && g_my >= by && g_my < by + 16) {
+    if (g_mx >= bx && g_mx < bx + CLOSE_W && g_my >= by && g_my < by + CLOSE_H) {
         struct myos_event e = { EV_CLOSE, 0, 0, 0, 0, 0, 0, 0 };
         if (w->proc)
             deliver(w, &e);          /* программа сама решит закрыться */
@@ -925,6 +984,20 @@ void wm_start(EFI_SYSTEM_TABLE *st)
     }
 
     gfx_init(&g_screen, g_back, SCR_W, SCR_H, SCR_STRIDE);
+
+    /* обои Frutiger Aero - один раз (при следующем start - те же) */
+    if (g_wall == NULL || g_wall_w != SCR_W || g_wall_h != SCR_H) {
+        if (g_wall)
+            kfree(g_wall);
+        g_wall = (UINT32 *)kmalloc((UINTN)SCR_W * SCR_H * 4u);
+        if (g_wall) {
+            UINT64 t0 = g_kticks;
+            aero_wallpaper(g_wall, SCR_W, SCR_H);
+            g_wall_w = SCR_W;
+            g_wall_h = SCR_H;
+            klog("wm: wallpaper drawn in %u ms\n", (UINT32)(g_kticks - t0));
+        }
+    }
 
     for (UINTN i = 0; i < npx; i++)
         g_shadow[i] = 0xAA55AA55u;        /* заведомо не совпадёт - первый кадр целиком */
