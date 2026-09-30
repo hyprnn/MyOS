@@ -302,6 +302,12 @@ BOOLEAN blk_read(UINTN dev, UINT64 lba, UINT32 count, VOID *buf)
     return ok;
 }
 
+/* "Окно записи" (kernel/settings.c): раздел, на который сейчас можно
+   писать, хотя весь диск - только для чтения. Открывается лишь на время
+   записи файла настроек в EFI/MyOS (по команде пользователя), под
+   g_vfs_mutex; -1 - закрыто. */
+INTN g_blk_write_window = -1;
+
 BOOLEAN blk_write(UINTN dev, UINT64 lba, UINT32 count, const VOID *buf)
 {
     UINTN w;
@@ -309,7 +315,8 @@ BOOLEAN blk_write(UINTN dev, UINT64 lba, UINT32 count, const VOID *buf)
 
     kmutex_lock(&g_vfs_mutex);
 
-    if (!blk_resolve(dev, lba, count, &w, &a) || !g_blk[w].writable) {
+    if (!blk_resolve(dev, lba, count, &w, &a) ||
+        (!g_blk[w].writable && (INTN)dev != g_blk_write_window)) {
         kmutex_unlock(&g_vfs_mutex);
         return FALSE;
     }
@@ -857,6 +864,41 @@ void kernel_cmd_disk(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
 
     if (arg[0] == '\0') {
         disk_list(out);
+        kmutex_unlock(&g_vfs_mutex);
+        return;
+    }
+
+    /* disk protect <диск>: сделать диск (и его тома) только для чтения,
+       как внутренний диск ноутбука - для проверки в QEMU */
+    if (arg[0] == 'p' && arg[1] == 'r' && arg[2] == 'o' && arg[3] == 't' &&
+        arg[4] == 'e' && arg[5] == 'c' && arg[6] == 't' && arg[7] == ' ') {
+
+        const char *name = arg + 8;
+        BOOLEAN found = FALSE;
+
+        for (UINTN i = 0; i < BLK_MAX; i++) {
+
+            BLKDEV *d = &g_blk[i];
+
+            if (!d->used || !kstreq(d->name, name))
+                continue;
+
+            found = TRUE;
+            d->writable = FALSE;
+            d->ro_reason = "protected by 'disk protect'";
+
+            for (UINTN k = 0; k < BLK_MAX; k++)
+                if (g_blk[k].used && g_blk[k].parent == (INTN)i) {
+                    g_blk[k].writable = FALSE;
+                    g_blk[k].ro_reason = d->ro_reason;
+                }
+
+            for (UINTN k = 0; k < VFS_MAX_MOUNTS; k++)
+                if (g_mounts[k].used && (g_mounts[k].dev == i || g_blk[g_mounts[k].dev].parent == (INTN)i))
+                    g_mounts[k].readonly = TRUE;
+        }
+
+        kprintf(out, found ? "%s is read-only now.\n" : "No disk named '%s'.\n", name);
         kmutex_unlock(&g_vfs_mutex);
         return;
     }

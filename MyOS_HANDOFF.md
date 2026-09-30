@@ -542,7 +542,12 @@ MSI-X, PS/2 по IRQ, PS/2-мышь.
   `wlan_cmd_connect_key(..., wait=FALSE)` (поток wlan пробует сам). Пишется
   только по команде. Проверка: прогоны `wifi-save` и `wifi-save-reboot`
   (q35 — диск загрузки виден как `/sata0`; второй прогон грузится с того же
-  образа).
+  образа). Том только для чтения (внутренний диск ноутбука): `wifi save`
+  просит `wifi save confirm`; запись идёт через «окно записи» —
+  `g_blk_write_window` (drivers/blk.c) = раздел, `m->readonly` снят, всё под
+  `g_vfs_mutex` и только на время `settings_write`/`settings_remove`. Для
+  проверки в QEMU — `disk protect <диск>` (делает диск только для чтения,
+  как на ноутбуке). Гайд установки для пользователей — `INSTALL.md`.
 * **Установка на диск** (`tools/install-arch.sh`, запуск из Arch): копирует
   загрузчик и ядро в `<ESP>/EFI/MyOS/`, пишет `<ESP>/loader/entries/myos.conf`
   (`efi /EFI/MyOS/BOOTX64.EFI`); `--menu` = `bootctl set-timeout 3`

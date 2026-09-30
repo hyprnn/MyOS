@@ -11,6 +11,14 @@
  * Какой том "наш"? Загрузчик сообщил путь к ядру (\EFI\MYOS\KERNEL.ELF
  * или \EFI\BOOT\KERNEL.ELF) и его размер. Смотрим на всех дисках FAT,
  * где лежит файл с таким путём и ровно такого размера.
+ *
+ * Внутренний диск ноутбука (на нём Arch) MyOS держит только для
+ * чтения. Если MyOS загружена с него (стоит рядом с Arch), настройки
+ * пишутся через "окно записи": на время одной записи файла в
+ * EFI/MyOS - и только если пользователь подтвердил (wifi save confirm)
+ * - разделу разрешается запись (g_blk_write_window в drivers/blk.c).
+ * Пишет при этом драйвер FAT: сам файл, его запись в папке и таблицу
+ * FAT - больше ничего на диске не меняется.
  */
 #include "myos.h"
 
@@ -83,27 +91,104 @@ BOOLEAN settings_path(const char *name, char *out, UINTN cap)
     return TRUE;
 }
 
-/* Записать файл настроек (создав папку EFI/MyOS, если её нет - так
-   бывает на флешке, где MyOS лежит в EFI/BOOT). 0 - получилось,
-   иначе код ошибки VFS. */
-INTN settings_write(const char *name, const void *data, UINTN n, char *where, UINTN cap)
+static VFS_MOUNT *settings_mount(void)
 {
-    char vol[20], dir[48];
+    char vol[20];
 
     if (!settings_boot_volume(vol, sizeof(vol)))
+        return NULL;
+
+    for (UINTN i = 0; i < VFS_MAX_MOUNTS; i++)
+        if (g_mounts[i].used && !g_mounts[i].gone && kstreq(g_mounts[i].name, vol))
+            return &g_mounts[i];
+
+    return NULL;
+}
+
+/* Том загрузки - только для чтения (внутренний диск)? Тогда запись
+   настроек требует подтверждения. */
+BOOLEAN settings_readonly(void)
+{
+    VFS_MOUNT *m = settings_mount();
+    return m != NULL && m->readonly;
+}
+
+/* Открыть окно записи для тома m (если он только для чтения). Держим
+   g_vfs_mutex всё время, пока окно открыто: ни один другой поток не
+   успеет записать что-то своё на этот диск. */
+static BOOLEAN settings_window_open(VFS_MOUNT *m)
+{
+    kmutex_lock(&g_vfs_mutex);
+
+    if (!m->readonly)
+        return FALSE;
+
+    m->readonly = FALSE;
+    g_blk_write_window = (INTN)m->dev;
+    klog("settings: write window open on /%s (EFI/MyOS only)\n", m->name);
+
+    return TRUE;
+}
+
+static void settings_window_close(VFS_MOUNT *m, BOOLEAN opened)
+{
+    if (opened) {
+        g_blk_write_window = -1;
+        m->readonly = TRUE;
+        klog("settings: write window closed on /%s\n", m->name);
+    }
+
+    kmutex_unlock(&g_vfs_mutex);
+}
+
+/* Записать файл настроек (создав папку EFI/MyOS, если её нет - так
+   бывает на флешке, где MyOS лежит в EFI/BOOT). 0 - получилось,
+   -1 - том загрузки не найден, иначе код ошибки VFS. На томе только
+   для чтения - через окно записи: звать только после согласия
+   пользователя. */
+INTN settings_write(const char *name, const void *data, UINTN n, char *where, UINTN cap)
+{
+    VFS_MOUNT *m = settings_mount();
+
+    if (m == NULL)
         return -1;
 
-    ksnprintf(dir, sizeof(dir), "/%s/EFI/MyOS", vol);
+    char dir[48];
+    ksnprintf(dir, sizeof(dir), "/%s/EFI/MyOS", m->name);
+    ksnprintf(where, cap, "%s/%s", dir, name);
+
+    BOOLEAN opened = settings_window_open(m);
+    VFS_DIRENT e;
+    INTN r = VFS_OK;
+
+    if (vfs_stat(dir, &e) != VFS_OK)
+        r = vfs_mkdir(dir);
+
+    if (r == VFS_OK)
+        r = vfs_write_file(where, data, n, FALSE);
+
+    settings_window_close(m, opened);
+    return r;
+}
+
+/* Удалить файл настроек (тоже через окно записи, если нужно) */
+INTN settings_remove(const char *name, char *where, UINTN cap)
+{
+    VFS_MOUNT *m = settings_mount();
+
+    if (m == NULL)
+        return -1;
+
+    ksnprintf(where, cap, "/%s/EFI/MyOS/%s", m->name, name);
 
     VFS_DIRENT e;
 
-    if (vfs_stat(dir, &e) != 0) {
-        INTN r = vfs_mkdir(dir);
-        if (r != 0)
-            return r;
-    }
+    if (vfs_stat(where, &e) != VFS_OK)
+        return VFS_ENOENT;
 
-    ksnprintf(where, cap, "%s/%s", dir, name);
+    BOOLEAN opened = settings_window_open(m);
+    INTN r = vfs_remove(where);
+    settings_window_close(m, opened);
 
-    return vfs_write_file(where, data, n, FALSE);
+    return r;
 }

@@ -1037,8 +1037,14 @@ def main():
             ('wifi save\n', 'Connect first', 10),
             ('wifi connect MyOS-Test myos-wifi-test\n',
              'Wi-Fi is up: wlan0 address 192.168.77.2', 60),
-            ('wifi save\n', "Saved network 'MyOS-Test' to /sata0/EFI/MyOS/wifi.cfg", 15),
+            # диск загрузки - "внутренний" (только чтение, как на ноутбуке):
+            # без подтверждения не пишем; с ним - только EFI/MyOS/wifi.cfg
+            ('disk protect sata0\n', 'sata0 is read-only now', 10),
+            ('wifi save\n', 'To allow that, type:  wifi save confirm', 15),
+            ('wifi save confirm\n', "Saved network 'MyOS-Test' to /sata0/EFI/MyOS/wifi.cfg", 15),
             ('cat /sata0/efi/myos/wifi.cfg\n', 're:psk=[0-9a-f]{64}', 15),
+            ('cd /sata0\n', '', 1),
+            ('write other.txt hi\n', 're:(?i)read-only', 15),
         ], ['-machine', 'q35']))
         CUSTOM_BOOT_DISKS['wifi-save-reboot'] = os.path.join(work, 'wifi-save.img')
         runs.append(('wifi-save-reboot', [
@@ -1047,6 +1053,7 @@ def main():
             ('wifi sim\n', 'interface wlan0 ready', 20),
             ('wifi\n', "Saved network: 'MyOS-Test'", 15),
             ('wifi connect\n', 'Wi-Fi is up: wlan0 address 192.168.77.2', 60),
+            ('disk protect sata0\n', 'sata0 is read-only now', 10),
             ('wifi forget\n', 'Forgot the saved network', 15),
             ('wifi connect\n', 'usage: wifi connect', 15),
         ], ['-machine', 'q35']))

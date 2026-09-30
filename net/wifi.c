@@ -642,12 +642,25 @@ static void wifi_show_saved(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
                      "uses it now.\n", w.ssid, where);
 }
 
-static void wifi_cmd_save(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
+static void wifi_cmd_save(SIMPLE_TEXT_OUTPUT_INTERFACE *out, BOOLEAN confirmed)
 {
     WIFI_SAVED w;
 
     if (!wlan_current(w.ssid, sizeof(w.ssid), w.pmk, &w.has_pass)) {
         print(out, "Connect first ('wifi connect <name> <password>'), then 'wifi save'.\n");
+        return;
+    }
+
+    /* MyOS загружена с внутреннего диска (рядом с Arch), а его она
+       держит только для чтения - спросить разрешения */
+    char where[96];
+
+    if (settings_readonly() && !confirmed) {
+        settings_path(WIFI_CFG, where, sizeof(where));
+        kprintf(out, "MyOS booted from the computer's internal disk, which it keeps read-only\n"
+                     "(your other system lives there). Saving writes ONE file into MyOS's own\n"
+                     "folder: %s\n"
+                     "To allow that, type:  wifi save confirm\n", where);
         return;
     }
 
@@ -665,7 +678,6 @@ static void wifi_cmd_save(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
     n += ksnprintf(text + n, sizeof(text) - n, "\n");
 
-    char where[96];
     INTN r = settings_write(WIFI_CFG, text, n, where, sizeof(where));
 
     if (r == -1) {
@@ -687,13 +699,7 @@ static void wifi_cmd_save(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 static void wifi_cmd_forget(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 {
     char where[96];
-
-    if (!settings_path(WIFI_CFG, where, sizeof(where))) {
-        print(out, "No saved network.\n");
-        return;
-    }
-
-    INTN r = vfs_remove(where);
+    INTN r = settings_remove(WIFI_CFG, where, sizeof(where));
 
     if (r == VFS_OK)
         kprintf(out, "Forgot the saved network (%s deleted).\n", where);
@@ -722,8 +728,8 @@ void wifi_boot_autoconnect(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
 
 void kernel_cmd_wifi(SIMPLE_TEXT_OUTPUT_INTERFACE *out, const char *arg)
 {
-    if (kstreq(arg, "save")) {
-        wifi_cmd_save(out);
+    if (kstreq(arg, "save") || kstreq(arg, "save confirm")) {
+        wifi_cmd_save(out, kstreq(arg, "save confirm"));
         return;
     }
 

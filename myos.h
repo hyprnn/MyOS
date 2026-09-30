@@ -2591,6 +2591,7 @@ INTN blk_register_disk(const char *prefix, const char *kind, const char *model,
                        UINT32 drv_serial);
 void blk_remove(UINTN idx);
 BOOLEAN blk_read(UINTN dev, UINT64 lba, UINT32 count, VOID *buf);
+extern INTN g_blk_write_window;
 BOOLEAN blk_write(UINTN dev, UINT64 lba, UINT32 count, const VOID *buf);
 void blk_sync_usb(void);
 void blk_scan_partitions(UINTN idx);
@@ -2877,7 +2878,9 @@ void wifi_boot_autoconnect(SIMPLE_TEXT_OUTPUT_INTERFACE *out);
 /* --- kernel/settings.c (настройки в EFI/MyOS тома загрузки, этап 9) --- */
 BOOLEAN settings_boot_volume(char *vol, UINTN cap);
 BOOLEAN settings_path(const char *name, char *out, UINTN cap);
+BOOLEAN settings_readonly(void);
 INTN settings_write(const char *name, const void *data, UINTN n, char *where, UINTN cap);
+INTN settings_remove(const char *name, char *where, UINTN cap);
 BOOLEAN net_status_line(char *buf, UINTN cap);
 void net_gui_indicator(char *buf, UINTN cap);
 

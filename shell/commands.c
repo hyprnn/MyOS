@@ -292,7 +292,7 @@ void run_command(
             "  ps            - threads: state, CPU share, stack, what they wait for\n"
             "  threadtest    - live test: preemption, fair sharing, mutex\n"
             "  spin <sec>    - keep the CPU 100% busy (other threads still run)\n"
-            "  disk [read N] - USB flash drives: list, show a sector\n"
+            "  disk [read N] - disks: list, show a sector; disk protect <disk> - make read-only\n"
         );
 
         print(
