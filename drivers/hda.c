@@ -744,18 +744,24 @@ static void hda_jack_check(void)
 static void hda_thread(void *arg)
 {
     (void)arg;
-    UINTN n = 0;
+    UINT64 last_jack = 0;
 
     for (;;) {
 
         kmutex_lock(&g_hda_mutex);
         hda_advance();
-        if (++n % 50 == 0)
+        if (g_kticks - last_jack >= 500) {
+            last_jack = g_kticks;
             hda_jack_check();
+        }
+        BOOLEAN idle = (g_written <= g_played && g_hda.owner_pid == 0);
         kmutex_unlock(&g_hda_mutex);
 
         sched_wake_all(&g_hda);          /* ждущим места в кольце */
-        sched_sleep_ms(10);
+
+        /* играет - каждые 10 мс; тишина - реже (ноутбук спит дольше);
+           кольцо тогда в тишине и так крутит нули */
+        sched_sleep_ms(idle ? 100 : 10);
     }
 }
 

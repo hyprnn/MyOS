@@ -432,8 +432,11 @@ void apps_desktop_launch(const char *what)
     else if (kstreq(what, "calc") || kstreq(what, "guess") ||
              kstreq(what, "primes") || kstreq(what, "hello") || kstreq(what, "crash"))
         app_open_program(what);
+    else if (kstreq(what, "doom"))
+        /* экран побольше (ноутбук 1366x768) - окно DOOM в 1.5 раза крупнее */
+        app_run_bare(g_kfb_w >= 1100 && g_kfb_h >= 700 ? "doom -big" : "doom");
     else if (kstreq(what, "clock") || kstreq(what, "paint") || kstreq(what, "life") ||
-             kstreq(what, "browser") || kstreq(what, "mines") || kstreq(what, "doom"))
+             kstreq(what, "browser") || kstreq(what, "mines"))
         app_run_bare(what);          /* графическая программа - без терминала */
     else
         app_open_program(what);

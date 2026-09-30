@@ -18,6 +18,9 @@
  * стрелять, пробел - открыть дверь, Shift - бежать, Alt - шаг вбок,
  * 1..7 - оружие, Esc - меню, Tab - карта.
  *
+ * doom -big - окно 960x600 (кадр увеличен в полтора раза): для экранов
+ * от 1024x768, например ноутбука 1366x768.
+ *
  * Где файл игры (WAD): doom -iwad путь; иначе ищем doom1.wad, doom.wad,
  * doom2.wad, freedoom1.wad, freedoom2.wad в текущей папке, в корне
  * каждого диска и в папках EFI/MyOS и doom на них. Бесплатный doom1.wad
@@ -44,6 +47,8 @@
 
 static int g_win;
 static unsigned int *g_px;
+static int g_big;                 /* -big: окно в 1.5 раза больше */
+static int g_ww, g_wh;            /* размер окна */
 
 /* очередь клавиш: (нажата << 8) | код DOOM */
 #define KQ 64
@@ -111,7 +116,10 @@ static void pump_events(void)
 
 void DG_Init(void)
 {
-    g_win = (int)myos_syscall3(SYS_WIN_CREATE, DOOMGENERIC_RESX, DOOMGENERIC_RESY, (long)"DOOM");
+    g_ww = g_big ? DOOMGENERIC_RESX * 3 / 2 : DOOMGENERIC_RESX;
+    g_wh = g_big ? DOOMGENERIC_RESY * 3 / 2 : DOOMGENERIC_RESY;
+
+    g_win = (int)myos_syscall3(SYS_WIN_CREATE, g_ww, g_wh, (long)"DOOM");
 
     if (g_win < 0) {
         printf("doom: no window (%d) - start the desktop first ('start')\n", g_win);
@@ -123,7 +131,23 @@ void DG_Init(void)
 
 void DG_DrawFrame(void)
 {
-    memcpy(g_px, DG_ScreenBuffer, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+    if (!g_big) {
+        memcpy(g_px, DG_ScreenBuffer, DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+    } else {
+        /* x1.5 "ближайшим соседом": каждая точка окна берёт точку кадра
+           с координатами x*2/3, y*2/3 */
+        static int sx[DOOMGENERIC_RESX * 3 / 2];
+        for (int x = 0; x < g_ww; x++)
+            sx[x] = x * 2 / 3;
+        for (int y = 0; y < g_wh; y++) {
+            const unsigned int *src = (const unsigned int *)DG_ScreenBuffer +
+                                      (y * 2 / 3) * DOOMGENERIC_RESX;
+            unsigned int *dst = g_px + y * g_ww;
+            for (int x = 0; x < g_ww; x++)
+                dst[x] = src[sx[x]];
+        }
+    }
+
     myos_syscall3(SYS_WIN_UPDATE, g_win, 0, 0);
     pump_events();
 }
@@ -226,9 +250,12 @@ int main(int argc, char **argv)
     static char wad[320];
     int have_iwad = 0;
 
-    for (int i = 1; i < argc; i++)
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-iwad") == 0)
             have_iwad = 1;
+        if (strcmp(argv[i], "-big") == 0)
+            g_big = 1;
+    }
 
     /* нет -iwad - найти самим и дописать в аргументы */
     char **av = argv;

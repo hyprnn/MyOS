@@ -11,7 +11,7 @@
 #include "myos.h"
 
 #define W 380
-#define H 230
+#define H 262
 
 /* "Сеть: ..." - как net_status_line в ядре */
 static void net_line(char *buf, size_t cap)
@@ -51,16 +51,17 @@ static void paint(GFX *g)
     gfx_text_bold(g, x, y, "MyOS", GFX_NAVY); y += 22;
     gfx_text(g, x, y, "Операционная система", GFX_BLACK); y += 16;
     gfx_text(g, x, y, "с нуля, без Linux и Windows.", GFX_BLACK); y += 24;
-    gfx_text(g, 16, y, "Своё ядро: память, потоки, диски (FAT),", GFX_BLACK); y += 16;
-    gfx_text(g, 16, y, "программы в кольце 3 и эта оконная", GFX_BLACK); y += 16;
-    gfx_text(g, 16, y, "система с композитором; сеть TCP/IP.", GFX_BLACK); y += 24;
+    gfx_text(g, 16, y, "Своё ядро: память, потоки, все ядра CPU,", GFX_BLACK); y += 16;
+    gfx_text(g, 16, y, "диски (FAT, exFAT), сеть TCP/IP и Wi-Fi,", GFX_BLACK); y += 16;
+    gfx_text(g, 16, y, "звук HD Audio; программы в кольце 3 и", GFX_BLACK); y += 16;
+    gfx_text(g, 16, y, "эта оконная система в стиле Aero.", GFX_BLACK); y += 24;
 
     char net[64], line[80];
     net_line(net, sizeof(net));
     snprintf(line, sizeof(line), "Сеть: %s", net);
     gfx_text(g, 16, y, line, GFX_BLACK); y += 20;
 
-    gfx_text(g, 16, y, "Меню «Пуск» → программы и игры.", GFX_SHADOW);
+    gfx_text(g, 16, y, "Меню «Пуск» → программы и игры (DOOM!).", GFX_SHADOW);
 }
 
 int main(void)
