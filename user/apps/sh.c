@@ -6,7 +6,7 @@
  * делает она:
  *   * редактор строки: стрелки влево/вправо, Home/End, Backspace,
  *     Delete, история стрелками вверх/вниз, Ctrl+C - стереть строку;
- *   * встроенные команды: cd, pwd, jobs, history, help;
+ *   * встроенные команды: cd, pwd, jobs, history, help, exit;
  *   * программы из /bin (и по пути) - на переднем плане или в фоне
  *     ("primes 1000000 &"), вывод - в файл ("ls > list.txt",
  *     ">> list.txt" - дописать);
@@ -396,6 +396,7 @@ static void help(void)
 {
     out_str("MyOS shell (/bin/sh) - a program, not part of the kernel:\n"
             "  cd DIR, pwd       - current folder     history - last commands\n"
+            "  exit              - leave (console: power off; window: close it)\n"
             "  PROGRAM &         - run in background  jobs    - background programs\n"
             "  CMD > FILE        - output to a file (>> FILE - append)\n"
             "  keys: Left/Right, Home/End, Del, Up/Down (history), Ctrl+C, PageUp/Down\n"
@@ -495,6 +496,12 @@ static void execute(char *line)
         return;
     }
 
+    /* exit: закончить шелл. В консоли ядро выключит машину (как и
+       раньше в MyOS), в окне-терминале закроется окно */
+    if (strcmp(name, "exit") == 0) {
+        exit(0);
+    }
+
     if (strcmp(name, "help") == 0 && args[0] == '\0' && out_path == 0) {
         help();
         return;
@@ -544,10 +551,24 @@ static void execute(char *line)
 
 int main(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
-
     char line[CMD_BYTES];
+
+    /* аргументы - первая команда (ярлык программы на рабочем столе
+       открывает терминал с "sh calc"), дальше - как обычно */
+    if (argc > 1) {
+        int k = 0;
+        for (int i = 1; i < argc; i++) {
+            k += snprintf(line + k, sizeof(line) - (size_t)k, "%s%s", i > 1 ? " " : "", argv[i]);
+            if (k >= (int)sizeof(line) - 1)
+                break;
+        }
+        make_prompt();
+        out_str(g_prompt);
+        out_str(line);
+        out_str("\n");
+        hist_add(line);
+        execute(line);
+    }
 
     for (;;) {
 

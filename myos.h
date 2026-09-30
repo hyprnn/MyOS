@@ -1090,6 +1090,13 @@ typedef struct VFS_MOUNT {
 /* Куда программа пишет и откуда читает (fd 0, 1, 2) */
 #define PROC_IO_CONSOLE 0      /* текстовая консоль шелла */
 #define PROC_IO_GUI     1      /* окно терминала GUI */
+#define PROC_IO_TTY     2      /* окно-терминал рабочего стола (gui/tty.c) */
+
+/* Терминал рабочего стола (gui/tty.c, этап 10) */
+#define TTY_COLS   80
+#define TTY_LINES  300          /* строк истории */
+#define TTY_KEYS   64
+typedef struct KTTY KTTY;
 
 typedef struct KPROC {
     BOOLEAN          used;
@@ -1131,6 +1138,7 @@ typedef struct KPROC {
     BOOLEAN          was_fg;              /* её запустили на переднем плане */
     BOOLEAN          kcmd_probe;          /* SYS_KCMD: неизвестная команда - */
     BOOLEAN          kcmd_unknown;        /*   не печатать, а сказать шеллу */
+    KTTY            *tty;                 /* PROC_IO_TTY: окно-терминал */
 } KPROC;
 
 /* TSS (64-битный), см. kernel/cpu.c */
@@ -2674,7 +2682,19 @@ void proc_switch_hook(KTHREAD *next);
 void kx_syscall_cpu_init(void);
 KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err);
 KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *cwd,
-                     KPROC *parent, INTN out_kfd, INTN *err);
+                     KPROC *parent, INTN out_kfd, KTTY *tty, INTN *err);
+
+/* --- gui/tty.c (терминал рабочего стола) --- */
+void tty_open_window(const char *cmd);
+void tty_ref(KTTY *t);
+void tty_unref(KTTY *t);
+void tty_putc(KTTY *t, UINT32 c);
+void tty_write(KTTY *t, const char *s, UINTN n);
+INT32 tty_getkey(KTTY *t, KPROC *p, INT64 timeout_ms);
+INTN tty_read_line(KTTY *t, KPROC *p, char *dst, UINTN n);
+SIMPLE_TEXT_OUTPUT_INTERFACE *tty_output(KTTY *t);
+void tty_set_fg(KTTY *t, KPROC *p);
+KPROC *tty_get_fg(KTTY *t);
 void kernel_shell_main(void) __attribute__((noreturn));
 INT64 proc_wait(KPROC *p);
 void proc_reap(KPROC *p);

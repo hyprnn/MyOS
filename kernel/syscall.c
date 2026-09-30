@@ -656,7 +656,7 @@ static INT64 sys_spawn(KPROC *p, UINT64 usp)
     }
 
     INTN err = VFS_OK;
-    KPROC *c = proc_spawn_ex(path, args, p->io, p->cwd, p, out_kfd, &err);
+    KPROC *c = proc_spawn_ex(path, args, p->io, p->cwd, p, out_kfd, NULL, &err);
 
     if (c == NULL)
         return err;
@@ -664,7 +664,10 @@ static INT64 sys_spawn(KPROC *p, UINT64 usp)
     /* на переднем плане: Ctrl+C - ей (а не шеллу) */
     if (sp.flags & MYOS_SPAWN_FG) {
         c->was_fg = TRUE;
-        g_fg_proc = c;
+        if (p->io == PROC_IO_TTY)
+            tty_set_fg(p->tty, c);
+        else
+            g_fg_proc = c;
     }
 
     return c->pid;
@@ -707,8 +710,14 @@ static INT64 sys_wait(KPROC *p, INT64 pid, UINT64 uinfo, UINT32 flags)
     }
 
     /* передний план - снова шеллу */
-    if (c->was_fg && (g_fg_proc == c || g_fg_proc == NULL))
-        g_fg_proc = p;
+    if (c->was_fg) {
+        if (p->io == PROC_IO_TTY) {
+            if (tty_get_fg(p->tty) == c || tty_get_fg(p->tty) == NULL)
+                tty_set_fg(p->tty, p);
+        } else if (g_fg_proc == c || g_fg_proc == NULL) {
+            g_fg_proc = p;
+        }
+    }
 
     proc_reap(c);
     return 1;
@@ -721,10 +730,13 @@ static INT64 sys_wait(KPROC *p, INT64 pid, UINT64 uinfo, UINT32 flags)
  */
 static INT64 sys_readkey(KPROC *p, INT64 timeout_ms)
 {
-    if (p->io != PROC_IO_CONSOLE)
-        return MYOS_ENOSYS;          /* окно GUI - этап Д2 */
-
     p->raw_keys = TRUE;
+
+    if (p->io == PROC_IO_TTY && p->tty != NULL)
+        return tty_getkey(p->tty, p, timeout_ms);
+
+    if (p->io != PROC_IO_CONSOLE)
+        return MYOS_ENOSYS;
 
     UINT64 t0 = g_kticks;
 
@@ -865,12 +877,16 @@ static INT64 sys_kcmd(KPROC *p, UINT64 uline, UINT64 upath, UINT32 flags)
     if (r != VFS_OK)
         return r;
 
-    if (p->io != PROC_IO_CONSOLE)
-        return MYOS_ENOSYS;          /* окно GUI - этап Д2 */
+    if (p->io != PROC_IO_CONSOLE && !(p->io == PROC_IO_TTY && p->tty != NULL))
+        return MYOS_ENOSYS;
 
     KCMD_FILE_OUT fo;
     EFI_SYSTEM_TABLE st = *g_st;
     BOOLEAN to_file = (upath != 0);
+
+    /* шелл в окне-терминале: вывод команды - в это окно */
+    if (p->io == PROC_IO_TTY)
+        st.ConOut = tty_output(p->tty);
 
     if (to_file) {
 
@@ -880,7 +896,7 @@ static INT64 sys_kcmd(KPROC *p, UINT64 uline, UINT64 upath, UINT32 flags)
         if (r != VFS_OK)
             return r;
 
-        fo.o = *g_st->ConOut;
+        fo.o = *st.ConOut;
         fo.o.OutputString = kcmd_file_string;
         fo.o.SetAttribute = kcmd_file_nop_attr;
         fo.o.ClearScreen = kcmd_file_nop;
@@ -937,6 +953,9 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
         if ((a1 == 1 || a1 == 2) && p->out_kfd >= 0) {
             /* шелл запустил с "> файл" */
             r = vfs_write(p->out_kfd, (const VOID *)(UINTN)a2, (UINTN)a3);
+        } else if ((a1 == 1 || a1 == 2) && p->io == PROC_IO_TTY && p->tty != NULL) {
+            tty_write(p->tty, (const char *)(UINTN)a2, (UINTN)a3);
+            r = (INT64)a3;
         } else if (a1 == 1 || a1 == 2) {
             proc_out(p, (const char *)(UINTN)a2, (UINTN)a3);
             r = (INT64)a3;
@@ -953,8 +972,11 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
     case SYS_READ: {
         if (!uptr_ok(p, a2, a3, TRUE)) { r = MYOS_EFAULT; break; }
         if (a1 == 0) {
-            r = (p->io == PROC_IO_GUI) ? proc_read_gui(p, (char *)(UINTN)a2, (UINTN)a3)
-                                       : proc_read_console(p, (char *)(UINTN)a2, (UINTN)a3);
+            if (p->io == PROC_IO_TTY && p->tty != NULL)
+                r = tty_read_line(p->tty, p, (char *)(UINTN)a2, (UINTN)a3);
+            else
+                r = (p->io == PROC_IO_GUI) ? proc_read_gui(p, (char *)(UINTN)a2, (UINTN)a3)
+                                           : proc_read_console(p, (char *)(UINTN)a2, (UINTN)a3);
         } else {
             INTN kfd = fd_kernel(p, (INT64)a1);
             if (kfd >= 0 && (kfd & PROC_FD_SOCK))
@@ -1118,6 +1140,11 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
         if (p->io == PROC_IO_CONSOLE &&
             g_st->ConIn->ReadKeyStroke(g_st->ConIn, &key) == EFI_SUCCESS)
             r = key.UnicodeChar ? key.UnicodeChar : (0x100 + key.ScanCode);
+        if (p->io == PROC_IO_TTY && p->tty != NULL) {
+            INT32 k = tty_getkey(p->tty, p, 0);
+            if (k > 0)
+                r = (k & MYOS_KEY_SPECIAL) ? 0x100 + (k & 0xFFFF) : k;
+        }
         break;
     }
 

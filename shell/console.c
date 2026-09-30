@@ -381,11 +381,16 @@ void print(
     if (!g_scrollback_replaying)
         serial_puts(s);   /* no-op, пока COM1 не включён */
 
+    /* история экрана (PageUp) - только у текстовой консоли; вывод в
+       окно-терминал или в файл (команды шелла, этап 10) - не её */
+    BOOLEAN to_console = (out == &g_kcon_out);
+
     while (*s) {
 
         if (*s == '\n') {
 
-            scrollback_char(L'\n');
+            if (to_console)
+                scrollback_char(L'\n');
 
             buf[0] = L'\r';
             out->OutputString(out, buf);
@@ -398,7 +403,8 @@ void print(
             CHAR16 c =
                 (CHAR16)(unsigned char)*s;
 
-            scrollback_char(c);
+            if (to_console)
+                scrollback_char(c);
 
             buf[0] = c;
 
@@ -415,7 +421,7 @@ void print(
      * Если мы не перерисовываем scrollback,
      * новый вывод возвращает нас вниз.
      */
-    if (!g_scrollback_replaying)
+    if (!g_scrollback_replaying && to_console)
         g_scrollback_view = 0;
 }
 

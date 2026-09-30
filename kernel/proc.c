@@ -605,6 +605,14 @@ void proc_reap(KPROC *p)
         p->out_kfd = -1;
     }
 
+    if (p->tty != NULL) {
+        KTTY *t = p->tty;
+        p->tty = NULL;
+        if (tty_get_fg(t) == p)
+            tty_set_fg(t, NULL);
+        tty_unref(t);
+    }
+
     /* сокеты, которые программа не успела отдать (на всякий случай) */
     sock_close_pid(p->pid);
 
@@ -622,7 +630,7 @@ void proc_reap(KPROC *p)
  */
 KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err)
 {
-    return proc_spawn_ex(path, args, io, NULL, NULL, -1, err);
+    return proc_spawn_ex(path, args, io, NULL, NULL, -1, NULL, err);
 }
 
 /* Убрать завершившиеся программы, которых никто не ждёт (их родитель
@@ -645,7 +653,7 @@ static void proc_sweep_orphans(void)
  * уборке), даже если запустить не вышло.
  */
 KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *cwd,
-                     KPROC *parent, INTN out_kfd, INTN *err)
+                     KPROC *parent, INTN out_kfd, KTTY *tty, INTN *err)
 {
     *err = VFS_OK;
 
@@ -718,6 +726,12 @@ KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *
     /* с этого места файл вывода - у программы: его закроет proc_reap */
     p->out_kfd = out_kfd;
     p->parent = parent;
+
+    /* окно-терминал: своё или родителя (шелл в окне запускает программу) */
+    if (io == PROC_IO_TTY) {
+        p->tty = tty ? tty : (parent ? parent->tty : NULL);
+        tty_ref(p->tty);
+    }
 
     proc_name_from(path, p->name);
     ksnprintf(p->path, sizeof(p->path), "%s", path);
@@ -811,6 +825,10 @@ void proc_exit_current(INT64 code)
 
         if (g_fg_proc == p)
             g_fg_proc = NULL;
+
+        /* в окне-терминале передний план - снова тому, кто её запустил */
+        if (p->tty != NULL && tty_get_fg(p->tty) == p)
+            tty_set_fg(p->tty, (p->parent && p->parent->tty == p->tty) ? p->parent : NULL);
 
         /* её программы (запущенные в фоне и не дождавшиеся) - сироты:
            уберутся сами, когда закончатся */

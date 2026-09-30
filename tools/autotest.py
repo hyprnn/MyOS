@@ -697,6 +697,15 @@ def main():
             # пункт "Терминал" (1-й, y=549..569): курсор в (60,559)
             ({'goto': (60, 559)}, '', 0.3),
             ({'click': 1}, "re:wm: window .* opened", 8),
+            # в окне терминала - тот же /bin/sh (этап 10): команды ядра,
+            # программы, вывод в файл, Ctrl+C останавливает программу
+            ('', "re:proc: pid [0-9]+ 'sh' enters ring 3", 10),
+            ('cpu\n', 're:term: CPU cores: [0-9]+ running', 15),
+            ('hello\n', 'term: Hello from ring 3', 15),
+            ('primes 100000 > /ram/p.txt\n', '', 2),
+            ('cat /ram/p.txt\n', 're:term: 9592 primes', 15),
+            ('crash loop\n', 're:term: .*Ctrl\\+C', 15),
+            ({'key': 'ctrl-c'}, 're:term: \\*\\*\\* crash .* stopped with Ctrl\\+C', 10),
             # снова меню -> "Часы" (6-й пункт, y=549+5*20=649..669)
             ({'goto': (20, 786)}, '', 0.3),
             ({'click': 1}, '', 0.4),
