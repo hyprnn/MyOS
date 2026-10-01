@@ -23,6 +23,7 @@ MyOS autotest: загрузить ОС в QEMU без окна, "понажим�
 """
 import argparse, base64, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time, zlib
 import http.server, urllib.request
+import shutil
 from shutil import which as shutil_which
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fatimg
@@ -277,6 +278,84 @@ def build_linux_tests(work):
         files['busybox'] = open(bb, 'rb').read()
         files['test.sh'] = open(os.path.join(root, 'tests', 'linux', 'test.sh'), 'rb').read()
     return files
+
+
+# ------------------------------------------------------------ корень Arch Linux
+
+ARCH_IMAGE = 'https://mirror.gcr.io/v2/library/archlinux'
+ARCH_CACHE = os.path.join(os.path.expanduser('~'), '.cache', 'myos', 'archlinux-rootfs.tar.gz')
+ARCH_HOME_UUID = '11111111-2222-3333-4444-555555555555'
+
+
+def get_arch_rootfs():
+    """Корень Arch Linux (tar.gz слоя официального образа archlinux из
+    Docker Hub через зеркало mirror.gcr.io). Берётся из MYOS_ARCH_ROOTFS
+    или кэша ~/.cache/myos; нет - скачивается (130 МБ). None - взять
+    негде (тогда прогон arch пропускается)."""
+    env = os.environ.get('MYOS_ARCH_ROOTFS')
+    if env and os.path.exists(env):
+        return env
+    if os.path.exists(ARCH_CACHE):
+        return ARCH_CACHE
+    import json
+
+    def get(url, accept):
+        req = urllib.request.Request(url, headers={'Accept': accept})
+        return urllib.request.urlopen(req, timeout=60)
+    try:
+        idx = json.load(get(ARCH_IMAGE + '/manifests/latest',
+                            'application/vnd.oci.image.index.v1+json'))
+        dig = [m['digest'] for m in idx['manifests']
+               if m.get('platform', {}).get('architecture') == 'amd64'][0]
+        man = json.load(get(ARCH_IMAGE + '/manifests/' + dig,
+                            'application/vnd.oci.image.manifest.v1+json'))
+        big = max(man['layers'], key=lambda l: l['size'])
+        os.makedirs(os.path.dirname(ARCH_CACHE), exist_ok=True)
+        tmp = ARCH_CACHE + '.part'
+        with get(ARCH_IMAGE + '/blobs/' + big['digest'], '*/*') as r, open(tmp, 'wb') as f:
+            shutil.copyfileobj(r, f)
+        os.rename(tmp, ARCH_CACHE)
+        return ARCH_CACHE
+    except Exception as e:
+        print('arch: cannot download the Arch Linux image (%s)' % e)
+        return None
+
+
+def build_arch_disks(work, tarball):
+    """Два NVMe-диска "как на ноутбуке": корень Arch (ext4, с
+    /opt/myos/archtest.sh и строкой /home в /etc/fstab) и отдельный
+    /home (ext4, UUID из fstab). False - нечем собрать (нет mkfs.ext4)."""
+    mkfs = shutil_which('mkfs.ext4') or ('/usr/sbin/mkfs.ext4' if os.path.exists('/usr/sbin/mkfs.ext4') else None)
+    if mkfs is None:
+        print('arch: mkfs.ext4 is not installed')
+        return False
+    root = os.path.join(work, 'archroot')
+    os.makedirs(root, exist_ok=True)
+    r = subprocess.run(['tar', '-xzf', tarball, '-C', root], capture_output=True)
+    if r.returncode != 0:
+        print('arch: cannot unpack the image: %s' % r.stderr.decode()[-300:])
+        return False
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.makedirs(os.path.join(root, 'opt', 'myos'), exist_ok=True)
+    shutil.copy(os.path.join(here, 'tests', 'linux', 'archtest.sh'),
+                os.path.join(root, 'opt', 'myos', 'archtest.sh'))
+    with open(os.path.join(root, 'etc', 'fstab'), 'a') as f:
+        f.write('UUID=%s\t/home\text4\trw,relatime\t0 2\n' % ARCH_HOME_UUID)
+    home = os.path.join(work, 'archhome')
+    os.makedirs(os.path.join(home, 'user'), exist_ok=True)
+    open(os.path.join(home, 'user', 'hello.txt'), 'w').write('hello from home\n')
+    for src, part, disk, size, extra in (
+            (root, 'archroot.part', 'archroot.img', '1100M', ['-L', 'ARCHROOT']),
+            (home, 'archhome.part', 'archhome.img', '32M', ['-L', 'ARCHHOME', '-U', ARCH_HOME_UUID])):
+        pp = os.path.join(work, part)
+        r = subprocess.run([mkfs, '-q', '-F'] + extra + ['-d', src, pp, size], capture_output=True)
+        if r.returncode != 0:
+            print('arch: mkfs.ext4 failed: %s' % r.stderr.decode()[-300:])
+            return False
+        fatimg.gpt_wrap(os.path.join(work, disk), pp, 'linux', part.split('.')[0])
+        os.remove(pp)
+    shutil.rmtree(root, ignore_errors=True)
+    return True
 
 
 def make_test_disk(path, mib, bits, scheme, label, extra=None):
@@ -1100,6 +1179,29 @@ def main():
             runs.append(('linux', lsteps,
                          ['-drive', 'if=none,id=lstick,format=raw,file=@WORK@/linuxstick.img'],
                          ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=lstick']))
+        # программы Arch Linux (этап 11, шаг 2): корень Arch на ext4 (NVMe,
+        # только чтение) и /home из его fstab; bash и динамические
+        # программы, ссылки, pacman, gzip/xz/zstd, sqlite, openssl, curl
+        # по HTTP и HTTPS (сокеты), DNS
+        arch_tar = get_arch_rootfs()
+        if arch_tar and build_arch_disks(work, arch_tar):
+            ahp = start_host_http(os.path.join(work, 'www'))
+            ahsp = start_host_https(os.path.join(work, 'www'))
+            runs.append(('arch', [
+                (None, "Type 'help'", 90),
+                ('bash /opt/myos/archtest.sh http://10.0.2.2:%d https://10.0.2.2:%d %d\n'
+                 % (ahp, ahsp, len(BIG_DATA)), 'ARCHTEST DONE pass=40 fail=0', 400),
+                ('bash\n', 'Linux root is /nvme', 30),
+                ('cat /etc/os-release\n', 'NAME="Arch Linux"', 30),
+                ('readlink -f /lib64/ld-linux-x86-64.so.2\n', '/usr/lib/ld-linux-x86-64.so.2', 30),
+                ('exit\n', "'bash' exited with code 0", 30),
+            ], ['-drive', 'if=none,id=nv0,format=raw,file=@WORK@/archroot.img',
+                '-device', 'nvme,serial=ARCH1,drive=nv0',
+                '-drive', 'if=none,id=nv1,format=raw,file=@WORK@/archhome.img',
+                '-device', 'nvme,serial=HOME1,drive=nv1'],
+                ['qemu-xhci', 'usb-kbd'], ))
+        else:
+            print('SKIP arch (no Arch Linux image or mkfs.ext4)')
         # все ядра процессора (этап 10): 4 ядра - все проснулись
         runs.append(('smp', [
             (None, 'CPU cores: 4 of 4 running', 90),

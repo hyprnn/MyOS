@@ -916,11 +916,87 @@ UEFI: всё — EfiLoaderData, а что ядру не трогать, пере
   fxsave, а glibc при наличии AVX пользовалась бы ymm.
 * **Проверка**: прогон `linux` (autotest): `tests/linux/ltest.c`,
   собранная на хосте `gcc -static` (glibc) и `musl-gcc -static` —
-  32 проверки (память, файлы, fork/exec/vfork, потоки+mutex+TLS,
+  на шаге 1 32 проверки (память, файлы, fork/exec/vfork, потоки+mutex+TLS,
   cond timedwait, сигналы, SIGSEGV-обработчик, mprotect, EINTR, poll,
   /proc, /dev); busybox хоста (`apt install busybox-static`) — `uname -a`
   и сценарий `tests/linux/test.sh` (конвейеры, $(...), подоболочки, фон).
   Нужен пакет `musl-tools`; без него прогон пропускается.
-* **Дальше (шаг 2)**: чтение ext4 (раздел Arch только для чтения),
-  динамические программы (ld.so, `/usr/lib`), сеть для программ Linux
-  (AF_INET поверх своих сокетов, AF_UNIX), epoll, memfd. Шаг 3 — Wayland.
+
+## Программы Linux (этап 11, шаг 2) — файлы, память, сеть
+
+* **ext4** (`fs/ext4.c`) — только чтение, ВСЕГДА (`m->readonly`, запись
+  отвечает EROFS): суперблок, описатели групп (64bit, flex_bg, meta_bg),
+  inode (256 байт), экстенты и старые косвенные блоки, inline_data у
+  файлов, папки — чтение записей подряд (htree совместим), ссылки (до 60
+  байт — в inode). Кэш блоков 4096 страниц (по кругу, "второй шанс"),
+  кэш имён: папка читается целиком один раз, промах = "нет имени".
+  Большие куски файла — `blk_read` прямо в буфер. Неизвестные incompat —
+  не монтируем; RECOVER — монтируем с предупреждением в журнале.
+  Монтирует `blk_try_mount` / `vfs_mount_dev` (FAT → ext4 → exFAT).
+* **VFS**: в `VFS_NODE` — ino, mode (S_IF* как в Linux; 0 у FAT = "не
+  знаю"), uid/gid, nlink, rdev, mtime/atime/ctime; операция `readlink`.
+  `vfs_resolve_ex` проходит ссылки (в середине пути всегда, в конце —
+  если follow; абсолютная ссылка — от корня ТОГО ЖЕ тома: для шелла MyOS
+  `/nvme0p2` и есть корень Linux). `vfs_lstat`, `vfs_readlink`,
+  `vfs_fd_node`, `vfs_node_read`, ошибка `VFS_ELOOP`.
+* **Корень Linux** (lxfile.c, "Корень Linux"): `lx_root_volume` — первый
+  том ext4 с `/etc/os-release`; запоминается в `LXPROC.root` при запуске
+  из шелла (у потомков — тот же). `/etc/fstab` этого корня (UUID=,
+  LABEL=) → таблица точек монтирования (`/home` → `/nvme0p3`).
+  `lin_to_myos` / `lx_path_to_linux` — переводы путей; `/dev`, `/proc`,
+  `/sys`, `/tmp` — свои, `/myos/...` — тома MyOS, имя тома MyOS, которого
+  нет в корне Linux (`/usb0p1`), — тоже можно. `lx_walk` разбирает путь
+  по элементам и проходит ссылки по правилам Linux (абсолютная — от
+  корня Linux, `..` — после ссылки), в VFS уходит путь без ссылок, поэтому
+  `do_stat_path` всегда делает lstat. `lx_resolve_kpath` — для путей ядра
+  (PT_INTERP, `#!`). getcwd, `/proc/self/exe|cwd|fd/N`, argv[0],
+  AT_EXECFN, PWD — пути Linux. `HOME=/tmp/root`. Шелл MyOS ищет команду
+  в `/bin`, текущей папке, потом в `/usr/bin` корня Linux
+  (`proc_find_program`).
+* **Кэш страниц и объекты памяти** (`kernel/pcache.c`): у области
+  (`UVMA.obj`, `.off`) может быть объект: `UOBJ_FILE` — файл ext4 через
+  кэш страниц (ключ: том, поколение диска, inode, номер страницы; общие
+  страницы у всех процессов, отображаются ВСЕГДА с COW — даже без права
+  записи, иначе mprotect открыл бы запись в общую страницу) или
+  `UOBJ_TMPFS` — узел tmpfs (страницы узла прямо; так работают
+  MAP_SHARED файлов `/tmp` и `/dev/shm`, memfd — удалённый файл в
+  `/tmp`, и MAP_SHARED|MAP_ANONYMOUS — безымянный узел `tmpfs_anon`).
+  Кэш держит не больше половины памяти: страницы, которые никто не
+  отображает (refs == 1), отдаются. Загрузчик ELF тоже отображает
+  сегменты из кэша (хвост последней страницы перед .bss обнуляется в
+  своей копии — `uvm_own_page`). FAT/exFAT — по-старому (копия).
+* **Page Fault программы может спать** (cpu.c, `pf_sleepable`): на
+  время `uvm_fault_err` снимается `isr_depth` и разрешаются прерывания —
+  как в системном вызове (чтение страницы файла с диска). Поэтому
+  `kx_isr_dispatch` после обработчика берёт `kx_cpu()` заново — поток мог
+  проснуться на другом ядре. `uvm_fault_obj` после чтения перепроверяет
+  область и PTE (пока спали, другой поток мог всё поменять).
+* **NVMe**: до 128 КиБ за команду (буфер 32 страницы + список PRP,
+  с учётом MDTS).
+* **Сокеты** (`kernel/lxsock.c`): AF_INET — `LF_INET` поверх сокета MyOS
+  (всегда неблокирующий, pid 0 — живёт, пока есть LFILE; ждём сами через
+  `sock_poll_wait`, чтобы сигналы прерывали); адреса — из сетевого
+  порядка байт в порядок MyOS. AF_UNIX — `LF_UNIX`/`LUSOCK`: очередь
+  сообщений у каждого конца, STREAM/SEQPACKET/DGRAM, socketpair, bind
+  (пустой файл + таблица имён; stat даёт S_IFSOCK), listen/connect/
+  accept, SCM_RIGHTS (сообщение с файлами читается первым и не
+  сливается с соседними), SO_PEERCRED, MSG_PEEK/DONTWAIT/NOSIGNAL.
+  IPv6 и netlink — EAFNOSUPPORT (программы обходятся IPv4).
+  `/etc/resolv.conf` → `/proc/.myos/resolv.conf` (DNS от DHCP MyOS).
+  Сеть будит poll/epoll (`net_wake` → `lx_poll_wake`).
+* **epoll / timerfd** (lxsock.c): epoll — список (fd, LFILE*): запись
+  исчезает, когда номер закрыт или указывает на другой файл;
+  уровень; EPOLLET — только для EPOLLOUT по фронту; EPOLLONESHOT.
+  timerfd — по `lx_now_ns`, ожидание кусками `lx_wait_poll`.
+* **Проверка**: ltest — 40 проверок (+ memfd/MAP_SHARED/fork,
+  MAP_PRIVATE, socketpair+SCM_RIGHTS, unix listen/connect, epoll,
+  timerfd, TCP через 127.0.0.1). Прогон `arch`: корень Arch — слой
+  официального образа `archlinux` (Docker Hub, зеркало mirror.gcr.io;
+  кэш `~/.cache/myos/archlinux-rootfs.tar.gz`, или `MYOS_ARCH_ROOTFS`),
+  `mkfs.ext4 -d` → два NVMe (корень и `/home` по UUID из fstab);
+  `tests/linux/archtest.sh` — 40 проверок (bash, ссылки, coreutils,
+  gawk, gzip/xz/zstd, tar, sqlite, openssl, file, pacman, сигналы,
+  `/home`, curl HTTP/HTTPS). Нет образа или mkfs.ext4 — прогон
+  пропускается.
+* **Дальше (шаг 3)**: сервер Wayland в рабочем столе MyOS (wl_shm через
+  memfd + SCM_RIGHTS, xdg_shell, клавиатура и мышь). Шаг 4 — Firefox.

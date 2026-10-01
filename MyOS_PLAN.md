@@ -248,10 +248,14 @@ MyOS уже умеет главное, что отличает ОС от про�
   потоки (clone, futex), fork/vfork/execve/wait4, каналы, сигналы,
   termios, /dev, /proc, tmpfs `/tmp`, терминал VT100 с цветами. Проверка:
   статические программы glibc и musl (32 проверки), busybox.
-- [ ] **Шаг 2. Файлы Linux.** ext4 только для чтения (корень Arch:
-  `/dev/nvme0n1p2`), динамические программы (ld.so + `/usr/lib`), сеть
-  для программ Linux (AF_INET, AF_UNIX), epoll, eventfd, memfd, inotify
-  (заглушки). Проверка: bash, python из Arch.
+- [x] **Шаг 2. Файлы Linux.** ext4 только для чтения (корень Arch:
+  `/dev/nvme0n1p2`, `/home` — по его `/etc/fstab`), пространство имён
+  Linux со ссылками, динамические программы (ld.so + `/usr/lib`), кэш
+  страниц файлов и общая память (memfd, MAP_SHARED), сеть для программ
+  Linux (AF_INET поверх своего стека, AF_UNIX с SCM_RIGHTS), epoll,
+  timerfd. Проверка: прогон `arch` — образ Arch из Docker Hub, bash,
+  coreutils, gawk, pacman, gzip/xz/zstd, sqlite, openssl, curl по
+  HTTP/HTTPS (40 проверок); ltest — 40 проверок.
 - [ ] **Шаг 3. Wayland.** Сервер Wayland внутри рабочего стола MyOS
   (wl_shm, xdg_shell, клавиатура и мышь): окна программ Linux — окна
   MyOS. Проверка: gtk3-demo, foot.

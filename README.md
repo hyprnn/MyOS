@@ -291,22 +291,38 @@ MyOS запускает все ядра процессора (у HP 250 G7 их 
 
 MyOS запускает **обычные программы, собранные для Linux** (x86-64), —
 без пересборки: ядро отвечает на их системные вызовы так же, как ядро
-Linux (как WSL1 в Windows). Это первый шаг пути к Firefox. Пока
-работают статически собранные программы (glibc или musl), например
-busybox:
+Linux (как WSL1 в Windows). Это путь к Firefox.
 
-    /usb0p1/busybox uname -a          # Linux myos 6.1.0-myos ... x86_64
+**Программы Arch с диска ноутбука.** MyOS читает раздел Linux (ext4,
+только чтение — писать туда MyOS не будет никогда) и делает его корнем
+"/" для программ Linux. Поэтому программы Arch запускаются прямо по имени
+из терминала MyOS — шелл ищет их в `/usr/bin` корня Linux (свои команды
+MyOS, вроде `ls` и `cat`, — первыми):
+
+    bash                              # bash из Arch: всё как в Linux
+    python3 script.py
+    curl https://example.com          # сеть, HTTPS (OpenSSL из Arch)
+
+Внутри программ Linux пути — как в Linux: `/usr/lib`, `/etc`, `/home`
+(отдельный раздел — по `/etc/fstab` этого Linux), символьные ссылки.
+Своё у MyOS: `/tmp` (в памяти — сюда можно писать; `HOME=/tmp/root`),
+`/dev`, `/proc`, `/sys`, `/etc/resolv.conf` (DNS от MyOS). Тома MyOS —
+через `/myos/...` (например, `/myos/usb0p1/file`) или прямо `/usb0p1/...`.
+Без раздела Linux программа видит диски MyOS как есть.
+
+Статические программы (например, busybox) работают и с флешки:
+
     /usb0p1/busybox sh                # шелл Linux: ls, grep, sed, vi, конвейеры...
 
-Что уже есть: память по требованию (mmap, mprotect, fork с копированием
-при записи), потоки (pthread, futex), fork/execve/wait, каналы,
-сигналы (Ctrl+C — SIGINT), терминал Linux (termios; в окне-терминале —
-цвета и курсор VT100/xterm), `/dev/null`, `/dev/urandom`, `/proc/self/...`,
-`/tmp` (файлы в памяти, с папками). Программа Linux видит диски MyOS
-как есть: `/usb0p1/...`, `/bin`, `/ram`, `/tmp`.
+Что есть: память по требованию (mmap, mprotect, fork с копированием при
+записи; файлы — через общий кэш страниц: библиотеку читают с диска один
+раз на все процессы), динамические программы (ld.so, `/usr/lib`),
+потоки (pthread, futex), fork/execve/wait, каналы, сигналы (Ctrl+C —
+SIGINT), терминал Linux (termios; в окне-терминале — цвета и курсор
+VT100/xterm), сокеты TCP/UDP (сеть MyOS) и AF_UNIX (с передачей файлов
+между процессами), epoll, eventfd, timerfd, memfd, общая память.
 
-Пока нет: динамических программ (нужны библиотеки из `/usr/lib` — шаг 2:
-чтение раздела Arch), сети для программ Linux, окон (Wayland — шаг 3).
+Пока нет: окон (Wayland — шаг 3), потом — Firefox (шаг 4).
 
 ## Установка на диск рядом с Arch (этап 9)
 
@@ -336,7 +352,7 @@ MyOS можно поставить на диск ноутбука, не трог
 | `bootinfo.h` | "паспорт загрузки" - что загрузчик передаёт ядру, раскладка адресов |
 | `myos.h` | общий заголовок: константы, типы, глобальные переменные, функции |
 | `lib/` | строки, `kprintf`, COM1, `memcpy`/`memset` |
-| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `acpi_os.c` + `acpi_dev.c` AML через uACPI (батарея, EC, кнопка питания), `backlight.c` яркость экрана, `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`), `smp.c` остальные ядра процессора и большой замок ядра (`cpu`, `smptest`), `ushell.c` запуск шелла `/bin/sh` и аварийный шелл |
+| `kernel/` | `kmain.c` (запуск ядра), `kernel.ld` (раскладка), консоль, GDT/IDT/TSS, таймер, `pmm.c` страницы, `vmm.c` таблицы страниц, `kmalloc.c` куча, `acpi.c` таблицы ACPI (ядра процессора, I/O APIC, HPET, PCIe), `acpi_os.c` + `acpi_dev.c` AML через uACPI (батарея, EC, кнопка питания), `backlight.c` яркость экрана, `power.c` часы/перезагрузка/выключение, `sched.c` потоки, планировщик, мьютексы (`ps`, `threadtest`), `smp.c` остальные ядра процессора и большой замок ядра (`cpu`, `smptest`), `ushell.c` запуск шелла `/bin/sh` и аварийный шелл; программы Linux: `linux.c` (загрузка ELF, память, потоки, fork/execve), `lxfile.c` (файлы, корень Linux, терминал, /proc), `lxsig.c` (сигналы), `lxsock.c` (сокеты, epoll, timerfd), `umem.c` (память по требованию), `pcache.c` (кэш страниц файлов, общая память) |
 | `firmware/` | прошивки устройств, вклеенные в ядро: `rtw88/rtw8821c_fw.bin` (Realtek, только двоичная, условия — `LICENCE.rtlwifi_firmware.txt`) |
 | `drivers/` | PCI, USB (xHCI, клавиатуры/мыши, хабы, флешки — с горячим подключением), PS/2 (клавиатура, мышь/тачпад), разбор HID-дескрипторов; `blk.c` диски, разделы MBR/GPT, кэш секторов; `ahci.c` SATA; `nvme.c` NVMe; сеть: `e1000.c` (Intel), `rtl8169.c` (Realtek), `usbnet.c` (USB-модемы RNDIS/ECM/NCM); Wi-Fi: `rtw8821c.c` (Realtek RTL8821CE, по rtw88) и `rtw8821c_table.c` (таблицы Realtek) |
 | `net/` | стек TCP/IP: `net.c` интерфейсы и поток `net`, `arp.c`, `ip.c` (IPv4, ICMP), `udp.c`, `tcp.c`, `dhcp.c`, `dns.c`, `socket.c` сокеты, `netcmd.c` команда `net` и `ifconfig`; Wi-Fi: `wpa.c` (WPA2: SHA-1, PBKDF2, AES, CCMP, рукопожатие), `wifi.c` (адаптеры, `wifi`), `wlan.c` (802.11: поиск сетей, подключение, `wlan0`), `wlan_sim.c` (программная точка доступа для теста) |
@@ -344,7 +360,7 @@ MyOS можно поставить на диск ноутбука, не трог
 | `user/posix/` | полная libc для программ (этап 9): `os.c`, `socket.c`, `fs.c` — POSIX поверх системных вызовов MyOS, свои заголовки (`sys/socket.h`, `netdb.h`...), `crt0.S`, `posix.ld`; программы на ней — `apps/` (`libctest`) |
 | `third_party/` | чужой код с лицензиями (см. `third_party/README.md`): BearSSL, FatFs, picolibc, zlib, curl, NetSurf и его библиотеки, FreeType, libpng, libjpeg-turbo, utf8proc, шрифты DejaVu, uACPI |
 | `sysnum.h` | номера системных вызовов — общие для ядра и программ |
-| `fs/` | `vfs.c` пути, тома, открытые файлы, RAM-диск как том `/ram`; `fat.c` FAT16/FAT32 чтение и запись (длинные имена) |
+| `fs/` | `vfs.c` пути, тома, открытые файлы, символьные ссылки, RAM-диск как том `/ram`; `fat.c` FAT16/FAT32 чтение и запись (длинные имена); `exfat.c` exFAT (FatFs); `ext4.c` ext4 только для чтения (раздел Linux); `tmpfs.c` `/tmp` в памяти; `binfs.c` `/bin` |
 | `gui/` | оконная система: `gfx.c` рисование и сглаженный шрифт, `wm.c` композитор и рабочий стол, `apps.c` Проводник, ярлыки и запуск программ, `tty.c` окно-терминал для `/bin/sh`, `icons.c` значки; `font8x16.h` (генерируется `tools/mkfont.py`) и `icons16.h` — шрифт и значки, общие с программами |
 | `shell/` | команды шелла, ввод строки, RAM-диск, `fetch`, редактор |
 | `tools/` | `autotest.py` проверки в QEMU (`test-battery.asl` — поддельная батарея для них), `install-arch.sh` установка на диск рядом с Arch, `split_main.py` (как был разрезан старый `main.c`) |
