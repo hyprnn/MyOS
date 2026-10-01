@@ -593,12 +593,26 @@ def run_steps(a, work, steps, name, extra=(), devices=None):
                     vm.mouse_move(-50, -50)
                     time.sleep(0.02)
                 x, y = keys['goto']
-                while x > 0 or y > 0:
-                    dx, dy = min(x, 20), min(y, 20)
-                    vm.mouse_move(dx, dy)
-                    x -= dx
-                    y -= dy
-                    time.sleep(0.02)
+                if 'usb-tablet' in (devices or DEFAULT_DEVICES):
+                    # с планшетом - точно: одно абсолютное событие (ядро
+                    # переводит его в сдвиг от прошлой точки планшета,
+                    # поэтому сначала "в 0", пока курсор упёрт в угол).
+                    # Относительные шаги мыши на медленной машине теряются
+                    # и курсор недоезжает до нужного пункта меню.
+                    def tab(px, py):
+                        vm.cmd('input-send-event', events=[
+                            {'type': 'abs', 'data': {'axis': 'x', 'value': (px * 32768 + 1279) // 1280}},
+                            {'type': 'abs', 'data': {'axis': 'y', 'value': (py * 32768 + 799) // 800}}])
+                    tab(0, 0)
+                    time.sleep(0.3)
+                    tab(x, y)
+                else:
+                    while x > 0 or y > 0:
+                        dx, dy = min(x, 20), min(y, 20)
+                        vm.mouse_move(dx, dy)
+                        x -= dx
+                        y -= dy
+                        time.sleep(0.02)
                 time.sleep(0.3)
                 label = '[goto %d,%d]' % keys['goto']
             if 'click' in keys:
@@ -839,7 +853,7 @@ def main():
             ({'click': 1}, '', 0.4),
             ({'goto': (60, 755)}, '', 0.3),
             ({'click': 1}, 'Left the desktop', 10),
-        ]))
+        ], [], DEFAULT_DEVICES + ['usb-tablet']))
         # диски и файлы (этап 5): флешка (MBR+FAT32), SATA-диск через
         # AHCI (GPT+FAT16), NVMe (GPT+FAT32); файлы с длинными именами,
         # папки, копирование между дисками, горячее подключение флешки
@@ -1063,7 +1077,7 @@ def main():
         ], ['-machine', 'q35', '-audiodev', 'wav,id=snd0,path=@WORK@/doom.wav',
             '-device', 'ich9-intel-hda', '-device', 'hda-duplex,audiodev=snd0',
             '-drive', 'if=none,id=dstick,format=raw,file=@WORK@/doomstick.img'],
-            ['qemu-xhci', 'usb-kbd', 'usb-mouse', 'usb-storage,drive=dstick']))
+            ['qemu-xhci', 'usb-kbd', 'usb-mouse', 'usb-tablet', 'usb-storage,drive=dstick']))
         # программы Linux (этап 11): тест ltest (glibc и musl) - память,
         # файлы, fork/exec, потоки, futex, сигналы; busybox со сценарием
         linux_files = build_linux_tests(work)
@@ -1192,7 +1206,8 @@ def main():
             ('browser %s/page.html\n' % url, 're:winproc: pid [0-9]+ got window', 40),
             ({'screen': [(BROWSER_H1, 8, 300), (BROWSER_SUN, 4, 5000),
                          (BROWSER_JPEG, 12, 3000)]}, '', 60),
-        ], ['-netdev', 'user,id=n0', '-device', 'e1000,netdev=n0']))
+        ], ['-netdev', 'user,id=n0', '-device', 'e1000,netdev=n0'],
+            DEFAULT_DEVICES + ['usb-tablet']))
         # Realtek в режиме C+ (тот же механизм колец, что у RTL8111/8168)
         runs.append(('net-rtl8139', [
             (None, "Type 'help'", 90),
