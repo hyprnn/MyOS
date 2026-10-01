@@ -64,9 +64,11 @@ static void tn_fill(TNODE *t, VFS_NODE *out)
 
 static void tn_free_data(TNODE *t, UINT64 from_page)
 {
+    /* unref, а не free: страницу может держать отображение программы
+       (mmap MAP_SHARED, memfd) - она уйдёт с последним хозяином */
     for (UINTN i = (UINTN)from_page; i < t->cap; i++)
         if (t->pages[i] != 0) {
-            pmm_free_pages(t->pages[i], 1);
+            pmm_page_unref(t->pages[i]);
             t->pages[i] = 0;
             g_tmp_bytes -= 4096u;
         }
@@ -366,22 +368,25 @@ static INTN t_open(VFS_MOUNT *m, VFS_NODE *f)
     return VFS_OK;
 }
 
-static INTN t_close(VFS_MOUNT *m, VFS_NODE *f)
+/* Узел ещё нужен (кто-то отобразил его в память) / уже не нужен */
+static void tn_put(TNODE *t)
 {
-    (void)m;
-
-    TNODE *t = tn(f);
-
     if (t->opens > 0)
         t->opens--;
 
     if (t->unlinked && t->opens == 0)
         tn_destroy(t);
+}
 
+static INTN t_close(VFS_MOUNT *m, VFS_NODE *f)
+{
+    (void)m;
+
+    tn_put(tn(f));
     return VFS_OK;
 }
 
-static const VFS_OPS g_tmp_ops = {
+const VFS_OPS g_tmp_ops = {
     "tmpfs",
     t_root,
     t_readdir,
@@ -420,4 +425,71 @@ void tmpfs_mount(void)
     tn_stamp(&g_troot);
 
     kmutex_unlock(&g_vfs_mutex);
+}
+
+
+/* ================================================================
+ * Файлы tmpfs как память программ (этап 11, шаг 2)
+ *
+ * mmap(MAP_SHARED) файла из /tmp или /dev/shm, memfd_create и общая
+ * анонимная память (MAP_SHARED | MAP_ANONYMOUS) - это одно и то же:
+ * страницы узла tmpfs прямо в таблицах страниц программы. Все, кто
+ * отобразил узел, видят одни и те же физические страницы (так
+ * Firefox и Wayland передают картинки между процессами). Отображение
+ * держит узел (как открытый файл), страницы - через счётчик хозяев
+ * pmm (umem.c).
+ * ================================================================ */
+
+/* Узел tmpfs за узлом VFS (вызывающий проверил, что том - tmpfs) */
+void *tmpfs_node(const VFS_NODE *n)
+{
+    return n->is_root ? NULL : (void *)(UINTN)n->ram_index;
+}
+
+void tmpfs_hold(void *node)
+{
+    ((TNODE *)node)->opens++;
+}
+
+void tmpfs_put(void *node)
+{
+    tn_put((TNODE *)node);
+}
+
+/* Страница idx узла (нет - обнулённая новая); +1 хозяин для
+   вызывающего. 0 - нет памяти. */
+UINT64 tmpfs_page(void *node, UINT64 idx)
+{
+    TNODE *t = (TNODE *)node;
+
+    if (idx > (1ull << 28) || !tn_grow(t, (UINTN)idx + 1u))
+        return 0;
+
+    if (t->pages[idx] == 0) {
+        UINT64 phys = pmm_alloc_zeroed(1, 0);
+        if (phys == 0)
+            return 0;
+        t->pages[idx] = phys;
+        g_tmp_bytes += 4096u;
+    }
+
+    pmm_page_ref(t->pages[idx]);
+    return t->pages[idx];
+}
+
+/* Узел без имени (общая анонимная память, memfd): ни в одной папке,
+   живёт, пока его держат */
+void *tmpfs_anon(UINT64 size)
+{
+    TNODE *t = (TNODE *)kzalloc(sizeof(TNODE));
+
+    if (t == NULL)
+        return NULL;
+
+    t->parent = &g_troot;
+    t->unlinked = TRUE;
+    t->opens = 1;
+    t->size = size;
+    ksnprintf(t->name, sizeof(t->name), "anon");
+    return t;
 }

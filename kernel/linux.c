@@ -388,6 +388,7 @@ static INTN lx_load_one(KPROC *p, const char *path, BOOLEAN is_interp, LX_LOADIN
     LX_PHDR *ph = NULL;
     UINT8 *buf = NULL;
     INTN r = VFS_EINVAL;
+    UOBJ *obj = uobj_from_fd(kfd);      /* NULL - FAT: читаем сегменты целиком */
 
     if (!kfd_pread(kfd, 0, &h, sizeof(h)) || h.ident[0] != 0x7F || h.ident[1] != 'E' ||
         h.ident[2] != 'L' || h.ident[3] != 'F') {
@@ -485,6 +486,45 @@ static INTN lx_load_one(KPROC *p, const char *path, BOOLEAN is_interp, LX_LOADIN
         UINT64 e = (va + ph[i].memsz + 0xFFFu) & ~0xFFFull;
         UINT32 prot = seg_prot(ph[i].flags);
 
+        /* файл можно отобразить (ext4, tmpfs) и сегмент ни с кем не
+           делит страниц: страницы файла - по требованию из кэша
+           (общие у всех, кто запустил эту программу), хвост - нули */
+        BOOLEAN clash = FALSE;
+
+        for (UVMA *w = p->vmas; w != NULL; w = w->next)
+            if (w->start < e && s < w->end)
+                clash = TRUE;
+
+        if (obj != NULL && !clash && ph[i].filesz > 0 &&
+            (va & 0xFFFu) == (ph[i].offset & 0xFFFu)) {
+
+            UINT64 fend = (va + ph[i].filesz + 0xFFFu) & ~0xFFFull;
+            UINT64 zero_at = va + ph[i].filesz;
+
+            if (!uvm_add_obj(p, s, fend, prot, 0, obj, ph[i].offset & ~0xFFFull) ||
+                (fend < e && !uvm_add(p, fend, e, prot, 0))) {
+                *why = "out of memory";
+                r = VFS_ENOSPC;
+                goto out;
+            }
+
+            /* последняя страница с данными файла: за filesz - .bss,
+               там должны быть нули (а в файле там уже что-то другое) */
+            if (ph[i].memsz > ph[i].filesz && (zero_at & 0xFFFu) != 0) {
+                UINT8 *k = uvm_own_page(p, zero_at & ~0xFFFull);
+                if (k == NULL) {
+                    *why = "cannot load a segment";
+                    r = VFS_EIO;
+                    goto out;
+                }
+                memset(k + (zero_at & 0xFFFu), 0, 4096u - (zero_at & 0xFFFu));
+            }
+
+            if (va + ph[i].memsz > top)
+                top = va + ph[i].memsz;
+            continue;
+        }
+
         /* сегменты могут делить страницу на стыке (-z noseparate-code):
            общая часть - с объединёнными правами */
         UVMA *ov = uvm_find(p, s);
@@ -550,6 +590,7 @@ static INTN lx_load_one(KPROC *p, const char *path, BOOLEAN is_interp, LX_LOADIN
     r = VFS_OK;
 
 out:
+    uobj_put(obj);
     kfree(ph);
     kfree(buf);
     vfs_close(kfd);
@@ -985,13 +1026,39 @@ static INT64 sys_mmap(KPROC *p, UINT64 addr, UINT64 len, UINT64 prot, UINT64 fla
             return -LX_ENOMEM;
     }
 
-    UINT32 vflags = (flags & LX_MAP_SHARED) && f == NULL ? UVM_SHARED : 0;
+    BOOLEAN shared = (flags & LX_MAP_SHARED) != 0;
 
-    if (!uvm_add(p, at, at + len, prot_from_linux(prot), vflags))
+    /* что будет в области: файл ext4 / tmpfs - объект (страницы по
+       требованию, общие с другими процессами, pcache.c); общая
+       анонимная память - безымянный узел tmpfs (после fork у родителя
+       и потомка - одни страницы); остальное - как раньше */
+    UOBJ *obj = NULL;
+
+    if (f != NULL && f->type == LF_VFS) {
+        obj = uobj_from_fd(f->kfd);
+        /* файл раздела Linux - только чтение: писать через общую
+           область некуда */
+        if (obj != NULL && obj->kind == UOBJ_FILE && shared && (prot & LX_PROT_WRITE)) {
+            uobj_put(obj);
+            return -LX_EACCES;
+        }
+    } else if (f == NULL && shared) {
+        obj = uobj_anon(len);
+        if (obj == NULL)
+            return -LX_ENOMEM;
+    }
+
+    UINT32 vflags = (shared && (f == NULL || obj != NULL)) ? UVM_SHARED : 0;
+    BOOLEAN added = uvm_add_obj(p, at, at + len, prot_from_linux(prot), vflags, obj,
+                                (f == NULL) ? 0 : off);
+
+    uobj_put(obj);                      /* у области - своя ссылка */
+
+    if (!added)
         return -LX_ENOMEM;
 
-    /* файл: содержимое сразу (страниц-кэша у MyOS пока нет) */
-    if (f != NULL && f->type != LF_ZERO) {
+    /* файл без объекта (FAT, exFAT, /proc): содержимое сразу */
+    if (f != NULL && f->type != LF_ZERO && obj == NULL) {
 
         UINT8 *buf = (UINT8 *)kmalloc(65536);
 
@@ -1081,7 +1148,8 @@ static INT64 sys_mremap(KPROC *p, UINT64 old, UINT64 olen, UINT64 nlen, UINT64 f
             free_after = FALSE;
 
     if (free_after && old + nlen <= MYOS_USER_LIMIT) {
-        if (!uvm_add(p, old + olen, old + nlen, v->prot, v->flags))
+        if (!uvm_add_obj(p, old + olen, old + nlen, v->prot, v->flags, v->obj,
+                         v->off + (old - v->start) + olen))
             return -LX_ENOMEM;
         return (INT64)old;
     }
@@ -1092,7 +1160,8 @@ static INT64 sys_mremap(KPROC *p, UINT64 old, UINT64 olen, UINT64 nlen, UINT64 f
     /* переехать: новые адреса, те же физические страницы */
     UINT64 at = uvm_find_free(p, nlen, 0);
 
-    if (at == 0 || !uvm_add(p, at, at + nlen, v->prot, v->flags))
+    if (at == 0 || !uvm_add_obj(p, at, at + nlen, v->prot, v->flags, v->obj,
+                                v->off + (old - v->start)))
         return -LX_ENOMEM;
 
     for (UINT64 o = 0; o < olen; o += 4096u) {
@@ -2567,8 +2636,6 @@ static INT64 lx_dispatch(KPROC *p, UINT64 *f, UINT64 nr, UINT64 *a)
     case NR_socketpair:
         return -LX_EAFNOSUPPORT;    /* сеть для программ Linux - следующий шаг */
 
-    case NR_memfd_create:
-        return -LX_ENOSYS;
 
     /* расширенные атрибуты (xattr: ACL, SELinux): у нас их нет - как
        у файловой системы без xattr ("не поддерживается"); ls -l и cp

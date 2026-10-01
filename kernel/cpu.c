@@ -768,6 +768,31 @@ static void kx_advance_ticks(void)
         kx_load_tick();
 }
 
+
+/*
+ * Page Fault в памяти программы - "как системный вызов" (этап 11):
+ * страницу файла, может быть, надо прочитать с диска, а это ожидание
+ * (сон потока). В обработчике прерывания спать нельзя, поэтому на
+ * время обработки мы выходим из "режима прерывания" и разрешаем
+ * прерывания - как в системном вызове (большой замок у нас; поток
+ * может уснуть и проснуться на другом ядре - поэтому kx_cpu() каждый
+ * раз заново). cr2 прочитан заранее: следующий Page Fault его сменит.
+ */
+static BOOLEAN pf_sleepable(UINT64 cr2, UINT64 err)
+{
+    BOOLEAN ok;
+
+    kx_cpu()->isr_depth--;
+    kx_sti();
+
+    ok = uvm_fault_err(g_kcur->proc, cr2, err);
+
+    kx_cli();
+    kx_cpu()->isr_depth++;
+
+    return ok;
+}
+
 /* Разбор прерывания по вектору (зовётся из kx_isr_dispatch ниже) */
 static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
 {
@@ -837,7 +862,7 @@ static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
 
             /* память по требованию (этап 11, umem.c): страницы ещё не
                было или она общая после fork - дать и продолжить */
-            if (v == 14 && uvm_fault_err(g_kcur->proc, kx_read_cr2(), f->error))
+            if (v == 14 && pf_sleepable(kx_read_cr2(), f->error))
                 return;
 
             /* программа Linux: ошибка - это сигнал (SIGSEGV...), у неё
@@ -867,7 +892,11 @@ static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
            страницы ещё нет - тоже дать (обычно uptr_ok даёт заранее) */
         if (v == 14 && g_kcur->proc != NULL) {
             UINT64 cr2 = kx_read_cr2();
-            if (cr2 < 0x0000800000000000ull && uvm_fault_err(g_kcur->proc, cr2, f->error & ~0x10ull))
+            /* спать можно, только если ядро было в месте с разрешёнными
+               прерываниями (обычный системный вызов) */
+            if (cr2 < 0x0000800000000000ull &&
+                ((f->rflags & (1u << 9)) ? pf_sleepable(cr2, f->error & ~0x10ull)
+                                         : uvm_fault_err(g_kcur->proc, cr2, f->error & ~0x10ull)))
                 return;
         }
 
@@ -928,7 +957,9 @@ void kx_isr_dispatch(KX_ISR_FRAME *f)
 
     kx_isr_dispatch_inner(f);
 
-    c->isr_depth--;
+    /* kx_cpu() заново: Page Fault программы мог уснуть, и поток
+       проснулся уже на другом ядре (pf_sleepable) */
+    kx_cpu()->isr_depth--;
 
     /* только внешние прерывания (таймер, устройства): исключения -
        это ошибка или int3, переключаться там незачем */

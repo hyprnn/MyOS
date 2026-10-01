@@ -1089,8 +1089,8 @@ def main():
                            linux_files)
             lsteps = [
                 (None, "Type 'help'", 90),
-                ('/usb0p1/lt-musl\n', 'LTEST DONE pass=32 fail=0', 120),
-                ('/usb0p1/lt-glibc\n', 'LTEST DONE pass=32 fail=0', 120),
+                ('/usb0p1/lt-musl\n', 'LTEST DONE pass=35 fail=0', 120),
+                ('/usb0p1/lt-glibc\n', 'LTEST DONE pass=35 fail=0', 120),
             ]
             if 'busybox' in linux_files:
                 lsteps += [

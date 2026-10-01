@@ -2397,6 +2397,7 @@ enum {
     NR_newfstatat = 262, NR_unlinkat = 263, NR_renameat = 264, NR_linkat = 265,
     NR_symlinkat = 266, NR_readlinkat = 267, NR_fchmodat = 268, NR_faccessat = 269,
     NR_pselect6 = 270, NR_ppoll = 271, NR_utimensat = 280, NR_eventfd = 284,
+    NR_memfd_create = 319,
     NR_fallocate = 285, NR_eventfd2 = 290, NR_dup3 = 292, NR_pipe2 = 293,
     NR_renameat2 = 316, NR_copy_file_range = 326, NR_statx = 332, NR_close_range = 436,
     NR_faccessat2 = 439, NR_fchmodat2 = 452,
@@ -3067,6 +3068,42 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
         f->count = a[0];
         ksnprintf(f->path, sizeof(f->path), "anon_inode:[eventfd]");
         r = fd_install(p, f, 0, (fl & LX_O_CLOEXEC) != 0);
+        if (r < 0)
+            lfile_unref(f);
+        return r;
+    }
+
+    case NR_memfd_create: {
+        /* файл в памяти без имени: файл tmpfs, который тут же удалён
+           (живёт, пока открыт или отображён в память) - его можно
+           писать, ftruncate и mmap(MAP_SHARED): так Wayland и Firefox
+           передают картинки между процессами */
+        static UINT32 g_memfd_seq;
+        char tmp[48], name[64];
+        if (!uptr_ok(p, a[0], 1, FALSE))
+            return -LX_EFAULT;
+        UINTN n = 0;
+        for (; n + 1 < sizeof(name); n++) {
+            if (((a[0] + n) & 0xFFFu) == 0 && !uptr_ok(p, a[0] + n, 1, FALSE))
+                return -LX_EFAULT;
+            name[n] = *(volatile char *)(UINTN)(a[0] + n);
+            if (name[n] == '\0')
+                break;
+        }
+        name[n] = '\0';
+        ksnprintf(tmp, sizeof(tmp), "/tmp/.memfd-%u", ++g_memfd_seq);
+        INTN kfd = vfs_open(tmp, VFS_O_READ | VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC);
+        if (kfd < 0)
+            return linux_errno(kfd);
+        vfs_remove(tmp);
+        f = lfile_new(LF_VFS, LX_O_RDWR);
+        if (f == NULL) {
+            vfs_close(kfd);
+            return -LX_ENOMEM;
+        }
+        f->kfd = kfd;
+        ksnprintf(f->path, sizeof(f->path), "/memfd:%s (deleted)", name);
+        r = fd_install(p, f, 0, (a[1] & 1u) != 0);       /* MFD_CLOEXEC */
         if (r < 0)
             lfile_unref(f);
         return r;

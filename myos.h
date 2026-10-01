@@ -1050,11 +1050,27 @@ typedef struct KPROC {
 #define UPTE_NX     (1ull << 63)
 #define UPTE_ADDR   0x000FFFFFFFFFF000ull
 
+/* Объект памяти (kernel/pcache.c): чем "наполнена" область - файл
+   через кэш страниц или узел tmpfs (memfd, /dev/shm, общая память) */
+#define UOBJ_FILE   1
+#define UOBJ_TMPFS  2
+
+typedef struct UOBJ {
+    UINT32      refs;
+    UINT32      kind;
+    struct VFS_MOUNT *m;         /* UOBJ_FILE: том, его поколение и узел */
+    UINT32      gen;
+    VFS_NODE    node;
+    void       *tn;              /* UOBJ_TMPFS: узел tmpfs */
+} UOBJ;
+
 typedef struct UVMA {
     struct UVMA *next;           /* список по возрастанию адресов */
     UINT64       start, end;
     UINT32       prot;           /* UVM_R/W/X */
     UINT32       flags;          /* UVM_SHARED/STACK/HEAP */
+    UOBJ        *obj;            /* NULL - анонимная (нули) */
+    UINT64       off;            /* место в объекте, соответствующее start */
 } UVMA;
 
 /* TSS (64-битный), см. kernel/cpu.c */
@@ -2405,6 +2421,9 @@ void uvm_free(UINT64 pml4);
 /* --- kernel/umem.c (этап 11): память программ по требованию --- */
 UVMA *uvm_find(KPROC *p, UINT64 va);
 BOOLEAN uvm_add(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags);
+BOOLEAN uvm_add_obj(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags, UOBJ *obj,
+                    UINT64 off);
+UINT8 *uvm_own_page(KPROC *p, UINT64 page);
 void uvm_unmap(KPROC *p, UINT64 start, UINT64 end);
 INTN uvm_protect(KPROC *p, UINT64 start, UINT64 end, UINT32 prot);
 UINT64 uvm_find_free(KPROC *p, UINT64 len, UINT64 hint);
@@ -2533,8 +2552,23 @@ LFILE *lx_fd_get(KPROC *p, INT64 fd);
 extern const VFS_OPS g_bin_ops;
 void binfs_mount(void);
 
+/* --- kernel/pcache.c (кэш страниц файлов, объекты памяти) --- */
+UOBJ *uobj_from_fd(INTN kfd);
+UOBJ *uobj_anon(UINT64 size);
+void uobj_ref(UOBJ *o);
+void uobj_put(UOBJ *o);
+UINT64 uobj_page(UOBJ *o, UINT64 idx);
+void pcache_drop_mount(struct VFS_MOUNT *m);
+void pcache_stats(UINT64 *pages, UINT64 *hits, UINT64 *misses);
+
 /* --- fs/tmpfs.c --- */
 void tmpfs_mount(void);
+extern const VFS_OPS g_tmp_ops;
+void *tmpfs_node(const VFS_NODE *n);
+void tmpfs_hold(void *node);
+void tmpfs_put(void *node);
+UINT64 tmpfs_page(void *node, UINT64 idx);
+void *tmpfs_anon(UINT64 size);
 
 /* --- fs/ext4.c (ext4, только чтение) --- */
 extern const VFS_OPS g_ext4_ops;
@@ -2597,6 +2631,8 @@ const char *vfs_strerror(INTN e);
 INTN vfs_normalize(const char *path, char *out, UINTN cap);
 INTN vfs_stat(const char *path, VFS_DIRENT *out);
 INTN vfs_lstat(const char *path, VFS_DIRENT *out);
+INTN vfs_fd_node(INTN fd, VFS_MOUNT **m, VFS_NODE *node);
+INTN vfs_node_read(VFS_MOUNT *m, UINT32 gen, VFS_NODE *node, UINT64 off, VOID *buf, UINTN n);
 INTN vfs_readlink(const char *path, char *buf, UINTN cap);
 INTN vfs_list(const char *path, INTN (*cb)(void *ctx, const VFS_DIRENT *e), void *ctx);
 INTN vfs_open(const char *path, UINT32 flags);

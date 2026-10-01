@@ -157,10 +157,13 @@ UVMA *uvm_find(KPROC *p, UINT64 va)
     return NULL;
 }
 
-/* Вставить область [start, end) - место должно быть свободно */
-BOOLEAN uvm_add(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags)
+/* Вставить область [start, end) - место должно быть свободно. obj -
+   чем наполнена (NULL - нулями), off - место в объекте для start;
+   область берёт свою ссылку на объект. */
+BOOLEAN uvm_add_obj(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags, UOBJ *obj,
+                    UINT64 off)
 {
-    if (start >= end || (start & 0xFFFu) || (end & 0xFFFu))
+    if (start >= end || (start & 0xFFFu) || (end & 0xFFFu) || (off & 0xFFFu))
         return FALSE;
 
     UVMA *n = (UVMA *)kzalloc(sizeof(UVMA));
@@ -172,6 +175,9 @@ BOOLEAN uvm_add(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags)
     n->end = end;
     n->prot = prot;
     n->flags = flags;
+    n->obj = obj;
+    n->off = off;
+    uobj_ref(obj);
 
     UVMA **pp = &p->vmas;
 
@@ -182,6 +188,11 @@ BOOLEAN uvm_add(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags)
     *pp = n;
 
     return TRUE;
+}
+
+BOOLEAN uvm_add(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags)
+{
+    return uvm_add_obj(p, start, end, prot, flags, NULL, 0);
 }
 
 /* Разрезать область v на две по адресу at (start < at < end) */
@@ -196,7 +207,10 @@ static BOOLEAN uvm_split(UVMA *v, UINT64 at)
     n->end = v->end;
     n->prot = v->prot;
     n->flags = v->flags;
+    n->obj = v->obj;
+    n->off = v->off + (at - v->start);
     n->next = v->next;
+    uobj_ref(n->obj);
 
     v->end = at;
     v->next = n;
@@ -270,6 +284,7 @@ void uvm_unmap(KPROC *p, UINT64 start, UINT64 end)
 
         if (v->start >= start && v->end <= end) {
             *pp = v->next;
+            uobj_put(v->obj);
             kfree(v);
             continue;
         }
@@ -378,6 +393,7 @@ void uvm_free_vmas(KPROC *p)
     while (p->vmas != NULL) {
         UVMA *v = p->vmas;
         p->vmas = v->next;
+        uobj_put(v->obj);
         kfree(v);
     }
 }
@@ -386,6 +402,100 @@ void uvm_free_vmas(KPROC *p)
 /* ================================================================
  * Page Fault: дать страницу
  * ================================================================ */
+
+/*
+ * Первое касание страницы области с объектом (файл, tmpfs): страница
+ * объекта. Общая область (MAP_SHARED) - сама страница объекта; частная
+ * - она же, но "копировать при записи" (запись сразу - сразу копия).
+ * Чтение файла может уснуть: тогда пока мы спим, другой поток мог
+ * изменить области или уже дать страницу - всё проверяем заново.
+ */
+static BOOLEAN uvm_fault_obj(KPROC *p, UINT64 va, BOOLEAN write)
+{
+    UINT64 page = va & ~0xFFFull;
+    UVMA *v = uvm_find(p, page);
+
+    if (v == NULL || v->obj == NULL)
+        return FALSE;
+
+    UOBJ *o = v->obj;
+    UINT64 idx = (v->off + (page - v->start)) / 4096u;
+
+    uobj_ref(o);                         /* не исчез бы, пока спим */
+
+    UINT64 phys = uobj_page(o, idx);
+
+    uobj_put(o);
+
+    if (phys == 0) {
+        klog("umem: pid %u: cannot read a page of a mapped file at 0x%llx\n", p->pid, va);
+        return FALSE;
+    }
+
+    /* пока читали - что изменилось? */
+    v = uvm_find(p, page);
+
+    UINT64 *e = uvm_pte(p->pml4, page, TRUE);
+
+    if (v == NULL || v->obj != o || e == NULL || (*e & UPTE_P)) {
+        pmm_page_unref(phys);
+        return v != NULL && e != NULL;   /* повторить - разберётся заново */
+    }
+
+    if (v->flags & UVM_SHARED) {
+        *e = phys | uvm_bits(v->prot, FALSE);
+    } else if (write) {
+        UINT64 mine = pmm_alloc_pages(1, 0);
+        if (mine == 0) {
+            pmm_page_unref(phys);
+            klog("umem: pid %u out of memory at 0x%llx\n", p->pid, va);
+            return FALSE;
+        }
+        memcpy(P2V(mine), P2V(phys), 4096u);
+        pmm_page_unref(phys);
+        *e = mine | uvm_bits(v->prot, FALSE);
+    } else {
+        /* всегда COW - даже если писать сейчас нельзя: mprotect может
+           разрешить запись позже, а страница кэша - общая */
+        *e = phys | uvm_bits(v->prot, TRUE);
+    }
+
+    p->pages++;
+    return TRUE;
+}
+
+/*
+ * Своя (не общая) страница page процесса для записи ядром - загрузчик
+ * ELF обнуляет хвост последней страницы сегмента. Адрес в ядре или NULL.
+ */
+UINT8 *uvm_own_page(KPROC *p, UINT64 page)
+{
+    UINT64 *e = uvm_pte(p->pml4, page, FALSE);
+
+    if (e == NULL || !(*e & UPTE_P)) {
+        UVMA *v = uvm_find(p, page);
+        if (v == NULL)
+            return NULL;
+        if (v->obj != NULL ? !uvm_fault_obj(p, page, FALSE) : !uvm_fault(p, page, FALSE))
+            return NULL;
+        e = uvm_pte(p->pml4, page, FALSE);
+        if (e == NULL || !(*e & UPTE_P))
+            return NULL;
+    }
+
+    if ((*e & UPTE_COW) && pmm_page_refs(*e & UPTE_ADDR) > 1u) {
+        UINT64 old = *e & UPTE_ADDR;
+        UINT64 mine = pmm_alloc_pages(1, 0);
+        if (mine == 0)
+            return NULL;
+        memcpy(P2V(mine), P2V(old), 4096u);
+        *e = mine | (*e & ~UPTE_ADDR);
+        pmm_page_unref(old);
+        uvm_invlpg(page);
+    }
+
+    return (UINT8 *)P2V(*e & UPTE_ADDR);
+}
 
 /*
  * Программа (или ядро от её имени) тронула адрес va, а страницы нет
@@ -410,6 +520,9 @@ BOOLEAN uvm_fault(KPROC *p, UINT64 va, BOOLEAN write)
 
     if (e == NULL)
         return FALSE;               /* нет памяти даже на таблицу */
+
+    if (!(*e & UPTE_P) && v->obj != NULL)
+        return uvm_fault_obj(p, va, write);
 
     if (!(*e & UPTE_P)) {
 
@@ -581,6 +694,7 @@ BOOLEAN uvm_fork(KPROC *parent, KPROC *child)
 
         *n = *v;
         n->next = NULL;
+        uobj_ref(n->obj);
         *tail = n;
         tail = &n->next;
     }

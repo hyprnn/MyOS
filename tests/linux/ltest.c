@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -84,6 +85,72 @@ static void t_memory(void)
     for (int i = 0; i < 1000; i++)
         free(v[i]);
     result("malloc-small", ok, "malloc failed");
+}
+
+/* ---------- общая память (этап 11, шаг 2) ---------- */
+
+static void t_shm(void)
+{
+    /* memfd: файл в памяти, его страницы видны через mmap(MAP_SHARED);
+       после fork потомок пишет - родитель видит */
+    int fd = (int)syscall(SYS_memfd_create, "ltest", 1u);
+    int ok = fd >= 0 && ftruncate(fd, 8192) == 0;
+    char *m = ok ? mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+
+    if (m != MAP_FAILED) {
+        strcpy(m + 4096, "from parent");
+        pid_t c = fork();
+        if (c == 0) {
+            strcpy(m, "from child");
+            _exit(0);
+        }
+        int st = 0;
+        waitpid(c, &st, 0);
+        char back[16] = { 0 };
+        ssize_t got = pread(fd, back, 10, 0);
+        ok = strcmp(m, "from child") == 0 && got == 10 && memcmp(back, "from child", 10) == 0;
+        munmap(m, 8192);
+    } else {
+        ok = 0;
+    }
+    if (fd >= 0)
+        close(fd);
+    result("memfd-shared", ok, "memfd + MAP_SHARED + fork");
+
+    /* общая анонимная память: страницу трогает только потомок */
+    volatile int *a = mmap(NULL, 4096 * 4, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    ok = a != MAP_FAILED;
+    if (ok) {
+        pid_t c = fork();
+        if (c == 0) {
+            a[2048] = 12345;            /* вторая страница - родитель её не трогал */
+            _exit(0);
+        }
+        int st = 0;
+        waitpid(c, &st, 0);
+        ok = a[2048] == 12345;
+        munmap((void *)a, 4096 * 4);
+    }
+    result("anon-shared-fork", ok, "MAP_SHARED|MAP_ANONYMOUS after fork");
+
+    /* файл, отображённый MAP_PRIVATE: запись в память не трогает файл */
+    int tf = open("/tmp/ltest-map", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ok = tf >= 0 && write(tf, "abcdef", 6) == 6;
+    char *pm = ok ? mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, tf, 0) : MAP_FAILED;
+    if (pm != MAP_FAILED) {
+        int first = memcmp(pm, "abcdef", 6) == 0 && pm[6] == 0;
+        pm[0] = 'X';
+        char back[8] = { 0 };
+        pread(tf, back, 6, 0);
+        ok = first && back[0] == 'a' && pm[0] == 'X';
+        munmap(pm, 4096);
+    } else {
+        ok = 0;
+    }
+    if (tf >= 0)
+        close(tf);
+    unlink("/tmp/ltest-map");
+    result("map-private-cow", ok, "MAP_PRIVATE copy on write");
 }
 
 /* ---------- файлы ---------- */
@@ -423,6 +490,7 @@ int main(int argc, char **argv)
     result("args-env", argc >= 1 && getenv("PATH") != NULL, "no PATH");
 
     t_memory();
+    t_shm();
     t_files();
     t_dirs();
     t_fork_pipe();

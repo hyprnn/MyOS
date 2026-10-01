@@ -404,6 +404,7 @@ void vfs_forget_dev(UINTN dev)
         proc_forget_volume(m->name);
 
         exfat_release(m);
+        pcache_drop_mount(m);
         ext4_release(m);
         m->used = FALSE;
         m->gone = TRUE;
@@ -1288,4 +1289,47 @@ INTN vfs_write_file(const char *path, const VOID *buf, UINTN n, BOOLEAN append)
         return r;
 
     return (done == n) ? VFS_OK : VFS_ENOSPC;
+}
+
+
+/* ================================================================
+ * Для кэша страниц и mmap (этап 11, kernel/umem.c)
+ * ================================================================ */
+
+/* Открытый файл fd: его том и узел (копия). VFS_OK или ошибка */
+INTN vfs_fd_node(INTN fd, VFS_MOUNT **m, VFS_NODE *node)
+{
+    kmutex_lock(&g_vfs_mutex);
+
+    VFS_FD *f = fd_get(fd);
+    INTN r = VFS_OK;
+
+    if (f == NULL)
+        r = VFS_EBADF;
+    else if (f->gone || f->mount < 0)
+        r = VFS_EGONE;
+    else {
+        *m = &g_mounts[f->mount];
+        *node = f->node;
+    }
+
+    kmutex_unlock(&g_vfs_mutex);
+    return r;
+}
+
+/* Прочитать кусок файла по узлу (без открытого fd): том m должен быть
+   тем же (поколение диска gen) - иначе диск сменили, EGONE */
+INTN vfs_node_read(VFS_MOUNT *m, UINT32 gen, VFS_NODE *node, UINT64 off, VOID *buf, UINTN n)
+{
+    kmutex_lock(&g_vfs_mutex);
+
+    INTN r;
+
+    if (!m->used || m->gone || (vfs_is_disk(m) && m->dev_gen != gen))
+        r = VFS_EGONE;
+    else
+        r = m->ops->read(m, node, off, buf, n);
+
+    kmutex_unlock(&g_vfs_mutex);
+    return r;
 }
