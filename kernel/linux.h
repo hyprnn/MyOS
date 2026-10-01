@@ -49,6 +49,8 @@
 #define LX_ENODATA     61
 #define LX_EOVERFLOW   75
 #define LX_ENOTSOCK    88
+#define LX_EMSGSIZE    90
+#define LX_EISCONN     106
 #define LX_EOPNOTSUPP  95
 #define LX_EAFNOSUPPORT 97
 #define LX_EADDRINUSE  98

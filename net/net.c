@@ -340,6 +340,7 @@ void net_wake(const void *obj)
 {
     sched_wake_all(obj);
     sched_wake_all(&g_net_any_event);
+    lx_poll_wake();                     /* poll/epoll программ Linux */
 }
 
 /* ================================================================

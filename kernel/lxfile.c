@@ -556,6 +556,13 @@ void lfile_unref(LFILE *f)
     case LF_MEM:
         kfree(f->mem);
         break;
+
+    case LF_INET:
+    case LF_UNIX:
+    case LF_EPOLL:
+    case LF_TIMERFD:
+        lxs_release(f);
+        break;
     }
 
     kfree(f);
@@ -580,6 +587,16 @@ static INT64 fd_install(KPROC *p, LFILE *f, INT64 from, BOOLEAN cloexec)
         }
 
     return -LX_EMFILE;
+}
+
+LFILE *lx_lfile_new(UINT32 type, UINT32 flags)
+{
+    return lfile_new(type, flags);
+}
+
+INT64 lx_fd_install(KPROC *p, LFILE *f, BOOLEAN cloexec)
+{
+    return fd_install(p, f, 0, cloexec);
 }
 
 LFILE *lx_fd_get(KPROC *p, INT64 fd)
@@ -898,6 +915,13 @@ static void lin_to_myos(KPROC *p, const char *lin, char *out, UINTN cap)
     /* /dev/shm (общая память POSIX) - это папка .shm в /tmp */
     if (path_is(lin, "/dev/shm", &rest)) {
         ksnprintf(out, cap, "/tmp/.shm%s", rest);
+        return;
+    }
+
+    /* DNS: серверы - те, что дал DHCP MyOS (у Linux на ноутбуке там
+       обычно ссылка на systemd-resolved, которого здесь нет) */
+    if (str_eq(lin, "/etc/resolv.conf")) {
+        ksnprintf(out, cap, "/proc/.myos/resolv.conf");
         return;
     }
 
@@ -1412,8 +1436,12 @@ static INTN do_stat_path(KPROC *p, const char *path, LX_STAT *st)
 
     INTN r = vfs_lstat(path, e);
 
-    if (r == VFS_OK)
+    if (r == VFS_OK) {
         stat_from_node(st, path, &e->node);
+        /* файл, к которому привязан сокет AF_UNIX (bind) - сокет */
+        if (lx_unix_bound(path))
+            st->mode = (st->mode & ~(UINT32)LX_S_IFMT) | 0140000u | 0777u;
+    }
 
     kfree(e);
     return (r == VFS_OK) ? 0 : (INTN)linux_errno(r);
@@ -1452,6 +1480,18 @@ static INTN do_stat_file(KPROC *p, LFILE *f, LX_STAT *st)
 
     case LF_EVENTFD:
         fill_stat(st, "anon_inode:[eventfd]", 0600, 0, 0);
+        return 0;
+
+    case LF_INET:
+    case LF_UNIX:
+        fill_stat(st, "socket:", 0140777, 0, 0);
+        st->ino = (UINT64)(UINTN)f;
+        return 0;
+
+    case LF_EPOLL:
+    case LF_TIMERFD:
+        fill_stat(st, "anon_inode:", 0600, 0, 0);
+        st->ino = (UINT64)(UINTN)f;
         return 0;
 
     default:
@@ -1611,6 +1651,17 @@ static BOOLEAN proc_file_text(KPROC *p, const char *path, TBUF *b)
 
     if (path_is(path, "/proc/sys/kernel/osrelease", NULL)) {
         tb_printf(b, "6.1.0-myos\n");
+        return TRUE;
+    }
+
+    if (path_is(path, "/proc/.myos/resolv.conf", NULL)) {
+        UINT32 dns[4];
+        UINTN n = dns_server_list(dns, 4);
+        tb_printf(b, "# MyOS: DNS servers from DHCP\n");
+        for (UINTN i = 0; i < n; i++)
+            tb_printf(b, "nameserver %u.%u.%u.%u\n", dns[i] >> 24, (dns[i] >> 16) & 255u,
+                      (dns[i] >> 8) & 255u, dns[i] & 255u);
+        tb_printf(b, "options single-request\n");
         return TRUE;
     }
 
@@ -1867,6 +1918,12 @@ static INT64 lf_read(KPROC *p, LFILE *f, UINT8 *dst, UINTN n)
         return (INT64)k;
     }
 
+    case LF_INET:
+    case LF_UNIX:
+    case LF_EPOLL:
+    case LF_TIMERFD:
+        return lxs_read(p, f, dst, n);
+
     case LF_EVENTFD: {
         if (n < 8)
             return -LX_EINVAL;
@@ -1897,7 +1954,8 @@ static INT64 lf_read(KPROC *p, LFILE *f, UINT8 *dst, UINTN n)
 static INT64 lf_write(KPROC *p, LFILE *f, const UINT8 *src, UINTN n)
 {
     if ((f->flags & LX_O_ACCMODE) == LX_O_RDONLY &&
-        f->type != LF_TTY && f->type != LF_NULL && f->type != LF_EVENTFD && f->type != LF_PIPE_W)
+        f->type != LF_TTY && f->type != LF_NULL && f->type != LF_EVENTFD && f->type != LF_PIPE_W &&
+        f->type != LF_INET && f->type != LF_UNIX)
         return -LX_EBADF;
 
     switch (f->type) {
@@ -1920,6 +1978,12 @@ static INT64 lf_write(KPROC *p, LFILE *f, const UINT8 *src, UINTN n)
 
     case LF_PIPE_W:
         return pipe_write(f->pipe, f, src, n);
+
+    case LF_INET:
+    case LF_UNIX:
+    case LF_EPOLL:
+    case LF_TIMERFD:
+        return lxs_write(p, f, src, n);
 
     case LF_EVENTFD: {
         if (n < 8)
@@ -2228,9 +2292,41 @@ static UINT32 lf_poll(KPROC *p, LFILE *f)
     case LF_EVENTFD:
         return LX_POLLOUT | (f->count > 0 ? LX_POLLIN : 0);
 
+    case LF_INET:
+    case LF_UNIX:
+    case LF_EPOLL:
+    case LF_TIMERFD:
+        return lxs_poll(p, f);
+
     default:
         return LX_POLLIN | LX_POLLOUT;
     }
+}
+
+UINT32 lx_file_poll(KPROC *p, LFILE *f)
+{
+    return lf_poll(p, f);
+}
+
+/*
+ * Подождать "что-то изменилось" (poll, epoll, сокеты): до deadline_ms
+ * (g_kticks; 0 - без срока), кусками по 10 мс. 0 - смотреть снова,
+ * -LX_ERESTARTSYS - пришёл сигнал.
+ */
+INT64 lx_wait_poll(KPROC *p, UINT64 deadline_ms)
+{
+    if (p->killed || lx_signal_pending())
+        return -LX_ERESTARTSYS;
+
+    UINT64 slice = 10;
+
+    if (deadline_ms != 0 && deadline_ms > g_kticks && deadline_ms - g_kticks < slice)
+        slice = deadline_ms - g_kticks;
+
+    UINT64 fl = kx_irq_save();
+    sched_block(&g_lx_poll_event, "poll", slice ? slice : 1);
+    kx_irq_restore(fl);
+    return 0;
 }
 
 typedef struct {
@@ -2485,6 +2581,8 @@ static INT64 do_ioctl(KPROC *p, LFILE *f, INT64 fd, UINT64 req, UINT64 arg)
         else if (f->type == LF_TTY) {
             LTERM *t = lterm_of(p);
             n = t ? (INT32)(t->len - t->off) : 0;
+        } else if (f->type == LF_INET || f->type == LF_UNIX) {
+            n = (INT32)lxs_pending(f);
         }
         *(volatile INT32 *)(UINTN)arg = n;
         return 0;

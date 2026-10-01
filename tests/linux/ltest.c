@@ -20,6 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -151,6 +157,180 @@ static void t_shm(void)
         close(tf);
     unlink("/tmp/ltest-map");
     result("map-private-cow", ok, "MAP_PRIVATE copy on write");
+}
+
+/* ---------- сокеты, epoll, timerfd (этап 11, шаг 2) ---------- */
+
+/* Отправить открытый файл fd через сокет s (SCM_RIGHTS) */
+static int send_fd(int s, int fd)
+{
+    char c = 'F';
+    struct iovec iov = { &c, 1 };
+    union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m;
+
+    memset(&m, 0, sizeof(m));
+    memset(&u, 0, sizeof(u));
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = u.b;
+    m.msg_controllen = sizeof(u.b);
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET;
+    h->cmsg_type = SCM_RIGHTS;
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &fd, sizeof(int));
+    return (int)sendmsg(s, &m, 0);
+}
+
+static int recv_fd(int s)
+{
+    char c = 0;
+    struct iovec iov = { &c, 1 };
+    union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m;
+
+    memset(&m, 0, sizeof(m));
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = u.b;
+    m.msg_controllen = sizeof(u.b);
+    if (recvmsg(s, &m, 0) != 1 || c != 'F')
+        return -1;
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    if (h == NULL || h->cmsg_type != SCM_RIGHTS)
+        return -1;
+    int fd;
+    memcpy(&fd, CMSG_DATA(h), sizeof(int));
+    return fd;
+}
+
+static void t_sock(void)
+{
+    /* socketpair + передача канала (pipe) другому процессу */
+    int sv[2];
+    int ok = socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0;
+    if (ok) {
+        pid_t c = fork();
+        if (c == 0) {
+            close(sv[0]);
+            int fd = recv_fd(sv[1]);
+            if (fd < 0)
+                _exit(2);
+            ssize_t w = write(fd, "via-fd", 6);
+            _exit(w == 6 ? 0 : 3);
+        }
+        close(sv[1]);
+        int pf[2];
+        ok = pipe(pf) == 0 && send_fd(sv[0], pf[1]) == 1;
+        if (ok) {
+            close(pf[1]);
+            char b[16] = { 0 };
+            ssize_t r = read(pf[0], b, sizeof(b) - 1);
+            int st = 0;
+            waitpid(c, &st, 0);
+            ok = r == 6 && strcmp(b, "via-fd") == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+            close(pf[0]);
+        }
+        close(sv[0]);
+    }
+    result("socketpair-scm-rights", ok, "socketpair + SCM_RIGHTS + fork");
+
+    /* AF_UNIX по имени: listen / connect / accept */
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strcpy(sa.sun_path, "/tmp/ltest.sock");
+    unlink(sa.sun_path);
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    ok = ls >= 0 && bind(ls, (struct sockaddr *)&sa, sizeof(sa)) == 0 && listen(ls, 4) == 0;
+    if (ok) {
+        struct stat st;
+        int is_sock = stat(sa.sun_path, &st) == 0 && S_ISSOCK(st.st_mode);
+        int cs = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        int con = connect(cs, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+        int as = accept(ls, NULL, NULL);
+        char b[8] = { 0 };
+        ok = is_sock && con && as >= 0 && write(cs, "ping", 4) == 4 && read(as, b, 4) == 4 &&
+             strcmp(b, "ping") == 0;
+        close(cs);
+        ok = ok && read(as, b, 4) == 0;         /* собеседник закрыл - конец */
+        if (as >= 0)
+            close(as);
+    }
+    if (ls >= 0)
+        close(ls);
+    unlink(sa.sun_path);
+    result("unix-listen-connect", ok, "bind/listen/connect/accept");
+
+    /* epoll: канал станет готов, когда в него напишут */
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    int pf[2];
+    ok = ep >= 0 && pipe(pf) == 0;
+    if (ok) {
+        struct epoll_event ev = { .events = EPOLLIN, .data.u64 = 77 };
+        struct epoll_event out[4];
+        ok = epoll_ctl(ep, EPOLL_CTL_ADD, pf[0], &ev) == 0 && epoll_wait(ep, out, 4, 0) == 0;
+        ok = ok && write(pf[1], "x", 1) == 1;
+        int n = epoll_wait(ep, out, 4, 1000);
+        ok = ok && n == 1 && out[0].data.u64 == 77 && (out[0].events & EPOLLIN);
+        close(pf[0]);
+        close(pf[1]);
+    }
+    if (ep >= 0)
+        close(ep);
+    result("epoll", ok, "epoll_wait on a pipe");
+
+    /* timerfd: 50 мс */
+    int tf = timerfd_create(CLOCK_MONOTONIC, 0);
+    ok = tf >= 0;
+    if (ok) {
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_nsec = 50 * 1000000;
+        double t0 = now_ms();
+        unsigned long long cnt = 0;
+        ok = timerfd_settime(tf, 0, &its, NULL) == 0 && read(tf, &cnt, 8) == 8 && cnt == 1 &&
+             now_ms() - t0 >= 40;
+        close(tf);
+    }
+    result("timerfd", ok, "timerfd 50 ms");
+
+    /* TCP через 127.0.0.1 (сеть MyOS) */
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in in;
+    memset(&in, 0, sizeof(in));
+    in.sin_family = AF_INET;
+    in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    in.sin_port = 0;
+    socklen_t il = sizeof(in);
+    ok = srv >= 0 && bind(srv, (struct sockaddr *)&in, sizeof(in)) == 0 && listen(srv, 4) == 0 &&
+         getsockname(srv, (struct sockaddr *)&in, &il) == 0 && ntohs(in.sin_port) != 0;
+    if (ok) {
+        pid_t c = fork();
+        if (c == 0) {
+            int cl = socket(AF_INET, SOCK_STREAM, 0);
+            if (connect(cl, (struct sockaddr *)&in, sizeof(in)) != 0)
+                _exit(2);
+            ssize_t w = write(cl, "hello tcp", 9);
+            close(cl);
+            _exit(w == 9 ? 0 : 3);
+        }
+        int a = accept(srv, NULL, NULL);
+        char b[16] = { 0 };
+        ssize_t got = 0, r;
+        while (a >= 0 && got < 9 && (r = read(a, b + got, sizeof(b) - 1 - got)) > 0)
+            got += r;
+        int st = 0;
+        waitpid(c, &st, 0);
+        ok = a >= 0 && got == 9 && strcmp(b, "hello tcp") == 0 && WIFEXITED(st) &&
+             WEXITSTATUS(st) == 0;
+        if (a >= 0)
+            close(a);
+    }
+    if (srv >= 0)
+        close(srv);
+    result("tcp-loopback", ok, "TCP over 127.0.0.1");
 }
 
 /* ---------- файлы ---------- */
@@ -491,6 +671,7 @@ int main(int argc, char **argv)
 
     t_memory();
     t_shm();
+    t_sock();
     t_files();
     t_dirs();
     t_fork_pipe();

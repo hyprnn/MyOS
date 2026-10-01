@@ -19,7 +19,7 @@
 #include "net.h"
 #include "tcp.h"
 
-#define SOCK_MAX   32
+#define SOCK_MAX   256         /* программам Linux (браузеру) нужно много */
 #define SOCK_DQ    16          /* сообщений UDP/ICMP в очереди */
 
 typedef struct {
@@ -625,8 +625,10 @@ INTN sock_send(INTN s, const void *buf, UINTN n)
 }
 
 /* Принять: TCP - сколько есть (0 - собеседник закрыл), UDP/ping -
-   одно сообщение (лишнее обрезается) */
-INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *ttl)
+   одно сообщение (лишнее обрезается). peek - только посмотреть
+   (MSG_PEEK программ Linux): данные остаются в сокете. */
+INTN sock_recvfrom_ex(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *ttl,
+                      BOOLEAN peek)
 {
     kmutex_lock(&g_net_mutex);
 
@@ -659,10 +661,11 @@ INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *
                 for (UINT32 i = 0; i < c; i++)
                     dst[i] = t->rbuf[(t->rbuf_start + i) % TCP_RBUF];
 
-                t->rbuf_start = (t->rbuf_start + c) % TCP_RBUF;
-                t->rbuf_len -= c;
-
-                tcp_window_update(t);
+                if (!peek) {
+                    t->rbuf_start = (t->rbuf_start + c) % TCP_RBUF;
+                    t->rbuf_len -= c;
+                    tcp_window_update(t);
+                }
 
                 if (ip) *ip = t->rip;
                 if (port) *port = t->rport;
@@ -708,6 +711,11 @@ INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *
             if (port) *port = d->sport;
             if (ttl) *ttl = d->ttl;
 
+            if (peek) {
+                r = (INTN)c;
+                break;
+            }
+
             kfree(d->data);
             d->data = NULL;
             k->qh = (UINT8)((k->qh + 1u) % SOCK_DQ);
@@ -727,6 +735,32 @@ INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *
 
     kmutex_unlock(&g_net_mutex);
 
+    return r;
+}
+
+INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *ttl)
+{
+    return sock_recvfrom_ex(s, buf, n, ip, port, ttl, FALSE);
+}
+
+/* С кем соединён сокет (getpeername) */
+INTN sock_peer(INTN s, UINT32 *ip, UINT16 *port)
+{
+    kmutex_lock(&g_net_mutex);
+
+    SOCKET *k = sock_get(s);
+    INTN r = 0;
+
+    if (k == NULL)
+        r = MYOS_EBADF;
+    else if (!k->connected && k->tcb == NULL)
+        r = MYOS_ENOTCONN;
+    else {
+        *ip = k->rip;
+        *port = k->rport;
+    }
+
+    kmutex_unlock(&g_net_mutex);
     return r;
 }
 

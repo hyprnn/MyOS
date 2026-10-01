@@ -214,6 +214,15 @@ static UINTN dns_servers(UINT32 *out, UINTN cap)
     return n;
 }
 
+/* Серверы DNS (для /etc/resolv.conf программ Linux) */
+UINTN dns_server_list(UINT32 *out, UINTN cap)
+{
+    kmutex_lock(&g_net_mutex);
+    UINTN n = dns_servers(out, cap);
+    kmutex_unlock(&g_net_mutex);
+    return n;
+}
+
 /*
  * Узнать адрес имени. "1.2.3.4" - просто разбирается; localhost -
  * 127.0.0.1. Возвращает 0 и *ip или ошибку (MYOS_EHOSTNOTFOUND,

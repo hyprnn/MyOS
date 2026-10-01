@@ -2459,6 +2459,10 @@ enum {
     LF_PIPE_W,      /*        пишущий конец */
     LF_MEM,         /* файл в памяти (/proc/...): текст, только чтение */
     LF_EVENTFD,     /* eventfd: счётчик */
+    LF_INET,        /* сокет TCP/UDP (сокет MyOS, net/socket.c) */
+    LF_UNIX,        /* сокет AF_UNIX (kernel/lxsock.c) */
+    LF_EPOLL,       /* epoll */
+    LF_TIMERFD,     /* timerfd */
 };
 
 struct LPIPE;
@@ -2472,7 +2476,16 @@ typedef struct LFILE {
     UINT64         pos;           /* LF_DIR: номер записи; LF_MEM: смещение */
     char          *mem;           /* LF_MEM: содержимое */
     UINT64         memlen;
-    UINT64         count;         /* LF_EVENTFD: значение счётчика */
+    UINT64         count;         /* LF_EVENTFD: значение счётчика; LF_TIMERFD:
+                                     сколько раз сработал */
+    INTN           sock;          /* LF_INET: номер сокета MyOS */
+    UINT32         stype;         /* сокет: SOCK_STREAM / DGRAM / SEQPACKET */
+    UINT64         rcvtimeo_ms;   /* SO_RCVTIMEO (0 - ждать сколько угодно) */
+    struct LUSOCK *us;            /* LF_UNIX */
+    struct LEPOLL *ep;            /* LF_EPOLL */
+    UINT64         t_next_ns;     /* LF_TIMERFD: когда сработает (0 - выключен) */
+    UINT64         t_iv_ns;       /*             и через сколько повторять */
+    UINT32         t_clock;       /*             часы (CLOCK_REALTIME/MONOTONIC) */
     char           path[VFS_PATH_MAX];   /* путь (для fstat, fchdir, /proc/self/fd) */
 } LFILE;
 
@@ -2541,6 +2554,18 @@ void lx_choose_root(KPROC *p);
 BOOLEAN lx_root_volume(char *out, UINTN cap);
 INTN lx_lookup_exec(KPROC *p, const char *path, char *real, UINTN cap);
 void lx_poll_wake(void);
+LFILE *lx_lfile_new(UINT32 type, UINT32 flags);
+INT64 lx_fd_install(KPROC *p, LFILE *f, BOOLEAN cloexec);
+UINT32 lx_file_poll(KPROC *p, LFILE *f);
+INT64 lx_wait_poll(KPROC *p, UINT64 deadline_ms);
+/* --- kernel/lxsock.c: сокеты, epoll, timerfd --- */
+INT64 lx_sock_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled);
+INT64 lxs_read(KPROC *p, LFILE *f, UINT8 *dst, UINTN n);
+INT64 lxs_write(KPROC *p, LFILE *f, const UINT8 *src, UINTN n);
+UINT32 lxs_poll(KPROC *p, LFILE *f);
+void lxs_release(LFILE *f);
+UINTN lxs_pending(LFILE *f);
+BOOLEAN lx_unix_bound(const char *mypath);
 INTN lx_file_read_kernel(LFILE *f, void *buf, UINTN n, UINT64 off);
 void proc_out_tty(KPROC *p, const char *s, UINTN n);
 BOOLEAN lx_term_isig(KPROC *p);
@@ -2869,6 +2894,10 @@ INTN sock_accept(INTN s, UINT32 pid, UINT32 *ip, UINT16 *port);
 INTN sock_sendto(INTN s, const void *buf, UINTN n, UINT32 ip, UINT16 port);
 INTN sock_send(INTN s, const void *buf, UINTN n);
 INTN sock_recvfrom(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *ttl);
+INTN sock_recvfrom_ex(INTN s, void *buf, UINTN n, UINT32 *ip, UINT16 *port, UINT8 *ttl,
+                      BOOLEAN peek);
+INTN sock_peer(INTN s, UINT32 *ip, UINT16 *port);
+UINTN dns_server_list(UINT32 *out, UINTN cap);
 INTN sock_recv(INTN s, void *buf, UINTN n);
 INTN sock_setopt(INTN s, UINT32 opt, UINT64 val);
 INTN sock_pending(INTN s);

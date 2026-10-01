@@ -2257,6 +2257,11 @@ static INT64 lx_dispatch(KPROC *p, UINT64 *f, UINT64 nr, UINT64 *a)
     if (handled)
         return r;
 
+    r = lx_sock_syscall(p, nr, a, &handled);
+
+    if (handled)
+        return r;
+
     switch (nr) {
 
     /* ---- память ---- */
@@ -2632,9 +2637,6 @@ static INT64 lx_dispatch(KPROC *p, UINT64 *f, UINT64 nr, UINT64 *a)
     case NR_syslog:
         return 0;
 
-    case NR_socket:
-    case NR_socketpair:
-        return -LX_EAFNOSUPPORT;    /* сеть для программ Linux - следующий шаг */
 
 
     /* расширенные атрибуты (xattr: ACL, SELinux): у нас их нет - как
