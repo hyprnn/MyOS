@@ -327,7 +327,13 @@ VT100/xterm), сокеты TCP/UDP (сеть MyOS) и AF_UNIX (с передач
 ## Установка на диск рядом с Arch (этап 9)
 
 Подробный гайд — **[INSTALL.md](INSTALL.md)** (Arch и systemd-boot; GRUB,
-rEFInd, флешка; что делать, если что-то не так). Коротко:
+rEFInd, флешка; что делать, если что-то не так). Одной командой (из Arch,
+обычным пользователем — скачать, собрать и поставить; повторный запуск
+обновляет):
+
+    curl -fsSL https://raw.githubusercontent.com/hyprnn/MyOS/claude/stage-8-internet-wifi-farsah/tools/get-myos.sh | bash
+
+Или по шагам:
 
 MyOS можно поставить на диск ноутбука, не трогая Arch: из Arch, после
 `make` (или с флешки MyOS — `--from /путь/к/флешке`):

@@ -9,7 +9,20 @@ rEFInd — см. раздел [«Другой загрузчик»](#11-друг
 
 ---
 
-## Коротко
+## Одной командой
+
+Из Arch, обычным пользователем (sudo скрипт попросит сам):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hyprnn/MyOS/claude/stage-8-internet-wifi-farsah/tools/get-myos.sh | bash
+```
+
+Скрипт `tools/get-myos.sh` ставит пакеты для сборки (`base-devel git`),
+скачивает код в `~/MyOS` (уже есть — обновляет), собирает и ставит
+(`install-arch.sh --menu`). Потом — `reboot` и в меню выбрать MyOS.
+Обновить MyOS — та же команда ещё раз.
+
+## Коротко (то же вручную)
 
 ```bash
 sudo pacman -S --needed base-devel git
