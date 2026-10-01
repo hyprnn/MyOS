@@ -27,6 +27,8 @@ t=$(echo abc | $BB sed 's/b/X/')
 [ "$t" = aXc ] || fail "sed ($t)"
 
 $BB ls /usb0p1 | $BB grep -q busybox || fail "ls | grep"
+cd /usb0p1 && $BB ls | $BB grep -q test.sh || fail "ls in the current folder"
+cd /
 
 $BB rm /tmp/seq.txt
 [ -e /tmp/seq.txt ] && fail "rm"

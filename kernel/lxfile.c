@@ -692,6 +692,10 @@ INTN lx_resolve_path(KPROC *p, INT64 dirfd, UINT64 upath, char *out, UINTN cap)
     char tmp[VFS_PATH_MAX];
     char joined[VFS_PATH_MAX * 2];
 
+    /* номер папки - int (как у Linux): AT_FDCWD (-100) может прийти и
+       без знакового расширения в старшие 32 бита регистра */
+    dirfd = (INT32)dirfd;
+
     for (UINTN i = 0; ; i++) {
 
         if (i + 1 >= sizeof(tmp))
@@ -1518,15 +1522,37 @@ static INT64 do_getdents64(KPROC *p, LFILE *f, UINT8 *out, UINTN cap)
 
     if (path_is(f->path, "/dev", &rest) || path_is(f->path, "/proc", &rest)) {
 
-        /* короткий список: что есть в /dev; /proc - пусто */
+        /* короткий список: что есть в /dev; в /proc - процессы (для ps)
+           и несколько файлов */
         static const char *const devs[] = { "null", "zero", "urandom", "random", "tty", NULL };
-        if (path_is(f->path, "/dev", NULL) && rest[0] == '\0')
-            for (UINTN i = 0; devs[i]; i++) {
-                if (c.idx++ < c.want)
+        static const char *const procs[] = { "self", "cpuinfo", "meminfo", "uptime", "mounts", NULL };
+        BOOLEAN is_dev = path_is(f->path, "/dev", NULL);
+
+        if (rest[0] == '\0') {
+            const char *const *names = is_dev ? devs : procs;
+            for (UINTN i = 0; names[i]; i++) {
+                if (c.idx < c.want) {
+                    c.idx++;
                     continue;
-                if (!gd_put(&c, devs[i], FALSE, 0x100 + i))
+                }
+                if (!gd_put(&c, names[i], is_dev ? FALSE : (i == 0), 0x100 + i))
                     break;
+                c.idx++;
             }
+            for (UINTN i = 0; !is_dev && !c.full && i < PROC_MAX; i++) {
+                if (!g_procs[i].used || g_procs[i].exited)
+                    continue;
+                if (c.idx < c.want) {
+                    c.idx++;
+                    continue;
+                }
+                char num[16];
+                ksnprintf(num, sizeof(num), "%u", g_procs[i].pid);
+                if (!gd_put(&c, num, TRUE, 0x10000 + g_procs[i].pid))
+                    break;
+                c.idx++;
+            }
+        }
 
     } else {
 
