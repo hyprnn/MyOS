@@ -1075,6 +1075,8 @@ def main():
             ('smptest 100\n', 're:4 programs at once: [0-9]+ ms -> ([2-9]|[1-9][0-9])\\.[0-9]+ times faster', 300),
             ('threadtest\n', 'threadtest: OK', 60),
             ('cpu\n', 'Big kernel lock', 15),
+            ('fetch\n', 'CPU cores    : 4 of 4 running', 15),
+            ('', 'Shell     : /bin/sh (a ring 3 program)', 3),
             ('ps\n', 'idle3', 15),
         ], ['-smp', '4']))
         runs.append(('smp-q35', [

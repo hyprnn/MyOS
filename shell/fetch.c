@@ -239,15 +239,12 @@ void cmd_fetch(
         "Shell"
     );
 
-    print(
-        out,
-        "     : myos-shell"
-    );
-
-    print(
-        out,
-        " (built-in command loop)\n"
-    );
+    /* этап 10: шелл - программа /bin/sh; из шелла ядра (аварийного)
+       fetch зовётся без процесса */
+    if (g_kcur->proc != NULL)
+        print(out, "     : /bin/sh (a ring 3 program)\n");
+    else
+        print(out, "     : kernel emergency shell\n");
 
 
     print_label(
@@ -267,8 +264,8 @@ void cmd_fetch(
     );
 
     if (g_acpi.have_madt)
-        kprintf(out, "    : %u (from ACPI), MyOS uses 1 for now\n",
-                (UINT32)g_acpi.ncpus_enabled);
+        kprintf(out, "    : %u of %u running (all cores work, see 'cpu')\n",
+                g_ncpus, (UINT32)g_acpi.ncpus_enabled);
     else
         print(out, "    : unknown (no ACPI MADT)\n");
 
