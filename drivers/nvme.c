@@ -37,7 +37,10 @@ typedef struct {
     UINT16  asq_tail, acq_head, iosq_tail, iocq_head;
     UINT8   acq_phase, iocq_phase;
     UINT16  cid;
-    UINT64  dma;                 /* 2 страницы для данных */
+    UINT64  dma;                 /* буфер данных (dma_pages страниц подряд) */
+    UINT32  dma_pages;
+    UINT64  prp;                 /* список PRP: адреса страниц буфера со 2-й */
+    UINT32  max_bytes;           /* сколько данных за одну команду */
     UINT64  ident;               /* страница для Identify */
     UINT64  sectors;
     UINT32  lba_size;
@@ -114,7 +117,9 @@ static BOOLEAN nvme_rw(BLKDEV *d, UINT64 lba, UINT32 count, VOID *buf, BOOLEAN w
 {
     NVME_CTRL *c = &g_nvme[d->drv_index];
     UINT8 *b = (UINT8 *)buf;
-    UINT32 per = 8192u / c->lba_size;
+    /* за команду - до max_bytes (128 КиБ): большие файлы (библиотеки
+       Linux, Firefox) читаются в 16 раз меньшим числом команд */
+    UINT32 per = c->max_bytes / c->lba_size;
     volatile UINT8 *dma = (volatile UINT8 *)P2V(c->dma);
 
     while (count > 0) {
@@ -133,7 +138,11 @@ static BOOLEAN nvme_rw(BLKDEV *d, UINT64 lba, UINT32 count, VOID *buf, BOOLEAN w
         cmd[1] = 1;                                   /* namespace 1 */
         cmd[6] = (UINT32)(c->dma & 0xFFFFFFFFu);      /* PRP1 */
         cmd[7] = (UINT32)(c->dma >> 32);
-        if (bytes > 4096u) {
+        if (bytes > 8192u) {
+            /* больше двух страниц: PRP2 - список адресов остальных */
+            cmd[8] = (UINT32)(c->prp & 0xFFFFFFFFu);
+            cmd[9] = (UINT32)(c->prp >> 32);
+        } else if (bytes > 4096u) {
             cmd[8] = (UINT32)((c->dma + 4096u) & 0xFFFFFFFFu);   /* PRP2 */
             cmd[9] = (UINT32)((c->dma + 4096u) >> 32);
         }
@@ -180,11 +189,26 @@ static BOOLEAN nvme_start(NVME_CTRL *c, SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     c->acq = pmm_alloc_zeroed(1, 0x100000000ull);
     c->iosq = pmm_alloc_zeroed(1, 0x100000000ull);
     c->iocq = pmm_alloc_zeroed(1, 0x100000000ull);
-    c->dma = pmm_alloc_zeroed(2, 0x100000000ull);
+    /* буфер данных: 128 КиБ подряд (не нашлось - хотя бы 8 КиБ) */
+    c->dma_pages = 32;
+    c->dma = pmm_alloc_zeroed(c->dma_pages, 0x100000000ull);
+    if (c->dma == 0) {
+        c->dma_pages = 2;
+        c->dma = pmm_alloc_zeroed(c->dma_pages, 0x100000000ull);
+    }
+    c->prp = pmm_alloc_zeroed(1, 0x100000000ull);
     c->ident = pmm_alloc_zeroed(1, 0x100000000ull);
 
-    if (!c->asq || !c->acq || !c->iosq || !c->iocq || !c->dma || !c->ident)
+    if (!c->asq || !c->acq || !c->iosq || !c->iocq || !c->dma || !c->ident || !c->prp)
         return FALSE;
+
+    {
+        volatile UINT64 *l = (volatile UINT64 *)P2V(c->prp);
+        for (UINT32 k = 1; k < c->dma_pages; k++)
+            l[k - 1] = c->dma + 4096ull * k;
+    }
+
+    c->max_bytes = c->dma_pages * 4096u;
 
     c->acq_phase = 1;
     c->iocq_phase = 1;
@@ -222,6 +246,10 @@ static BOOLEAN nvme_start(NVME_CTRL *c, SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     }
 
     c->model[40] = '\0';
+
+    /* MDTS: предел одной передачи у контроллера (2^n страниц; 0 - нет) */
+    if (id[77] != 0 && id[77] < 16 && (4096u << id[77]) < c->max_bytes)
+        c->max_bytes = 4096u << id[77];
 
     for (INTN i = 39; i >= 0 && c->model[i] == ' '; i--)
         c->model[i] = '\0';
