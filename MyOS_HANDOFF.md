@@ -817,3 +817,110 @@ UEFI: всё — EfiLoaderData, а что ядру не трогать, пере
   `user/lib/gfx.c`): светлый градиент и контур со срезанными углами;
   фон окон `C_FACE`/`GFX_FACE` = 0xEEF3F8.
 
+
+## Программы Linux (этап 11, шаг 1) — как устроено
+
+Цель этапа — Firefox. Путь — совместимость с ядром Linux (как WSL1):
+программа для Linux работает без пересборки, ядро MyOS отвечает на её
+системные вызовы по правилам Linux. Шаг 1 (сделан): статические
+программы glibc/musl, busybox.
+
+* **Какая программа**: `linux_elf_is_linux` (linux.c). У программ MyOS в
+  `user/user.ld` и `user/posix/posix.ld` — пустой заголовок программы
+  с типом `0x6D794F53` ("MyOS"); без метки и только с PT_LOAD — тоже
+  MyOS (старые сборки). Всё остальное (PT_GNU_STACK, PT_NOTE, PT_TLS,
+  PT_INTERP, ET_DYN) — Linux. `proc_spawn_ex` для Linux зовёт
+  `linux_proc_start` вместо своего загрузчика.
+* **Память** (`kernel/umem.c`): у процесса Linux список областей `UVMA`
+  (`p->vmas`), страницы — по первому касанию (`uvm_fault` из
+  обработчика #PF: и из ring 3, и когда ядро трогает буфер программы;
+  `uptr_ok` для таких процессов = `uvm_prefault`). fork — `uvm_fork`:
+  частные страницы у обоих "только чтение + `UPTE_COW`" (бит 10),
+  счётчики хозяев страниц — `pmm_page_ref/unref/refs` (pmm.c, 16 бит на
+  страницу, таблица заводится при первом fork). PROT_NONE = страница без
+  бита U. Сброс TLB на других ядрах: `uvm_tlb_shootdown` → IPI
+  `KX_VEC_TLB` (0xF2), обрабатывается в `kx_isr_dispatch` БЕЗ большого
+  замка, а ядра, ждущие замок, отвечают из цикла ожидания (`bkl_acquire`).
+  Одиночные страницы pmm выдаёт с подсказки (next fit) — иначе поиск
+  шёл бы через всю занятую память.
+* **Раскладка**: программа ET_EXEC — где слинкована, ET_DYN — с
+  `0x555555554000`; стек 8 МБ под `MYOS_USER_STACK_TOP` (`UVM_STACK`);
+  mmap — вниз от `0x7F0000000000`; brk — сразу за данными. Стек при
+  старте — argc/argv/envp/auxv (AT_PHDR, AT_RANDOM, AT_ENTRY, AT_BASE...),
+  `lx_build_stack`. Динамические программы: загрузчик уже грузит PT_INTERP
+  (ld.so) и даёт AT_BASE, но файлов `/lib64/...` у MyOS пока нет.
+* **Системные вызовы**: `kx_syscall_dispatch_inner` → `linux_syscall`
+  (linux.c) если `p->is_linux`. Номера и константы — `kernel/linux.h`.
+  Разделены: `lx_file_syscall` (lxfile.c: файлы, каналы, терминал,
+  poll/select, stat/statx, getdents64, ioctl, fcntl...), `lx_sig_syscall`
+  (lxsig.c), остальное — `lx_dispatch` (память, clone/fork/execve/wait4,
+  futex, время, uname, prlimit...). Неизвестный — ENOSYS и одна строка в
+  журнале (`linux: ... system call N is not supported yet`) — так видно,
+  что добавить дальше. Ошибки VFS → errno: `linux_errno`.
+* **Вход в программу со всеми регистрами**: `kx_lx_iret(LX_REGS*, fx)`
+  (fxrstor + iretq; стек ядра бросается) — новый поток, fork, execve,
+  обработчик сигнала, rt_sigreturn. fxsave рамки syscall/прерывания —
+  `(рамка - 512) & ~15`.
+* **Потоки**: `KTHREAD.proc` — у процесса может быть много потоков
+  (`proc_alive`, `proc_other_threads`); процесс заканчивает последний
+  поток (`proc_exit_current`). `KTHREAD.fs_base` (TLS, `arch_prctl`) —
+  MSR 0xC0000100 в `proc_switch_hook`. `lx_tid` — номер потока для
+  программы (общий счёт с pid, у главного = pid). futex: ключ — физический
+  адрес слова, ожидание — `sched_block(ключ)` кусками по 100 мс (сигналы),
+  WAKE/REQUEUE/CMP_REQUEUE/WAKE_OP/BITSET. CLONE_CHILD_CLEARTID —
+  `linux_thread_gone`. exit_group — `p->group_exit` + `p->killed`.
+  `sched_wake_thread` — разбудить конкретный поток. KT_MAX = 256,
+  PROC_MAX = 64.
+* **fork/execve**: fork — новый KPROC (`proc_alloc_slot`), копия
+  "Linux-части" (`LXPROC`: файлы, обработчики, pgid/sid), `uvm_fork`;
+  vfork/CLONE_VFORK — родитель ждёт `vfork_wait`. execve: новое адресное
+  пространство строится рядом со старым и заменяет его только при
+  успехе; `#!` — интерпретатор (до 4 уровней); `/proc/self/exe` →
+  `lx->exe`; другие потоки — `lx_die`; файлы FD_CLOEXEC закрываются,
+  обработчики сбрасываются. Программу MyOS из Linux-процесса пока не
+  запустить (ENOEXEC).
+* **Файлы** (`kernel/lxfile.c`): `LFILE` со счётчиком ссылок (dup,
+  fork), таблица `LX_FDS` = 1024. Виды: TTY, VFS, DIR (путь + номер
+  записи), NULL/ZERO/RANDOM, PIPE (кольцо 64 КиБ, атомарно до 4 КиБ,
+  SIGPIPE), MEM (/proc), EVENTFD. Пути: `/dev/*`, `/proc/self|PID/*`
+  (exe, cwd, fd/N, maps, stat, status, cmdline), `/proc/cpuinfo|meminfo|
+  uptime`; `/dev/shm` → `/tmp/.shm`. У FAT нет inode — `st_ino` = хэш
+  пути; права — всегда 0755. poll/select ждут `g_lx_poll_event` (каналы,
+  терминал, eventfd будят его) кусками по 10 мс.
+* **Терминал**: `LTERM` на окно-терминал (или консоль) — termios
+  (TCGETS/TCSETS*), TIOCGWINSZ, pgrp. Канонический режим — строка с
+  эхом (`tty_read_line` / свой редактор для консоли), сырой — клавиши
+  сразу, стрелки → `ESC [ A`..., VMIN/VTIME. Ctrl+C у программы Linux
+  (`proc_ctrl_c`, `tty_event`) → `lx_ctrl_c`: SIGINT всей группе
+  процессов, если ISIG включён, иначе клавиша 3. Окно-терминал
+  (`gui/tty.c`) понимает ANSI/VT100: курсор (CSI A-H, d, G), стирание
+  (J, K, X, P, @), строки (L, M, S, T), область прокрутки (r), SGR
+  (16/256/24-битные цвета → палитра из 16; в ячейке — символ 21 бит +
+  цвета по 5 бит), ESC 7/8, ESC M, ответ на `ESC[6n`. TERM=xterm в окне,
+  TERM=dumb в консоли.
+* **Сигналы** (`kernel/lxsig.c`): пришедшие — `LXPROC.sig_pending` и
+  `KTHREAD.sig_pending`, маска — у потока. Доставка — на выходе из
+  syscall (`linux_syscall`) и прерывания (`linux_isr_return` в конце
+  `kx_isr_dispatch`): кадр `rt_sigframe` как у Linux (ucontext с
+  sigcontext, fpstate 512 байт, siginfo), вход через `kx_lx_iret`.
+  Прерванный вызов отвечает `-LX_ERESTARTSYS` (512): SA_RESTART или
+  пропущенный сигнал — повтор (rip -= 2, rax = номер), иначе EINTR.
+  Ошибки в программе (cpu.c) → SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGTRAP
+  (`lx_signal_fault`); без обработчика — смерть с объяснением, как у
+  программ MyOS. alarm/setitimer(ITIMER_REAL) — проверка при каждом
+  выходе в программу.
+* **`/tmp`** — новый том tmpfs (`fs/tmpfs.c`): папки, файлы любого
+  размера (страницы pmm), имена с учётом регистра; удалённый открытый
+  файл живёт до последнего close (новая операция `VFS_OPS.open`).
+* **AVX выключен** (CR4.OSXSAVE = 0, vmm.c): ядро сохраняет только
+  fxsave, а glibc при наличии AVX пользовалась бы ymm.
+* **Проверка**: прогон `linux` (autotest): `tests/linux/ltest.c`,
+  собранная на хосте `gcc -static` (glibc) и `musl-gcc -static` —
+  32 проверки (память, файлы, fork/exec/vfork, потоки+mutex+TLS,
+  cond timedwait, сигналы, SIGSEGV-обработчик, mprotect, EINTR, poll,
+  /proc, /dev); busybox хоста (`apt install busybox-static`) — `uname -a`
+  и сценарий `tests/linux/test.sh` (конвейеры, $(...), подоболочки, фон).
+  Нужен пакет `musl-tools`; без него прогон пропускается.
+* **Дальше (шаг 2)**: чтение ext4 (раздел Arch только для чтения),
+  динамические программы (ld.so, `/usr/lib`), сеть для программ Linux
+  (AF_INET поверх своих сокетов, AF_UNIX), epoll, memfd. Шаг 3 — Wayland.

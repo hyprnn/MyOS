@@ -118,6 +118,7 @@
 #define MYOS_EINPROGRESS   -27   /* неблокирующий connect: соединение устанавливается */
 #define MYOS_EBUSY         -28   /* занято другой программой (звук) */
 #define MYOS_ENODEV        -29   /* такого устройства нет (звуковой карты) */
+#define MYOS_ENOMEM        -30   /* не хватило памяти (или адреса заняты) */
 
 struct myos_time {
     unsigned short year;

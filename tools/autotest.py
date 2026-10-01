@@ -254,6 +254,28 @@ def sound_seconds(path):
     return sum(1 for v in s if abs(v) > 300) / float(w.getframerate())
 
 
+def build_linux_tests(work):
+    """Программы Linux для прогона linux (этап 11): tests/linux/ltest.c,
+    собранная на хосте статически с glibc и с musl, busybox хоста и
+    сценарий для него. None - нечем собрать (нет musl-gcc / static libc)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = os.path.join(root, 'tests', 'linux', 'ltest.c')
+    files = {}
+    for name, cc in (('lt-glibc', ['gcc', '-pthread']), ('lt-musl', ['musl-gcc'])):
+        if not shutil_which(cc[0]):
+            return None
+        out = os.path.join(work, name)
+        r = subprocess.run(cc + ['-static', '-O2', '-w', '-o', out, src], capture_output=True)
+        if r.returncode != 0:
+            return None
+        files[name] = open(out, 'rb').read()
+    bb = shutil_which('busybox')
+    if bb:
+        files['busybox'] = open(bb, 'rb').read()
+        files['test.sh'] = open(os.path.join(root, 'tests', 'linux', 'test.sh'), 'rb').read()
+    return files
+
+
 def make_test_disk(path, mib, bits, scheme, label, extra=None):
     """Диск с FAT и файлами "как с Linux": короткое и длинное имя,
     папка, большой файл (300 000 байт, много кластеров)"""
@@ -1042,6 +1064,25 @@ def main():
             '-device', 'ich9-intel-hda', '-device', 'hda-duplex,audiodev=snd0',
             '-drive', 'if=none,id=dstick,format=raw,file=@WORK@/doomstick.img'],
             ['qemu-xhci', 'usb-kbd', 'usb-mouse', 'usb-storage,drive=dstick']))
+        # программы Linux (этап 11): тест ltest (glibc и musl) - память,
+        # файлы, fork/exec, потоки, futex, сигналы; busybox со сценарием
+        linux_files = build_linux_tests(work)
+        if linux_files:
+            make_test_disk(os.path.join(work, 'linuxstick.img'), 64, 32, 'mbr', 'LINUX',
+                           linux_files)
+            lsteps = [
+                (None, "Type 'help'", 90),
+                ('/usb0p1/lt-musl\n', 'LTEST DONE pass=32 fail=0', 120),
+                ('/usb0p1/lt-glibc\n', 'LTEST DONE pass=32 fail=0', 120),
+            ]
+            if 'busybox' in linux_files:
+                lsteps += [
+                    ('/usb0p1/busybox uname -a\n', 'Linux myos 6.1.0-myos', 30),
+                    ('/usb0p1/busybox sh /usb0p1/test.sh\n', 'SCRIPT OK', 120),
+                ]
+            runs.append(('linux', lsteps,
+                         ['-drive', 'if=none,id=lstick,format=raw,file=@WORK@/linuxstick.img'],
+                         ['qemu-xhci', 'usb-kbd', 'usb-storage,drive=lstick']))
         # все ядра процессора (этап 10): 4 ядра - все проснулись
         runs.append(('smp', [
             (None, 'CPU cores: 4 of 4 running', 90),

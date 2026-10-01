@@ -1,0 +1,436 @@
+/*
+ * tests/linux/ltest.c - проверка "программ Linux на MyOS" (этап 11).
+ *
+ * Это обычная программа для Linux: autotest собирает её на хосте
+ * (gcc -static с glibc и musl-gcc -static) и запускает в MyOS с
+ * флешки. Каждая проверка печатает "LTEST PASS имя" или
+ * "LTEST FAIL имя - почему", в конце - "LTEST DONE pass=N fail=M".
+ * На настоящем Linux программа тоже проходит все проверки (так её и
+ * проверяли перед тем, как ждать того же от MyOS).
+ */
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static int g_pass, g_fail;
+
+static void result(const char *name, int ok, const char *why)
+{
+    if (ok) {
+        printf("LTEST PASS %s\n", name);
+        g_pass++;
+    } else {
+        printf("LTEST FAIL %s - %s (errno %d)\n", name, why, errno);
+        g_fail++;
+    }
+    fflush(stdout);
+}
+
+static double now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+/* ---------- память ---------- */
+
+static void t_memory(void)
+{
+    size_t n = 64u << 20;
+    unsigned char *p = malloc(n);
+
+    if (p == NULL) {
+        result("malloc-64M", 0, "malloc failed");
+        return;
+    }
+
+    for (size_t i = 0; i < n; i += 4096)
+        p[i] = (unsigned char)(i >> 12);
+
+    int ok = 1;
+    for (size_t i = 0; i < n; i += 4096)
+        if (p[i] != (unsigned char)(i >> 12))
+            ok = 0;
+
+    free(p);
+    result("malloc-64M", ok, "wrong data");
+
+    /* много мелких - brk */
+    void *v[1000];
+    for (int i = 0; i < 1000; i++)
+        v[i] = malloc(100 + i);
+    ok = 1;
+    for (int i = 0; i < 1000; i++) {
+        if (v[i] == NULL)
+            ok = 0;
+        else
+            memset(v[i], i & 0xFF, 100 + i);
+    }
+    for (int i = 0; i < 1000; i++)
+        free(v[i]);
+    result("malloc-small", ok, "malloc failed");
+}
+
+/* ---------- файлы ---------- */
+
+static void t_files(void)
+{
+    const char *path = "/tmp/ltest.txt";
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+
+    if (fd < 0) {
+        result("file-write", 0, "open for write");
+        return;
+    }
+
+    const char *msg = "hello from a Linux program\nsecond line\n";
+    ssize_t w = write(fd, msg, strlen(msg));
+    close(fd);
+    result("file-write", w == (ssize_t)strlen(msg), "short write");
+
+    char buf[128] = { 0 };
+    fd = open(path, O_RDONLY);
+    ssize_t r = read(fd, buf, sizeof(buf) - 1);
+    struct stat st;
+    int fs = fstat(fd, &st);
+    off_t pos = lseek(fd, 6, SEEK_SET);
+    char c = 0;
+    read(fd, &c, 1);
+    close(fd);
+
+    result("file-read", r == (ssize_t)strlen(msg) && strcmp(buf, msg) == 0, "content differs");
+    result("file-stat", fs == 0 && st.st_size == (off_t)strlen(msg) && S_ISREG(st.st_mode),
+           "fstat");
+    result("file-lseek", pos == 6 && c == 'f', "lseek");
+
+    /* dup2 на свой номер, запись через него */
+    fd = open(path, O_WRONLY | O_APPEND);
+    int d = dup2(fd, 10);
+    write(10, "third\n", 6);
+    close(fd);
+    close(10);
+    stat(path, &st);
+    result("file-dup2", d == 10 && st.st_size == (off_t)strlen(msg) + 6, "dup2/append");
+
+    int rn = rename(path, "/tmp/ltest2.txt");
+    int ex = access("/tmp/ltest2.txt", F_OK);
+    int un = unlink("/tmp/ltest2.txt");
+    int gone = access("/tmp/ltest2.txt", F_OK);
+    result("file-rename-unlink", rn == 0 && ex == 0 && un == 0 && gone != 0, "rename/unlink");
+
+    int md = mkdir("/tmp/ltdir", 0755);
+    struct stat ds;
+    int dst = stat("/tmp/ltdir", &ds);
+    int rd = rmdir("/tmp/ltdir");
+    result("mkdir-rmdir", md == 0 && dst == 0 && S_ISDIR(ds.st_mode) && rd == 0, "mkdir/rmdir");
+}
+
+static void t_dirs(void)
+{
+    DIR *d = opendir("/bin");
+    int n = 0, dot = 0;
+    struct dirent *e;
+
+    if (d != NULL) {
+        while ((e = readdir(d)) != NULL) {
+            n++;
+            if (strcmp(e->d_name, ".") == 0)
+                dot = 1;
+        }
+        closedir(d);
+    }
+
+    result("readdir", n > 5 && dot, "opendir/readdir /bin");
+
+    char cwd[256];
+    int ch = chdir("/tmp");
+    char *g = getcwd(cwd, sizeof(cwd));
+    result("chdir-getcwd", ch == 0 && g != NULL && strcmp(cwd, "/tmp") == 0, cwd);
+    chdir("/");
+}
+
+/* ---------- процессы ---------- */
+
+static int g_cow = 1;
+
+static void t_fork_pipe(void)
+{
+    int fds[2];
+
+    if (pipe(fds) != 0) {
+        result("pipe-fork", 0, "pipe");
+        return;
+    }
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        close(fds[0]);
+        g_cow = 2;
+        const char *m = "hi from child";
+        write(fds[1], m, strlen(m));
+        close(fds[1]);
+        _exit(7);
+    }
+
+    close(fds[1]);
+    char buf[64] = { 0 };
+    ssize_t r = 0, k;
+    while ((k = read(fds[0], buf + r, sizeof(buf) - 1 - r)) > 0)
+        r += k;
+    close(fds[0]);
+
+    int st = 0;
+    pid_t w = waitpid(pid, &st, 0);
+
+    result("pipe-fork", pid > 0 && strcmp(buf, "hi from child") == 0, buf);
+    result("waitpid", w == pid && WIFEXITED(st) && WEXITSTATUS(st) == 7, "exit status");
+    result("fork-cow", g_cow == 1, "child changed parent memory");
+}
+
+static void t_exec(const char *self)
+{
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        char *av[] = { (char *)self, "exec-child", "arg2", NULL };
+        char *ev[] = { "LTEST_VAR=works", NULL };
+        execve(self, av, ev);
+        _exit(99);
+    }
+
+    int st = 0;
+    waitpid(pid, &st, 0);
+    result("fork-exec", WIFEXITED(st) && WEXITSTATUS(st) == 3, "execve child status");
+
+    /* posix_spawn-подобное: vfork */
+    pid = vfork();
+    if (pid == 0) {
+        char *av[] = { (char *)self, "exec-child", "arg2", NULL };
+        char *ev[] = { "LTEST_VAR=works", NULL };
+        execve(self, av, ev);
+        _exit(99);
+    }
+    st = 0;
+    waitpid(pid, &st, 0);
+    result("vfork-exec", WIFEXITED(st) && WEXITSTATUS(st) == 3, "vfork child status");
+}
+
+/* ---------- потоки ---------- */
+
+static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+static long g_counter;
+static __thread int g_tls = 5;
+
+static void *th_add(void *arg)
+{
+    long id = (long)arg;
+
+    g_tls = (int)id * 10;
+
+    for (int i = 0; i < 100000; i++) {
+        pthread_mutex_lock(&g_mx);
+        g_counter++;
+        pthread_mutex_unlock(&g_mx);
+    }
+
+    return (void *)(long)(g_tls == (int)id * 10);
+}
+
+static void t_threads(void)
+{
+    pthread_t th[4];
+    int ok = 1;
+
+    for (long i = 0; i < 4; i++)
+        if (pthread_create(&th[i], NULL, th_add, (void *)(i + 1)) != 0)
+            ok = 0;
+
+    int tls_ok = 1;
+    for (int i = 0; i < 4; i++) {
+        void *r = NULL;
+        pthread_join(th[i], &r);
+        if (r == NULL)
+            tls_ok = 0;
+    }
+
+    result("threads-mutex", ok && g_counter == 400000, "counter");
+    result("threads-tls", tls_ok && g_tls == 5, "thread-local storage");
+
+    /* условная переменная со сроком: ETIMEDOUT примерно через 50 мс */
+    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 50 * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    double t0 = now_ms();
+    pthread_mutex_lock(&g_mx);
+    int rc = pthread_cond_timedwait(&cv, &g_mx, &ts);
+    pthread_mutex_unlock(&g_mx);
+    double dt = now_ms() - t0;
+    result("cond-timedwait", rc == ETIMEDOUT && dt >= 30 && dt < 2000, "timeout");
+}
+
+/* ---------- сигналы ---------- */
+
+static volatile sig_atomic_t g_sig;
+static sigjmp_buf g_jb;
+
+static void on_sig(int s)
+{
+    g_sig = s;
+}
+
+static void on_segv(int s, siginfo_t *si, void *uc)
+{
+    (void)s;
+    (void)uc;
+    g_sig = (int)(long)si->si_addr == 0x10 ? 100 : 101;
+    siglongjmp(g_jb, 1);
+}
+
+static void t_signals(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sig;
+    sigaction(SIGUSR1, &sa, NULL);
+    g_sig = 0;
+    raise(SIGUSR1);
+    result("signal-raise", g_sig == SIGUSR1, "handler not called");
+
+    sigaction(SIGUSR2, &sa, NULL);
+    g_sig = 0;
+    kill(getpid(), SIGUSR2);
+    result("signal-kill", g_sig == SIGUSR2, "handler not called");
+
+    sigaction(SIGALRM, &sa, NULL);
+    g_sig = 0;
+    double t0 = now_ms();
+    alarm(1);
+    while (g_sig == 0 && now_ms() - t0 < 5000)
+        pause();
+    result("alarm-pause", g_sig == SIGALRM, "no SIGALRM");
+
+    /* ошибка памяти - свой обработчик и выход через siglongjmp */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_segv;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    g_sig = 0;
+    if (sigsetjmp(g_jb, 1) == 0) {
+        *(volatile int *)0x10 = 1;
+    }
+    result("sigsegv-handler", g_sig == 100, "SIGSEGV not caught");
+
+    /* mprotect: запись в страницу "только чтение" - тоже SIGSEGV */
+    char *pg = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pg[0] = 'x';
+    mprotect(pg, 4096, PROT_READ);
+    g_sig = 0;
+    if (sigsetjmp(g_jb, 1) == 0)
+        pg[1] = 'y';
+    result("mprotect", g_sig != 0 && pg[0] == 'x', "write to read-only page went through");
+    munmap(pg, 4096);
+
+    /* сигнал прерывает долгий вызов: read из канала - EINTR */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sig;
+    sigaction(SIGALRM, &sa, NULL);
+    int fds[2];
+    pipe(fds);
+    g_sig = 0;
+    alarm(1);
+    char c;
+    ssize_t r = read(fds[0], &c, 1);
+    result("eintr", r == -1 && errno == EINTR && g_sig == SIGALRM, "read not interrupted");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* ---------- время, poll, /proc ---------- */
+
+static void t_misc(void)
+{
+    double t0 = now_ms();
+    struct timespec ts = { 0, 30 * 1000000 };
+    nanosleep(&ts, NULL);
+    double dt = now_ms() - t0;
+    result("nanosleep", dt >= 25 && dt < 1000, "sleep length");
+
+    time_t t = time(NULL);
+    result("time", t > 1700000000, "clock is not set");
+
+    struct utsname u;
+    uname(&u);
+    result("uname", strcmp(u.sysname, "Linux") == 0 && strcmp(u.machine, "x86_64") == 0,
+           u.sysname);
+
+    char exe[256] = { 0 };
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    result("proc-self-exe", n > 0 && strstr(exe, "lt") != NULL, exe);
+
+    int fds[2];
+    pipe(fds);
+    struct pollfd pf = { fds[0], POLLIN, 0 };
+    t0 = now_ms();
+    int pr = poll(&pf, 1, 100);
+    dt = now_ms() - t0;
+    write(fds[1], "z", 1);
+    int pr2 = poll(&pf, 1, 1000);
+    result("poll", pr == 0 && dt >= 80 && pr2 == 1 && (pf.revents & POLLIN), "poll on a pipe");
+    close(fds[0]);
+    close(fds[1]);
+
+    int dn = open("/dev/null", O_WRONLY);
+    ssize_t dw = write(dn, "abc", 3);
+    close(dn);
+    int ur = open("/dev/urandom", O_RDONLY);
+    unsigned char rb[16] = { 0 };
+    ssize_t urr = read(ur, rb, 16);
+    close(ur);
+    result("dev-files", dw == 3 && urr == 16, "/dev/null or /dev/urandom");
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "exec-child") == 0) {
+        const char *v = getenv("LTEST_VAR");
+        printf("LTEST exec child: %s %s\n", argv[2], v ? v : "(no env)");
+        return (v && strcmp(v, "works") == 0 && strcmp(argv[2], "arg2") == 0) ? 3 : 4;
+    }
+
+    printf("LTEST start: %s, pid %d\n", argv[0], (int)getpid());
+    result("args-env", argc >= 1 && getenv("PATH") != NULL, "no PATH");
+
+    t_memory();
+    t_files();
+    t_dirs();
+    t_fork_pipe();
+    t_exec(argv[0]);
+    t_threads();
+    t_signals();
+    t_misc();
+
+    printf("LTEST DONE pass=%d fail=%d\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}

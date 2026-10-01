@@ -11,6 +11,8 @@ PHDRS
     text PT_LOAD FLAGS(5);    /* R + X */
     rodata PT_LOAD FLAGS(4);  /* R */
     data PT_LOAD FLAGS(6);    /* R + W */
+    myos 0x6D794F53 FLAGS(0); /* метка "программа MyOS" (этап 11: иначе ядро
+                                 решит, что это программа Linux) */
 }
 
 SECTIONS

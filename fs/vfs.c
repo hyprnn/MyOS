@@ -270,7 +270,8 @@ static const VFS_OPS g_ram_ops = {
     ram_remove,
     ram_rename,
     ram_statfs,
-    NULL                          /* close: нечего дописывать */
+    NULL,                         /* close: нечего дописывать */
+    NULL                          /* open: считать не нужно */
 };
 
 
@@ -796,6 +797,9 @@ INTN vfs_open(const char *path, UINT32 flags)
     f->flags = flags;
     f->pos = (flags & VFS_O_APPEND) ? node.size : 0;
 
+    if (mi >= 0 && g_mounts[mi].ops->open != NULL)
+        g_mounts[mi].ops->open(&g_mounts[mi], &f->node);
+
     kmutex_unlock(&g_vfs_mutex);
     return fd;
 }
@@ -898,6 +902,31 @@ INTN vfs_seek(INTN fd, INT64 off, UINT32 whence, UINT64 *newpos)
             f->pos = (UINT64)np;
             *newpos = f->pos;
         }
+    }
+
+    kmutex_unlock(&g_vfs_mutex);
+    return r;
+}
+
+/* Новая длина открытого файла (ftruncate программ Linux, этап 11) */
+INTN vfs_ftruncate(INTN fd, UINT64 size)
+{
+    kmutex_lock(&g_vfs_mutex);
+
+    VFS_FD *f = fd_get(fd);
+    INTN r;
+
+    if (f == NULL)
+        r = VFS_EBADF;
+    else if (f->gone)
+        r = VFS_EGONE;
+    else if (!(f->flags & (VFS_O_WRITE | VFS_O_APPEND)))
+        r = VFS_EBADF;
+    else {
+        VFS_MOUNT *m = &g_mounts[f->mount];
+        r = (m->ops->truncate != NULL) ? m->ops->truncate(m, &f->node, size) : VFS_ENOSYS;
+        if (r == VFS_OK && f->pos > size)
+            f->pos = size;
     }
 
     kmutex_unlock(&g_vfs_mutex);

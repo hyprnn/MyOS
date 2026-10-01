@@ -834,8 +834,41 @@ static void kx_isr_dispatch_inner(KX_ISR_FRAME *f)
         /* исключение в ПРОГРАММЕ (ring 3): виновата она, а не ядро -
            программа будет завершена, ОС работает дальше (proc.c) */
         if ((f->cs & 3u) == 3u) {
+
+            /* память по требованию (этап 11, umem.c): страницы ещё не
+               было или она общая после fork - дать и продолжить */
+            if (v == 14 && uvm_fault_err(g_kcur->proc, kx_read_cr2(), f->error))
+                return;
+
+            /* программа Linux: ошибка - это сигнал (SIGSEGV...), у неё
+               может быть свой обработчик (lxsig.c) */
+            KPROC *lp = g_kcur->proc;
+
+            if (lp != NULL && lp->is_linux) {
+                UINT32 sig = (v == 0 || v == 16 || v == 19) ? 8u :     /* SIGFPE */
+                             (v == 6) ? 4u :                            /* SIGILL */
+                             (v == 17) ? 7u :                           /* SIGBUS */
+                             (v == 1) ? 5u : 11u;                       /* SIGTRAP / SIGSEGV */
+                UINT64 addr = (v == 14) ? kx_read_cr2() : f->rip;
+                lx_signal_fault(lp, sig, addr);
+                if (lp->group_exit) {
+                    /* не обработать - объяснить, как у программ MyOS */
+                    kx_user_fault(f);
+                    lp->killed = TRUE;
+                }
+                return;
+            }
+
             kx_user_fault(f);
             return;
+        }
+
+        /* ядро тронуло память программы (буфер системного вызова), а
+           страницы ещё нет - тоже дать (обычно uptr_ok даёт заранее) */
+        if (v == 14 && g_kcur->proc != NULL) {
+            UINT64 cr2 = kx_read_cr2();
+            if (cr2 < 0x0000800000000000ull && uvm_fault_err(g_kcur->proc, cr2, f->error & ~0x10ull))
+                return;
         }
 
         kx_panic(f);
@@ -881,6 +914,14 @@ void kx_isr_dispatch(KX_ISR_FRAME *f)
     if (f->vector == KX_VEC_HALT)
         kx_isr_dispatch_inner(f);
 
+    /* "сбрось TLB" (umem.c): без большого замка - его держит как раз
+       тот, кто просит и ждёт ответа */
+    if (f->vector == KX_VEC_TLB) {
+        uvm_tlb_ipi();
+        kx_lapic_eoi();
+        return;
+    }
+
     kx_bkl_enter();
 
     c->isr_depth++;
@@ -896,8 +937,11 @@ void kx_isr_dispatch(KX_ISR_FRAME *f)
 
     /* возвращаемся в программу, а её попросили завершиться
        (упала, Ctrl+C, закрыли окно) - завершить прямо здесь */
-    if ((f->cs & 3u) == 3u)
+    if ((f->cs & 3u) == 3u) {
         proc_check_kill();
+        /* программа Linux: сигналы (обработчик - прямо сейчас) */
+        linux_isr_return(f);
+    }
 
     /* прервали код ядра ОС в месте, где прерывания были разрешены
        (там его и так мог сменить любой поток) - если другое ядро

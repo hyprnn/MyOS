@@ -52,7 +52,29 @@ struct KTTY {
     char    logline[160];               /* строка для журнала (klog) */
     UINT32  loglen;
     char    cmd[128];                   /* первая команда шелла (ярлык) */
+
+    /* управляющие последовательности ANSI/VT100 (этап 11: программы
+       Linux - шелл с редактором строки, vi, цветной ls) */
+    UINT8   esc;                        /* 0 - текст, 1 - после ESC, 2 - CSI
+                                           "ESC [", 3 - OSC "ESC ]", 4 - "ESC (" */
+    UINT32  par[8];                     /* числа CSI */
+    UINT32  npar;
+    BOOLEAN par_q;                      /* "ESC [ ?" */
+    UINT32  fgc, bgc;                   /* цвета: 0 - обычный, 1..16 - палитра */
+    BOOLEAN bold, rev;
+    UINT32  srow, scol;                 /* сохранённый курсор (ESC 7) */
+    UINT32  rtop, rbot;                 /* область прокрутки (строки экрана);
+                                           rbot == 0 - весь экран */
+    BOOLEAN hide_cursor;
 };
+
+/* Ячейка экрана: символ Юникода (21 бит) + цвета (по 5 бит):
+   0 - цвет терминала, 1..16 - палитра VT100, 17/18 - "цвет текста"/
+   "цвет фона" терминала (нужны для инверсии) */
+#define CELL_CH(c)    ((c) & 0x1FFFFFu)
+#define CELL_FG(c)    (((c) >> 21) & 31u)
+#define CELL_BG(c)    (((c) >> 26) & 31u)
+#define CELL(ch, fg, bg)  ((ch) | ((UINT32)(fg) << 21) | ((UINT32)(bg) << 26))
 
 /* окно хранит не сам терминал (его освобождает wm_close), а ссылку */
 typedef struct {
@@ -110,6 +132,86 @@ static void tty_clear_line(UINT32 *l)
         l[i] = ' ';
 }
 
+/* Цвета ячейки по текущему режиму (жирный - яркий цвет, инверсия) */
+static UINT32 tty_attr(KTTY *t)
+{
+    UINT32 fg = t->fgc, bg = t->bgc;
+
+    if (t->bold && fg >= 1 && fg <= 8)
+        fg += 8;
+
+    if (t->rev) {
+        UINT32 f2 = bg ? bg : 18u, b2 = fg ? fg : 17u;
+        fg = f2;
+        bg = b2;
+    }
+
+    return ((fg & 31u) << 21) | ((bg & 31u) << 26);
+}
+
+/* Пустая ячейка с текущим фоном (так стирает VT100) */
+static UINT32 tty_blank(KTTY *t)
+{
+    return ' ' | (tty_attr(t) & (31u << 26));
+}
+
+static UINT32 tty_screen_rows(KTTY *t)
+{
+    UINT32 r = tty_rows(t);
+
+    if (r > TTY_LINES / 2)
+        r = TTY_LINES / 2;
+
+    return r ? r : 24;
+}
+
+/*
+ * Экран - последние rows строк буфера. Для перемещения курсора нужен
+ * "полный" экран: строк в буфере не меньше rows (добавляем пустые
+ * снизу - то, что уже видно, не сдвигается). Возвращает номер строки
+ * буфера, где верх экрана.
+ */
+static UINT32 tty_screen_top(KTTY *t)
+{
+    UINT32 rows = tty_screen_rows(t);
+
+    while (t->nlines < rows) {
+        t->nlines++;
+        tty_clear_line(tty_line(t, t->nlines - 1));
+    }
+
+    return t->nlines - rows;
+}
+
+/* Сдвинуть строки экрана [a, b] вверх на одну (b - пустая) или вниз */
+static void tty_scroll_region(KTTY *t, UINT32 a, UINT32 b, BOOLEAN up)
+{
+    UINT32 top = tty_screen_top(t);
+    UINT32 blank = tty_blank(t);
+
+    if (up) {
+        for (UINT32 r = a; r < b; r++)
+            memcpy(tty_line(t, top + r), tty_line(t, top + r + 1), sizeof(UINT32) * TTY_COLS);
+        for (UINTN i = 0; i < TTY_COLS; i++)
+            tty_line(t, top + b)[i] = blank;
+    } else {
+        for (UINT32 r = b; r > a; r--)
+            memcpy(tty_line(t, top + r), tty_line(t, top + r - 1), sizeof(UINT32) * TTY_COLS);
+        for (UINTN i = 0; i < TTY_COLS; i++)
+            tty_line(t, top + a)[i] = blank;
+    }
+}
+
+/* Область прокрутки задана и курсор на её нижней строке? */
+static BOOLEAN tty_in_region_bottom(KTTY *t)
+{
+    if (t->rbot == 0)
+        return FALSE;
+
+    UINT32 top = tty_screen_top(t);
+    return t->row >= top && t->row - top == t->rbot;
+}
+
 static void tty_newline(KTTY *t)
 {
     /* строка готова - в журнал (автотест смотрит вывод программ там) */
@@ -118,6 +220,12 @@ static void tty_newline(KTTY *t)
     t->loglen = 0;
 
     t->col = 0;
+
+    /* внизу области прокрутки (vi, less) - сдвинуть только её */
+    if (tty_in_region_bottom(t)) {
+        tty_scroll_region(t, t->rtop, t->rbot, TRUE);
+        return;
+    }
 
     if (t->row + 1 < t->nlines) {
         t->row++;
@@ -135,8 +243,358 @@ static void tty_newline(KTTY *t)
     tty_clear_line(tty_line(t, t->row));
 }
 
+static void tty_push_key(KTTY *t, INT32 k);
+
+/* 256 цветов xterm (и 24-битные) -> ближайший из 16 */
+static UINT32 tty_rgb16(UINT32 r, UINT32 g, UINT32 b)
+{
+    UINT32 mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    UINT32 c = (r > mx / 2 && r > 60 ? 1u : 0u) | (g > mx / 2 && g > 60 ? 2u : 0u) |
+               (b > mx / 2 && b > 60 ? 4u : 0u);
+
+    if (mx < 60)
+        return 1;                       /* чёрный */
+
+    return c + (mx > 200 ? 9u : 1u);
+}
+
+static UINT32 tty_xterm256(UINT32 n)
+{
+    if (n < 16)
+        return n + 1;
+
+    if (n >= 232) {
+        UINT32 v = (n - 232) * 10 + 8;
+        return (v < 64) ? 1 : (v < 128) ? 9 : (v < 200) ? 8 : 16;
+    }
+
+    n -= 16;
+    return tty_rgb16((n / 36) * 51, ((n / 6) % 6) * 51, (n % 6) * 51);
+}
+
+static void tty_sgr(KTTY *t)
+{
+    if (t->npar == 0) {
+        t->fgc = t->bgc = 0;
+        t->bold = t->rev = FALSE;
+        return;
+    }
+
+    for (UINT32 i = 0; i < t->npar; i++) {
+
+        UINT32 v = t->par[i];
+
+        if (v == 0) {
+            t->fgc = t->bgc = 0;
+            t->bold = t->rev = FALSE;
+        } else if (v == 1) {
+            t->bold = TRUE;
+        } else if (v == 22) {
+            t->bold = FALSE;
+        } else if (v == 7) {
+            t->rev = TRUE;
+        } else if (v == 27) {
+            t->rev = FALSE;
+        } else if (v >= 30 && v <= 37) {
+            t->fgc = v - 30 + 1;
+        } else if (v == 39) {
+            t->fgc = 0;
+        } else if (v >= 40 && v <= 47) {
+            t->bgc = v - 40 + 1;
+        } else if (v == 49) {
+            t->bgc = 0;
+        } else if (v >= 90 && v <= 97) {
+            t->fgc = v - 90 + 9;
+        } else if (v >= 100 && v <= 107) {
+            t->bgc = v - 100 + 9;
+        } else if ((v == 38 || v == 48) && i + 2 < t->npar && t->par[i + 1] == 5) {
+            UINT32 c = tty_xterm256(t->par[i + 2]);
+            if (v == 38) t->fgc = c; else t->bgc = c;
+            i += 2;
+        } else if ((v == 38 || v == 48) && i + 4 < t->npar && t->par[i + 1] == 2) {
+            UINT32 c = tty_rgb16(t->par[i + 2], t->par[i + 3], t->par[i + 4]);
+            if (v == 38) t->fgc = c; else t->bgc = c;
+            i += 4;
+        }
+    }
+}
+
+/* Конец последовательности CSI: выполнить команду fin */
+static void tty_csi(KTTY *t, UINT32 fin)
+{
+    UINT32 rows = tty_screen_rows(t);
+    UINT32 top = tty_screen_top(t);
+    UINT32 n = (t->npar > 0 && t->par[0] > 0) ? t->par[0] : 1;
+    UINT32 srow = (t->row >= top) ? t->row - top : 0;
+    UINT32 blank = tty_blank(t);
+
+    if (t->col >= TTY_COLS)
+        t->col = TTY_COLS - 1;
+
+    switch (fin) {
+
+    case 'A':                                   /* курсор вверх */
+        srow = (srow > n) ? srow - n : 0;
+        t->row = top + srow;
+        break;
+
+    case 'B':                                   /* вниз */
+        srow = (srow + n < rows) ? srow + n : rows - 1;
+        t->row = top + srow;
+        break;
+
+    case 'C':                                   /* вправо */
+        t->col = (t->col + n < TTY_COLS) ? t->col + n : TTY_COLS - 1;
+        break;
+
+    case 'D':                                   /* влево */
+        t->col = (t->col > n) ? t->col - n : 0;
+        break;
+
+    case 'E': case 'F':                         /* на n строк вниз/вверх, в начало */
+        srow = (fin == 'E') ? ((srow + n < rows) ? srow + n : rows - 1) : (srow > n ? srow - n : 0);
+        t->row = top + srow;
+        t->col = 0;
+        break;
+
+    case 'G': case '`':                         /* колонка */
+        t->col = (n <= TTY_COLS) ? n - 1 : TTY_COLS - 1;
+        break;
+
+    case 'd':                                   /* строка */
+        t->row = top + ((n <= rows) ? n - 1 : rows - 1);
+        break;
+
+    case 'H': case 'f': {                       /* строка;колонка (с 1) */
+        UINT32 r = (t->npar > 0 && t->par[0] > 0) ? t->par[0] : 1;
+        UINT32 c = (t->npar > 1 && t->par[1] > 0) ? t->par[1] : 1;
+        t->row = top + ((r <= rows) ? r - 1 : rows - 1);
+        t->col = (c <= TTY_COLS) ? c - 1 : TTY_COLS - 1;
+        break;
+    }
+
+    case 'J': {                                 /* стереть экран */
+        UINT32 mode = t->npar ? t->par[0] : 0;
+        for (UINT32 r = 0; r < rows; r++) {
+            UINT32 *l = tty_line(t, top + r);
+            for (UINT32 c = 0; c < TTY_COLS; c++) {
+                BOOLEAN erase = (mode >= 2) ||
+                                (mode == 0 && (r > srow || (r == srow && c >= t->col))) ||
+                                (mode == 1 && (r < srow || (r == srow && c <= t->col)));
+                if (erase)
+                    l[c] = blank;
+            }
+        }
+        break;
+    }
+
+    case 'K': {                                 /* стереть строку */
+        UINT32 mode = t->npar ? t->par[0] : 0;
+        UINT32 *l = tty_line(t, t->row);
+        for (UINT32 c = 0; c < TTY_COLS; c++)
+            if (mode == 2 || (mode == 0 && c >= t->col) || (mode == 1 && c <= t->col))
+                l[c] = blank;
+        break;
+    }
+
+    case 'X': {                                 /* стереть n символов */
+        UINT32 *l = tty_line(t, t->row);
+        for (UINT32 c = t->col; c < TTY_COLS && c < t->col + n; c++)
+            l[c] = blank;
+        break;
+    }
+
+    case 'P': {                                 /* удалить n символов */
+        UINT32 *l = tty_line(t, t->row);
+        for (UINT32 c = t->col; c < TTY_COLS; c++)
+            l[c] = (c + n < TTY_COLS) ? l[c + n] : blank;
+        break;
+    }
+
+    case '@': {                                 /* вставить n пробелов */
+        UINT32 *l = tty_line(t, t->row);
+        for (UINT32 c = TTY_COLS; c-- > t->col;)
+            l[c] = (c >= t->col + n) ? l[c - n] : blank;
+        break;
+    }
+
+    case 'L': case 'M': {                       /* вставить / удалить строки */
+        UINT32 bot = t->rbot ? t->rbot : rows - 1;
+        if (srow < (t->rbot ? t->rtop : 0) || srow > bot)
+            break;
+        for (UINT32 i = 0; i < n && i <= bot - srow; i++)
+            tty_scroll_region(t, srow, bot, fin == 'M');
+        t->col = 0;
+        break;
+    }
+
+    case 'S': case 'T': {                       /* прокрутить экран */
+        UINT32 a = t->rbot ? t->rtop : 0, b = t->rbot ? t->rbot : rows - 1;
+        for (UINT32 i = 0; i < n && i <= b - a; i++)
+            tty_scroll_region(t, a, b, fin == 'S');
+        break;
+    }
+
+    case 'r': {                                 /* область прокрутки */
+        UINT32 a = (t->npar > 0 && t->par[0] > 0) ? t->par[0] - 1 : 0;
+        UINT32 b = (t->npar > 1 && t->par[1] > 0) ? t->par[1] - 1 : rows - 1;
+        if (b >= rows)
+            b = rows - 1;
+        if (a < b && !(a == 0 && b == rows - 1)) {
+            t->rtop = a;
+            t->rbot = b;
+        } else {
+            t->rtop = t->rbot = 0;
+        }
+        t->row = top;
+        t->col = 0;
+        break;
+    }
+
+    case 'm':
+        tty_sgr(t);
+        break;
+
+    case 's':
+        t->srow = srow;
+        t->scol = t->col;
+        break;
+
+    case 'u':
+        t->row = top + ((t->srow < rows) ? t->srow : rows - 1);
+        t->col = t->scol;
+        break;
+
+    case 'h': case 'l':                         /* режимы */
+        if (t->par_q && t->npar > 0) {
+            if (t->par[0] == 25)
+                t->hide_cursor = (fin == 'l');
+            /* 1049/47/1047 - "второй экран" (vi, less): просто чистый */
+            if ((t->par[0] == 1049 || t->par[0] == 47 || t->par[0] == 1047) && fin == 'h') {
+                for (UINT32 r = 0; r < rows; r++)
+                    tty_clear_line(tty_line(t, top + r));
+                t->row = top;
+                t->col = 0;
+            }
+        }
+        break;
+
+    case 'n':                                   /* где курсор? - ответ клавишами */
+        if (t->npar > 0 && t->par[0] == 6) {
+            char rep[24];
+            ksnprintf(rep, sizeof(rep), "\x1b[%u;%uR", srow + 1, t->col + 1);
+            for (UINTN i = 0; rep[i]; i++)
+                tty_push_key(t, (UINT8)rep[i] == 0x1B ? 0x1B : (INT32)(UINT8)rep[i]);
+        }
+        break;
+    }
+}
+
+/* Байт в режиме "после ESC": начало последовательности или короткая
+   команда. TRUE - символ съеден. */
+static BOOLEAN tty_escape(KTTY *t, UINT32 c)
+{
+    if (t->esc == 0) {
+        if (c != 0x1B)
+            return FALSE;
+        t->esc = 1;
+        return TRUE;
+    }
+
+    if (t->esc == 1) {
+
+        t->esc = 0;
+
+        switch (c) {
+        case '[':
+            t->esc = 2;
+            t->npar = 0;
+            t->par[0] = 0;
+            t->par_q = FALSE;
+            break;
+        case ']':
+            t->esc = 3;
+            break;
+        case '(': case ')':
+            t->esc = 4;
+            break;
+        case '7':
+            t->srow = t->row - tty_screen_top(t);
+            t->scol = t->col;
+            break;
+        case '8':
+            t->row = tty_screen_top(t) + t->srow;
+            t->col = t->scol;
+            break;
+        case 'M': {                             /* вверх, у верха - прокрутка вниз */
+            UINT32 top = tty_screen_top(t);
+            UINT32 a = t->rbot ? t->rtop : 0;
+            if (t->row - top <= a)
+                tty_scroll_region(t, a, t->rbot ? t->rbot : tty_screen_rows(t) - 1, FALSE);
+            else
+                t->row--;
+            break;
+        }
+        case 'D':
+            tty_newline(t);
+            break;
+        case 'c':                               /* сброс */
+            t->fgc = t->bgc = 0;
+            t->bold = t->rev = FALSE;
+            t->rtop = t->rbot = 0;
+            break;
+        }
+
+        return TRUE;
+    }
+
+    if (t->esc == 2) {
+
+        if (c >= '0' && c <= '9') {
+            if (t->npar == 0)
+                t->npar = 1;
+            t->par[t->npar - 1] = t->par[t->npar - 1] * 10u + (c - '0');
+            return TRUE;
+        }
+
+        if (c == ';') {
+            if (t->npar == 0)
+                t->npar = 1;
+            if (t->npar < 8)
+                t->par[t->npar++] = 0;
+            return TRUE;
+        }
+
+        if (c == '?' || c == '>' || c == '=') {
+            t->par_q = TRUE;
+            return TRUE;
+        }
+
+        t->esc = 0;
+
+        if (c >= 0x40 && c <= 0x7E)
+            tty_csi(t, c);
+
+        return TRUE;
+    }
+
+    if (t->esc == 3) {                          /* OSC: до BEL или ESC \ */
+        if (c == 7)
+            t->esc = 0;
+        else if (c == 0x1B)
+            t->esc = 1;
+        return TRUE;
+    }
+
+    t->esc = 0;                                 /* "ESC ( B" - набор символов */
+    return TRUE;
+}
+
 void tty_putc(KTTY *t, UINT32 c)
 {
+    if (tty_escape(t, c))
+        return;
+
     if (c == '\r') {
         t->col = 0;
         return;
@@ -160,13 +618,13 @@ void tty_putc(KTTY *t, UINT32 c)
         return;
     }
 
-    if (c < 32)
+    if (c == 7 || c < 32)
         return;
 
     if (t->col >= TTY_COLS)
         tty_newline(t);
 
-    tty_line(t, t->row)[t->col++] = c;
+    tty_line(t, t->row)[t->col++] = CELL(c & 0x1FFFFFu, 0, 0) | tty_attr(t);
 
     /* в журнал - как есть (UTF-8) */
     if (t->loglen + 4 < sizeof(t->logline))
@@ -266,6 +724,22 @@ static void tty_push_key(KTTY *t, INT32 k)
     t->ktail = next;
 
     sched_wake_all(t);
+    lx_poll_wake();         /* программа Linux могла ждать в poll (этап 11) */
+}
+
+/* Есть ли клавиша в очереди (poll программы Linux), не забирая её */
+BOOLEAN tty_key_ready(KTTY *t)
+{
+    return t->khead != t->ktail;
+}
+
+/* Сколько строк текста видно в окне (ioctl TIOCGWINSZ) */
+UINT32 tty_rows(KTTY *t)
+{
+    if (t->win == NULL || t->win->ch < 8 + FONT_H)
+        return 25;
+
+    return (UINT32)((t->win->ch - 8) / FONT_H);
 }
 
 /*
@@ -357,6 +831,24 @@ INTN tty_read_line(KTTY *t, struct KPROC *p, char *dst, UINTN n)
 
 /* ---------------- окно ---------------- */
 
+/* Цвет ячейки: палитра VT100 (как у xterm) */
+static UINT32 tty_color(UINT32 c, BOOLEAN fg)
+{
+    static const UINT32 pal[16] = {
+        0x000000, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xE5E5E5,
+        0x666666, 0xF14C4C, 0x23D18B, 0xF5F543, 0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF,
+    };
+
+    if (c >= 1 && c <= 16)
+        return pal[c - 1];
+    if (c == 17)
+        return TTY_FG;
+    if (c == 18)
+        return TTY_BG;
+
+    return fg ? TTY_FG : TTY_BG;
+}
+
 static void tty_paint(WIN *w, GFX *g)
 {
     KTTY *t = ((TTY_WIN *)w->state)->t;
@@ -378,26 +870,45 @@ static void tty_paint(WIN *w, GFX *g)
     UINT32 bottom = last - t->scroll;
     UINT32 top = (bottom + 1 > vis) ? bottom + 1 - vis : 0;
 
-    char buf[TTY_COLS * 3 + 1];
+    char buf[TTY_COLS * 4 + 1];
     INT32 y = 4;
 
     for (UINT32 r = top; r <= bottom; r++) {
 
         UINT32 *l = tty_line(t, r);
-        UINTN k = 0;
         UINTN used = TTY_COLS;
 
         while (used > 0 && l[used - 1] == ' ')
             used--;
 
-        for (UINTN i = 0; i < used; i++)
-            k += utf8_put(l[i], &buf[k]);
+        /* кусками одного цвета: фон - прямоугольником, потом текст */
+        UINTN i = 0;
 
-        buf[k] = '\0';
-        gfx_text(g, 4, y, buf, TTY_FG);
+        while (i < used) {
 
-        if (r == t->row && t->scroll == 0)
-            gfx_fill(g, 4 + (INT32)t->col * FONT_W, y + FONT_H - 3, FONT_W, 3, TTY_CURSOR);
+            UINT32 fg = CELL_FG(l[i]), bg = CELL_BG(l[i]);
+            UINTN j = i, k = 0;
+
+            while (j < used && CELL_FG(l[j]) == fg && CELL_BG(l[j]) == bg) {
+                k += utf8_put(CELL_CH(l[j]), &buf[k]);
+                j++;
+            }
+
+            buf[k] = '\0';
+
+            INT32 x = 4 + (INT32)i * FONT_W;
+
+            if (bg != 0)
+                gfx_fill(g, x, y, (INT32)(j - i) * FONT_W, FONT_H, tty_color(bg, FALSE));
+
+            gfx_text(g, x, y, buf, tty_color(fg, TRUE));
+            i = j;
+        }
+
+        if (r == t->row && t->scroll == 0 && !t->hide_cursor) {
+            UINT32 cc = (t->col < TTY_COLS) ? t->col : TTY_COLS - 1;
+            gfx_fill(g, 4 + (INT32)cc * FONT_W, y + FONT_H - 3, FONT_W, 3, TTY_CURSOR);
+        }
 
         y += FONT_H;
     }
@@ -433,7 +944,13 @@ static void tty_event(WIN *w, struct myos_event *e)
        клавиши сам) - просто клавиша 3 */
     if (e->key == 3) {
         KPROC *f = t->fg;
-        if (f != NULL && !f->raw_keys && !f->exited) {
+        /* программа Linux: SIGINT (если она сама не читает Ctrl+C) */
+        if (f != NULL && f->is_linux && !f->exited) {
+            if (lx_term_isig(f)) {
+                lx_ctrl_c(f);
+                return;
+            }
+        } else if (f != NULL && !f->raw_keys && !f->exited) {
             ksnprintf(f->why, sizeof(f->why), "stopped with Ctrl+C");
             proc_kill(f);
             return;

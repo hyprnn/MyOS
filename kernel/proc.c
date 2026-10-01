@@ -37,15 +37,6 @@ KPROC *volatile g_fg_proc = NULL;        /* программа "на перед�
 static UINT32 g_next_pid = 1;
 const char *g_proc_last_error = "";     /* почему не запустилась (для шелла) */
 
-/* биты записи таблицы страниц (как в vmm.c) */
-#define UPTE_P     (1ull << 0)
-#define UPTE_W     (1ull << 1)
-#define UPTE_U     (1ull << 2)
-#define UPTE_PS    (1ull << 7)
-#define UPTE_NX    (1ull << 63)
-#define UPTE_SHARED (1ull << 9)     /* страница чужая (буфер окна) - не освобождать */
-#define UPTE_ADDR  0x000FFFFFFFFFF000ull
-
 #define MAX_ELF_SIZE   (32u * 1024u * 1024u)   /* браузер со шрифтами - ~7 МБ */
 
 
@@ -79,7 +70,7 @@ static void uvm_sync_kernel_half(UINT64 pml4)
  * создать недостающие таблицы (с битом U: иначе процессор не пустит
  * программу ниже, даже если у самой страницы U есть).
  */
-static UINT64 *uvm_pte(UINT64 pml4, UINT64 va, BOOLEAN create)
+UINT64 *uvm_pte(UINT64 pml4, UINT64 va, BOOLEAN create)
 {
     UINT64 *t = (UINT64 *)P2V(pml4);
 
@@ -227,6 +218,11 @@ BOOLEAN uptr_ok(KPROC *p, UINT64 addr, UINT64 len, BOOLEAN write)
     if (p == NULL)
         return FALSE;
 
+    /* программа с областями памяти (Linux, этап 11): страницы ещё
+       может не быть - дать её сейчас (umem.c) */
+    if (p->vmas != NULL)
+        return uvm_prefault(p, addr, len, write);
+
     if (len == 0)
         return TRUE;
 
@@ -254,7 +250,7 @@ BOOLEAN uptr_ok(KPROC *p, UINT64 addr, UINT64 len, BOOLEAN write)
 }
 
 /* Освободить всю нижнюю половину и саму PML4 */
-static void uvm_free(UINT64 pml4)
+void uvm_free(UINT64 pml4)
 {
     UINT64 *l4 = (UINT64 *)P2V(pml4);
 
@@ -279,9 +275,11 @@ static void uvm_free(UINT64 pml4)
 
                 UINT64 *l1 = (UINT64 *)P2V(l2[k] & UPTE_ADDR);
 
+                /* страница могла достаться и другим процессам (fork,
+                   этап 11) - отдаём свою долю, а освободит последний */
                 for (UINTN m = 0; m < 512; m++)
                     if ((l1[m] & UPTE_P) && !(l1[m] & UPTE_SHARED))
-                        pmm_free_pages(l1[m] & UPTE_ADDR, 1);
+                        pmm_page_unref(l1[m] & UPTE_ADDR);
 
                 pmm_free_pages(l2[k] & UPTE_ADDR, 1);
             }
@@ -324,6 +322,13 @@ void proc_switch_hook(KTHREAD *next)
 
     if (want != 0 && (read_cr3() & UPTE_ADDR) != want)
         __asm__ __volatile__("mov %0, %%cr3" : : "r"(want) : "memory");
+
+    /* регистр FS программы (данные потока glibc/musl, этап 11): у
+       каждого потока свой; ядро FS не пользуется */
+    if (next->proc != NULL && c->fs_base != next->fs_base) {
+        kx_wrmsr(0xC0000100u, next->fs_base);
+        c->fs_base = next->fs_base;
+    }
 }
 
 
@@ -637,6 +642,10 @@ void proc_reap(KPROC *p)
         uvm_free(p->pml4);
 
     p->pml4 = 0;
+
+    /* области памяти и остальное от Linux (этап 11) */
+    uvm_free_vmas(p);
+    linux_proc_free(p);
     p->used = FALSE;
 }
 
@@ -650,6 +659,56 @@ KPROC *proc_spawn(const char *path, const char *args, UINT32 io, INTN *err)
     return proc_spawn_ex(path, args, io, NULL, NULL, -1, NULL, err);
 }
 
+/*
+ * Жив ли процесс: есть ли у него хоть один живой поток. У программ
+ * MyOS поток один, у программ Linux - сколько угодно (этап 11), и
+ * главный может закончиться раньше других.
+ */
+BOOLEAN proc_alive(KPROC *p)
+{
+    for (UINTN i = 0; i < KT_MAX; i++) {
+        KTHREAD *t = &g_kthreads[i];
+        if (t->proc == p && t->state != KT_DEAD && t->state != KT_UNUSED)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+/* Сколько живых потоков у процесса, кроме me */
+static UINTN proc_other_threads(KPROC *p, KTHREAD *me)
+{
+    UINTN n = 0;
+
+    for (UINTN i = 0; i < KT_MAX; i++) {
+        KTHREAD *t = &g_kthreads[i];
+        if (t != me && t->proc == p && t->state != KT_DEAD && t->state != KT_UNUSED)
+            n++;
+    }
+
+    return n;
+}
+
+/* Номер нового процесса (и потока Linux - у них общий счёт, как в Linux) */
+UINT32 proc_next_pid(void)
+{
+    UINT64 fl = kx_irq_save();
+    UINT32 n = g_next_pid++;
+    kx_irq_restore(fl);
+    return n;
+}
+
+/* Таблица страниц нового процесса: нижняя половина пустая, верхняя - ядро */
+UINT64 proc_new_pml4(void)
+{
+    UINT64 pml4 = pmm_alloc_zeroed(1, 0);
+
+    if (pml4 != 0)
+        uvm_sync_kernel_half(pml4);
+
+    return pml4;
+}
+
 /* Убрать завершившиеся программы, которых никто не ждёт (их родитель
    - шелл - уже закрылся). Сама себя программа убрать не может: она
    до последнего стоит на своих таблицах страниц. */
@@ -657,9 +716,43 @@ static void proc_sweep_orphans(void)
 {
     for (UINTN i = 0; i < PROC_MAX; i++) {
         KPROC *q = &g_procs[i];
-        if (q->used && q->autoreap && q->exited && !kthread_alive(q->thread, q->tid))
+        if (q->used && q->autoreap && q->exited && !proc_alive(q))
             proc_reap(q);
     }
+}
+
+/* Свободный слот процесса (с номером и пустыми файлами); NULL - нет */
+KPROC *proc_alloc_slot(void)
+{
+    proc_sweep_orphans();
+
+    UINT64 fl = kx_irq_save();
+    KPROC *p = NULL;
+
+    for (UINTN i = 0; i < PROC_MAX; i++)
+        if (!g_procs[i].used) {
+            p = &g_procs[i];
+            break;
+        }
+
+    if (p != NULL) {
+        raw_zero_mem((volatile UINT8 *)p, sizeof(*p));
+        p->used = TRUE;
+        p->pid = g_next_pid++;
+    }
+
+    kx_irq_restore(fl);
+
+    if (p == NULL)
+        return NULL;
+
+    for (UINTN i = 0; i < PROC_FDS; i++)
+        p->fds[i] = -1;
+
+    p->out_kfd = -1;
+    p->started_ms = g_kticks;
+
+    return p;
 }
 
 /*
@@ -713,22 +806,7 @@ KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *
     }
 
     /* слот */
-    UINT64 fl = kx_irq_save();
-    KPROC *p = NULL;
-
-    for (UINTN i = 0; i < PROC_MAX; i++)
-        if (!g_procs[i].used) {
-            p = &g_procs[i];
-            break;
-        }
-
-    if (p != NULL) {
-        raw_zero_mem((volatile UINT8 *)p, sizeof(*p));
-        p->used = TRUE;
-        p->pid = g_next_pid++;
-    }
-
-    kx_irq_restore(fl);
+    KPROC *p = proc_alloc_slot();
 
     if (p == NULL) {
         kfree(img);
@@ -736,9 +814,6 @@ KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *
         if (out_kfd >= 0) vfs_close(out_kfd);
         return NULL;
     }
-
-    for (UINTN i = 0; i < PROC_FDS; i++)
-        p->fds[i] = -1;
 
     /* с этого места файл вывода - у программы: его закроет proc_reap */
     p->out_kfd = out_kfd;
@@ -757,14 +832,20 @@ KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *
     p->started_ms = g_kticks;
 
     /* своя PML4: нижняя половина пустая, верхняя - ядро */
-    p->pml4 = pmm_alloc_zeroed(1, 0);
+    p->pml4 = proc_new_pml4();
 
     const char *why = "out of memory";
+    BOOLEAN is_linux = linux_elf_is_linux(img, got);
 
     if (p->pml4 == 0) {
         r = VFS_ENOSPC;
+    } else if (is_linux) {
+        /* программа Linux (этап 11): свой загрузчик - память по
+           требованию, стек с auxv, файлы и сигналы Linux */
+        kfree(img);
+        img = NULL;
+        r = linux_proc_start(p, path, args, &why);
     } else {
-        uvm_sync_kernel_half(p->pml4);
         r = proc_load_elf(p, img, got, &why);
         if (r == VFS_OK && !proc_setup_stack(p, args)) {
             r = VFS_ENOSPC;
@@ -793,6 +874,14 @@ KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *
 
     p->tid = p->thread->tid;
 
+    /* поток уже "принадлежит" процессу (proc_alive) - до того, как он
+       впервые получит процессор: родитель мог бы сразу спросить, жив
+       ли потомок. Он не начнёт работать, пока мы держим большой замок. */
+    p->thread->proc = p;
+    p->thread->cr3 = p->pml4;
+    if (p->is_linux)
+        p->thread->lx_tid = p->pid;
+
     klog("proc: started pid %u '%s' (%s), %llu KiB of memory\n",
          p->pid, p->name, path, p->pages * 4u);
 
@@ -805,12 +894,10 @@ KPROC *proc_spawn_ex(const char *path, const char *args, UINT32 io, const char *
  */
 INT64 proc_wait(KPROC *p)
 {
-    KTHREAD *t = p->thread;
-    UINT32 tid = p->tid;
     UINT64 fl = kx_irq_save();
 
-    while (kthread_alive(t, tid))
-        sched_block(t, "program", 0);
+    while (proc_alive(p))
+        sched_block(p, "program", 200);
 
     kx_irq_restore(fl);
 
@@ -828,6 +915,19 @@ void proc_exit_current(INT64 code)
     KPROC *p = g_kcur->proc;
 
     if (p != NULL) {
+
+        /* поток программы Linux: CLONE_CHILD_CLEARTID и т.п. */
+        if (p->is_linux)
+            linux_thread_gone(g_kcur);
+
+        /* exit_group или смертельный сигнал уже решили код выхода */
+        if (p->group_exit)
+            code = p->exit_code;
+
+        /* у процесса остаются другие потоки (этап 11) - уходит только
+           этот; процесс закончит последний */
+        if (proc_other_threads(p, g_kcur) > 0)
+            kthread_exit();
 
         /* остаток вывода графической программы - в журнал */
         if (p->io == PROC_IO_GUI && p->outlen > 0) {
@@ -855,6 +955,11 @@ void proc_exit_current(INT64 code)
             }
 
         win_proc_cleanup(p);
+
+        /* Linux: код для wait4, отпустить родителя после vfork,
+           сигнал SIGCHLD родителю */
+        if (p->is_linux)
+            linux_proc_exited(p, code);
 
         klog("proc: pid %u '%s' exited with code %lld%s%s\n", p->pid, p->name, code,
              p->why[0] ? " - " : "", p->why);
@@ -933,6 +1038,12 @@ void proc_forget_volume(const char *name)
 void proc_ctrl_c(void)
 {
     KPROC *p = g_fg_proc;
+
+    /* программа Linux: сигнал SIGINT её группе (этап 11, lxsig.c) */
+    if (p != NULL && p->is_linux) {
+        lx_ctrl_c(p);
+        return;
+    }
 
     /* на переднем плане - шелл-программа, читающая клавиши сама:
        Ctrl+C ей - клавиша (сотрёт набранную строку), а не "стоп" */
@@ -1150,6 +1261,7 @@ void proc_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
     }
 
     binfs_mount();
+    tmpfs_mount();          /* /tmp - файлы в памяти (этап 11) */
 
     print(out, "  Programs run in ring 3 with their own memory; system calls via 'syscall'.\n");
     print(out, "  /bin - built-in programs (ls /bin); a program file can also live on a disk.\n");

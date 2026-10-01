@@ -566,6 +566,7 @@ typedef struct __attribute__((packed)) {
 typedef void (*KX_IRQ_HANDLER)(void);
 #define KX_VEC_RESCHED   0xF0u    /* IPI: "на тебя есть работа" (SMP) */
 #define KX_VEC_HALT      0xF1u    /* IPI: "остановись" (паника на другом ядре) */
+#define KX_VEC_TLB       0xF2u    /* IPI: "сбрось TLB" (память программы изменилась) */
 #define KX_VEC_SPURIOUS  0xFFu
 
 extern void kx_isr_stubs(void) __attribute__((visibility("hidden")));
@@ -642,7 +643,7 @@ typedef struct {
 
 /* Сколько потоков может существовать одновременно. Таблица
    маленькая и обходится целиком - так проще и нагляднее списков. */
-#define KT_MAX          64
+#define KT_MAX          256     /* этап 11: у программ Linux много потоков */
 #define KT_NAME_LEN     16
 /* Квант времени: столько миллисекунд (тиков таймера) поток
    работает подряд, если другие тоже хотят процессор */
@@ -714,6 +715,23 @@ typedef struct KTHREAD {
     BOOLEAN     is_idle;         /* поток простоя какого-то ядра: его
                                     не берёт никто, кроме своего ядра */
     UINT32      cpu;             /* на каком ядре работал последним */
+
+    /* этап 11: поток программы Linux (kernel/linux*.c) */
+    UINT64      fs_base;         /* регистр FS: у glibc/musl там данные
+                                    потока (TLS) - у каждого потока свой */
+    UINT32      lx_tid;          /* номер потока для программы (gettid;
+                                    у главного = pid процесса) */
+    UINT64      sig_mask;        /* заблокированные сигналы (бит n-1 - сигнал n) */
+    UINT64      sig_pending;     /* пришедшие этому потоку */
+    UINT64      clear_tid;       /* set_tid_address: при выходе - 0 сюда и
+                                    futex wake (так pthread_join ждёт поток) */
+    UINT64      alt_sp, alt_size;   /* sigaltstack */
+    UINT32      alt_flags;
+    BOOLEAN     sig_restore_mask;   /* rt_sigsuspend/ppoll: после сигнала
+                                       вернуть маску из sig_saved */
+    UINT64      sig_saved;
+    BOOLEAN     lx_die;          /* execve в другом потоке: этому - завершиться */
+    UINT64      fault_addr;      /* адрес ошибки для siginfo (SIGSEGV) */
 } KTHREAD;
 
 /* Замок-"мьютекс": пока его держит один поток, другой, пришедший
@@ -802,7 +820,7 @@ typedef struct BLKDEV {
 #define VFS_MAX_MOUNTS   12
 #define VFS_PATH_MAX     256
 #define VFS_NAME_MAX     128
-#define VFS_MAX_FD       64
+#define VFS_MAX_FD       256
 
 /* Коды ошибок (отрицательные) */
 #define VFS_OK            0
@@ -876,6 +894,9 @@ typedef struct {
     INTN (*statfs)(struct VFS_MOUNT *m, UINT64 *total_bytes, UINT64 *free_bytes);
     /* файл закрыт (может быть NULL): дописать отложенное на диск */
     INTN (*close)(struct VFS_MOUNT *m, VFS_NODE *f);
+    /* файл открыт (может быть NULL): tmpfs считает открытия, чтобы
+       удалённый, но открытый файл дожил до последнего close */
+    INTN (*open)(struct VFS_MOUNT *m, VFS_NODE *f);
 } VFS_OPS;
 
 /* Том FAT (fs/fat.c) */
@@ -919,7 +940,7 @@ typedef struct VFS_MOUNT {
 
 #include "sysnum.h"
 
-#define PROC_MAX        24
+#define PROC_MAX        64
 #define PROC_FDS        32
 #define PROC_IN_MAX     256
 #define MAX_HEAP_BYTES  (512ull * 1024u * 1024u)  /* куча программы - не больше
@@ -975,7 +996,45 @@ typedef struct KPROC {
     BOOLEAN          kcmd_kernel;         /* MYOS_KCMD_KERNEL: не отдавать команду
                                              программе из /bin (см. kcmd_is_program) */
     KTTY            *tty;                 /* PROC_IO_TTY: окно-терминал */
+
+    /* этап 11: программы Linux (kernel/linux*.c, kernel/umem.c) */
+    BOOLEAN          is_linux;              /* говорит на языке ядра Linux:
+                                             его номера вызовов, auxv, errno */
+    struct UVMA     *vmas;                /* области памяти (mmap, куча, стек);
+                                             страницы в них - по первому касанию */
+    UINT64           mmap_top;            /* новые mmap ищутся ниже этого адреса */
+    struct LXPROC   *lx;                  /* остальное от Linux: файлы, сигналы... */
+    BOOLEAN          group_exit;          /* exit_group/смертельный сигнал: код
+                                             выхода уже решён (exit_code) */
 } KPROC;
+
+/* Область памяти программы (этап 11): [start, end), границы кратны
+   4 КиБ. Страницы внутри появляются при первом касании (Page Fault ->
+   uvm_fault), а не сразу - программы Linux просят "на всякий случай"
+   гигабайты, а трогают малую часть. */
+#define UVM_R        0x1u        /* права: чтение */
+#define UVM_W        0x2u        /*        запись */
+#define UVM_X        0x4u        /*        исполнение */
+#define UVM_SHARED   0x10u       /* общая (MAP_SHARED): после fork - та же память */
+#define UVM_STACK    0x20u       /* стек главного потока */
+#define UVM_HEAP     0x40u       /* куча (brk) */
+
+/* Биты записи таблицы страниц программы (proc.c, umem.c) */
+#define UPTE_P      (1ull << 0)
+#define UPTE_W      (1ull << 1)
+#define UPTE_U      (1ull << 2)
+#define UPTE_PS     (1ull << 7)
+#define UPTE_SHARED (1ull << 9)     /* страница чужая (буфер окна) - не освобождать */
+#define UPTE_COW    (1ull << 10)    /* общая после fork: перед записью - копия */
+#define UPTE_NX     (1ull << 63)
+#define UPTE_ADDR   0x000FFFFFFFFFF000ull
+
+typedef struct UVMA {
+    struct UVMA *next;           /* список по возрастанию адресов */
+    UINT64       start, end;
+    UINT32       prot;           /* UVM_R/W/X */
+    UINT32       flags;          /* UVM_SHARED/STACK/HEAP */
+} UVMA;
 
 /* TSS (64-битный), см. kernel/cpu.c */
 typedef struct __attribute__((packed)) {
@@ -1104,6 +1163,9 @@ typedef struct KX_CPU {
     UINT64   slice_start;        /* rdtsc начала работы kcur */
     volatile UINT64 idle_tsc;    /* сколько тактов ядро проспало в hlt */
     UINT64   tlb_gen;            /* какую версию отображений ядра видит TLB */
+    UINT64   fs_base;            /* что сейчас в MSR FS base этого ядра */
+    volatile UINT32 tlb_req;     /* другое ядро просит сбросить TLB (память
+                                    программы изменилась, umem.c) */
     UINT64   ticks;              /* тиков таймера этого ядра */
     KX_TSS  *tss_ptr;            /* TSS этого ядра (у cpu0 - g_ktss) */
 
@@ -2264,6 +2326,7 @@ BOOLEAN sched_can_block(void);
 void sched_sleep_ms(UINT64 ms);
 BOOLEAN sched_block(const void *obj, const char *what, UINT64 timeout_ms);
 UINTN sched_wake_all(const void *obj);
+void sched_wake_thread(KTHREAD *t);
 BOOLEAN sched_wake_one(const void *obj);
 void sched_account_load(void);
 void kmutex_lock(KMUTEX *m);
@@ -2297,6 +2360,8 @@ INTN tty_read_line(KTTY *t, KPROC *p, char *dst, UINTN n);
 SIMPLE_TEXT_OUTPUT_INTERFACE *tty_output(KTTY *t);
 void tty_set_fg(KTTY *t, KPROC *p);
 KPROC *tty_get_fg(KTTY *t);
+BOOLEAN tty_key_ready(KTTY *t);
+UINT32 tty_rows(KTTY *t);
 void kernel_shell_main(void) __attribute__((noreturn));
 INT64 proc_wait(KPROC *p);
 void proc_reap(KPROC *p);
@@ -2313,11 +2378,136 @@ void kernel_cmd_run(EFI_SYSTEM_TABLE *st, const char *path, const char *args, BO
 BOOLEAN proc_shell_try(EFI_SYSTEM_TABLE *st, const CHAR16 *line);
 BOOLEAN uptr_ok(KPROC *p, UINT64 addr, UINT64 len, BOOLEAN write);
 BOOLEAN proc_map_heap_page(KPROC *p, UINT64 va);
+UINT64 *uvm_pte(UINT64 pml4, UINT64 va, BOOLEAN create);
+void uvm_free(UINT64 pml4);
+
+/* --- kernel/umem.c (этап 11): память программ по требованию --- */
+UVMA *uvm_find(KPROC *p, UINT64 va);
+BOOLEAN uvm_add(KPROC *p, UINT64 start, UINT64 end, UINT32 prot, UINT32 flags);
+void uvm_unmap(KPROC *p, UINT64 start, UINT64 end);
+INTN uvm_protect(KPROC *p, UINT64 start, UINT64 end, UINT32 prot);
+UINT64 uvm_find_free(KPROC *p, UINT64 len, UINT64 hint);
+BOOLEAN uvm_fault(KPROC *p, UINT64 va, BOOLEAN write);
+BOOLEAN uvm_fault_err(KPROC *p, UINT64 va, UINT64 err);
+BOOLEAN uvm_prefault(KPROC *p, UINT64 addr, UINT64 len, BOOLEAN write);
+BOOLEAN uvm_fork(KPROC *parent, KPROC *child);
+void uvm_free_vmas(KPROC *p);
+void uvm_tlb_shootdown(KPROC *p);
+void uvm_tlb_ipi(void);
+BOOLEAN uvm_copy_out(KPROC *p, UINT64 va, const void *src, UINT64 n);
+UINT64 uvm_pages_in(KPROC *p);
 extern const char *g_proc_last_error;
+
+/* ================================================================
+ * Программы Linux (этап 11): kernel/linux.c, kernel/lxfile.c,
+ * kernel/lxsig.c. Подробно - в начале kernel/linux.c.
+ * ================================================================ */
+
+#define LX_FDS       1024        /* открытых файлов у процесса Linux */
+#define LX_NSIG      64          /* сигналы 1..64 */
+
+/* Открытый файл программы Linux ("описание открытого файла"): после
+   dup и fork на него смотрят несколько номеров - счётчик refs */
+enum {
+    LF_TTY = 1,     /* терминал процесса (консоль или окно) */
+    LF_VFS,         /* обычный файл VFS (kfd) */
+    LF_DIR,         /* папка: путь + номер следующей записи */
+    LF_NULL,        /* /dev/null */
+    LF_ZERO,        /* /dev/zero */
+    LF_RANDOM,      /* /dev/urandom, /dev/random */
+    LF_PIPE_R,      /* канал: читающий конец */
+    LF_PIPE_W,      /*        пишущий конец */
+    LF_MEM,         /* файл в памяти (/proc/...): текст, только чтение */
+    LF_EVENTFD,     /* eventfd: счётчик */
+};
+
+struct LPIPE;
+
+typedef struct LFILE {
+    UINT32         refs;
+    UINT32         type;          /* LF_* */
+    UINT32         flags;         /* O_ACCMODE, O_APPEND, O_NONBLOCK (как в Linux) */
+    INTN           kfd;           /* LF_VFS: номер файла VFS */
+    struct LPIPE  *pipe;          /* LF_PIPE_*: канал */
+    UINT64         pos;           /* LF_DIR: номер записи; LF_MEM: смещение */
+    char          *mem;           /* LF_MEM: содержимое */
+    UINT64         memlen;
+    UINT64         count;         /* LF_EVENTFD: значение счётчика */
+    char           path[VFS_PATH_MAX];   /* путь (для fstat, fchdir, /proc/self/fd) */
+} LFILE;
+
+/* Обработчик сигнала (как struct sigaction ядра Linux) */
+typedef struct {
+    UINT64 handler;               /* 0 - по умолчанию, 1 - игнорировать, иначе адрес */
+    UINT64 flags;                 /* SA_* */
+    UINT64 restorer;              /* SA_RESTORER: откуда вернуться (rt_sigreturn) */
+    UINT64 mask;                  /* что ещё заблокировать на время обработчика */
+} LSIGACT;
+
+typedef struct LXPROC {
+    LFILE         *fd[LX_FDS];
+    UINT8          cloexec[LX_FDS];   /* FD_CLOEXEC: закрыть при execve */
+    LSIGACT        act[LX_NSIG + 1];
+    UINT64         sig_pending;       /* сигналы процессу (любому потоку) */
+    UINT32         umask;
+    UINT32         pgid, sid;
+    INT32          wstatus;           /* код для wait4 (как в Linux) */
+    INT32          exit_signal;       /* сигнал родителю при выходе (SIGCHLD) */
+    BOOLEAN        vfork_wait;        /* родитель ждёт execve/exit потомка */
+    BOOLEAN        stopped_by_signal;
+    char           exe[VFS_PATH_MAX]; /* /proc/self/exe */
+    UINT64         itimer_real_at;    /* alarm/setitimer: когда SIGALRM (мс) */
+    UINT64         itimer_real_iv;    /* ...и период (мс) */
+} LXPROC;
+
+/* Регистры программы целиком - для входа в неё через iretq
+   (новый поток, fork, execve, обработчик сигнала, rt_sigreturn) */
+typedef struct {
+    UINT64 r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8;
+    UINT64 rax, rcx, rdx, rsi, rdi;
+    UINT64 rip, cs, rflags, rsp, ss;
+} LX_REGS;
+
+/* --- kernel/linux.c --- */
+BOOLEAN linux_elf_is_linux(const UINT8 *img, UINTN size);
+INTN linux_proc_start(KPROC *p, const char *path, const char *args, const char **why);
+void linux_proc_free(KPROC *p);
+INT64 linux_syscall(KPROC *p, UINT64 *f);
+void linux_isr_return(KX_ISR_FRAME *f);
+void linux_thread_gone(KTHREAD *t);
+void linux_proc_exited(KPROC *p, INT64 code);
+void kx_lx_iret(LX_REGS *r, const void *fx) __attribute__((noreturn));
+INT64 linux_errno(INT64 myos_err);
+BOOLEAN proc_alive(KPROC *p);
+KPROC *proc_alloc_slot(void);
+UINT64 proc_new_pml4(void);
+UINT32 proc_next_pid(void);
+void proc_out(KPROC *p, const char *s, UINTN n);
+INTN proc_read_console(KPROC *p, char *dst, UINTN n);
+
+/* --- kernel/lxfile.c --- */
+void lx_files_init(KPROC *p);
+BOOLEAN lx_files_fork(KPROC *parent, KPROC *child);
+void lx_files_exec(KPROC *p);
+void lx_files_free(KPROC *p);
+void lfile_unref(LFILE *f);
+INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled);
+INTN lx_resolve_path(KPROC *p, INT64 dirfd, UINT64 upath, char *out, UINTN cap);
+INTN lx_lookup_exec(KPROC *p, const char *path, char *real, UINTN cap);
+void lx_poll_wake(void);
+INTN lx_file_read_kernel(LFILE *f, void *buf, UINTN n, UINT64 off);
+void proc_out_tty(KPROC *p, const char *s, UINTN n);
+BOOLEAN lx_term_isig(KPROC *p);
+void lx_ctrl_c(KPROC *p);
+void lx_signal_fault(KPROC *p, UINT32 sig, UINT64 addr);
+LFILE *lx_fd_get(KPROC *p, INT64 fd);
 
 /* --- fs/binfs.c --- */
 extern const VFS_OPS g_bin_ops;
 void binfs_mount(void);
+
+/* --- fs/tmpfs.c --- */
+void tmpfs_mount(void);
 
 /* --- drivers/blk.c --- */
 extern BLKDEV g_blk[BLK_MAX];
@@ -2374,6 +2564,7 @@ INTN vfs_open(const char *path, UINT32 flags);
 INTN vfs_read(INTN fd, VOID *buf, UINTN n);
 INTN vfs_write(INTN fd, const VOID *buf, UINTN n);
 INTN vfs_close(INTN fd);
+INTN vfs_ftruncate(INTN fd, UINT64 size);
 INTN vfs_size(INTN fd, UINT64 *size);
 INTN vfs_seek(INTN fd, INT64 off, UINT32 whence, UINT64 *newpos);
 INTN vfs_mkdir(const char *path);
@@ -2407,6 +2598,9 @@ UINT64 pmm_alloc_pages(UINT64 count, UINT64 limit);
 void pmm_free_pages(UINT64 phys, UINT64 count);
 UINT64 pmm_alloc_zeroed(UINT64 count, UINT64 limit);
 UINT64 pmm_alloc_low_page(void);
+void pmm_page_ref(UINT64 phys);
+void pmm_page_unref(UINT64 phys);
+UINT32 pmm_page_refs(UINT64 phys);
 const char *kmm_type_name(UINT32 t);
 BOOLEAN pmm_free_type(UINT32 t);
 UINT64 pmm_release_loader_temp(void);

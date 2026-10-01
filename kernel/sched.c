@@ -617,6 +617,28 @@ UINTN sched_wake_all(const void *obj)
     return n;
 }
 
+/*
+ * Разбудить конкретный поток, что бы он ни ждал (спит или ждёт
+ * события): ему пришёл сигнал (этап 11, программы Linux) или его
+ * процесс завершают. Он вернётся из sched_block/sched_sleep_ms раньше
+ * срока и сам проверит, что случилось.
+ */
+void sched_wake_thread(KTHREAD *t)
+{
+    UINT64 fl = kx_irq_save();
+
+    if (t->state == KT_BLOCKED || t->state == KT_SLEEPING) {
+        t->wait_on = NULL;
+        t->timed_out = FALSE;
+        kt_make_ready(t, TRUE);
+        if (g_kx_isr_depth > 0 || g_kcur == g_kidle)
+            kx_cpu()->need_resched = TRUE;
+        sched_kick_idle();
+    }
+
+    kx_irq_restore(fl);
+}
+
 /* Разбудить одного (первого по таблице) - для мьютекса */
 BOOLEAN sched_wake_one(const void *obj)
 {
@@ -834,6 +856,18 @@ KTHREAD *kthread_create(const char *name, void (*fn)(void *), void *arg, UINTN s
     t->timed_out = FALSE;
     t->cr3 = 0;
     t->proc = NULL;
+    t->fs_base = 0;
+    t->lx_tid = 0;
+    t->sig_mask = 0;
+    t->sig_pending = 0;
+    t->clear_tid = 0;
+    t->alt_sp = 0;
+    t->alt_size = 0;
+    t->alt_flags = 0;
+    t->sig_restore_mask = FALSE;
+    t->sig_saved = 0;
+    t->lx_die = FALSE;
+    t->fault_addr = 0;
     t->is_idle = FALSE;
     t->bkl_depth = 1;      /* новый поток начинает в коде ядра - под
                               большим замком, который держит ядро
@@ -888,8 +922,15 @@ void kthread_exit(void)
     t->state = KT_DEAD;
     t->lock_depth = 0;
 
-    /* кто-то мог ждать нашего завершения */
+    /* кто-то мог ждать нашего завершения - и завершения нашего
+       процесса (его ждут через сам KPROC и его родителя, этап 11) */
     sched_wake_all(t);
+
+    if (t->proc != NULL) {
+        sched_wake_all(t->proc);
+        if (t->proc->parent != NULL)
+            sched_wake_all(t->proc->parent);
+    }
 
     sched_switch(FALSE);
 

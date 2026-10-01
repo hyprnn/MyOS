@@ -430,7 +430,7 @@ static INTN x_close(VFS_MOUNT *m, VFS_NODE *f)
 
 const VFS_OPS g_exfat_ops = {
     "exFAT", x_root, x_readdir, x_lookup, x_read, x_write, x_truncate,
-    x_create, x_remove, x_rename, x_statfs, x_close
+    x_create, x_remove, x_rename, x_statfs, x_close, NULL
 };
 
 /* ================================================================

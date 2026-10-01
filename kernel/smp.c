@@ -74,8 +74,13 @@ static void bkl_acquire(void)
 
     if (__atomic_load_n(&g_bkl_serving, __ATOMIC_ACQUIRE) != my) {
         g_bkl_spins++;
-        while (__atomic_load_n(&g_bkl_serving, __ATOMIC_ACQUIRE) != my)
+        while (__atomic_load_n(&g_bkl_serving, __ATOMIC_ACQUIRE) != my) {
+            /* ждём с запрещёнными прерываниями - просьбу "сбрось TLB"
+               (umem.c) выполняем прямо здесь, иначе тот, кто держит
+               замок и ждёт нашего ответа, ждал бы вечно */
+            uvm_tlb_ipi();
             cpu_pause();
+        }
     }
 
     g_bkl_owner = kx_cpu_index() + 1u;

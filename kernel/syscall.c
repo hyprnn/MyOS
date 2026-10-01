@@ -141,7 +141,7 @@ static INTN user_path(KPROC *p, UINT64 upath, char *out, UINTN cap)
 }
 
 /* Вывод программы на экран (fd 1 и 2) */
-static void proc_out(KPROC *p, const char *s, UINTN n)
+void proc_out(KPROC *p, const char *s, UINTN n)
 {
     if (p->io == PROC_IO_GUI) {
 
@@ -190,7 +190,7 @@ static void proc_out(KPROC *p, const char *s, UINTN n)
 }
 
 /* Строка с клавиатуры (консоль): с эхом и забоем, до Enter */
-static INTN proc_read_console(KPROC *p, char *dst, UINTN n)
+INTN proc_read_console(KPROC *p, char *dst, UINTN n)
 {
     SIMPLE_TEXT_OUTPUT_INTERFACE *out = g_st->ConOut;
     static char line[PROC_IN_MAX];
@@ -624,14 +624,14 @@ static INT64 sys_wait(KPROC *p, INT64 pid, UINT64 uinfo, UINT32 flags)
 
     UINT64 fl = kx_irq_save();
 
-    while (kthread_alive(c->thread, c->tid)) {
+    while (proc_alive(c)) {
 
         if ((flags & MYOS_WAIT_NOHANG) || p->killed) {
             kx_irq_restore(fl);
             return p->killed ? MYOS_EINTR : 0;
         }
 
-        sched_block(c->thread, "wait", 200);
+        sched_block(c, "wait", 200);
     }
 
     kx_irq_restore(fl);
@@ -893,6 +893,10 @@ static INT64 kx_syscall_dispatch_inner(UINT64 *f)
         return MYOS_ENOSYS;       /* syscall не из программы?! */
 
     p->syscalls++;
+
+    /* программа Linux: её номера вызовов и правила (этап 11, linux.c) */
+    if (p->is_linux)
+        return linux_syscall(p, f);
 
     switch (nr) {
 

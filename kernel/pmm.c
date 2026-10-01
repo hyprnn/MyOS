@@ -232,10 +232,53 @@ BOOLEAN pmm_init(void)
  * fit), полностью занятые 64-страничные слова пропускаются
  * целиком. Возвращает физический адрес или 0.
  */
+/*
+ * Подсказка для одиночных страниц: с какой страницы начинать поиск.
+ * Программы Linux берут память миллионами отдельных страниц (этап 11);
+ * если каждый раз искать с начала, поиск идёт через всю уже занятую
+ * память - тем дольше, чем её больше. Поэтому одиночную страницу ищем
+ * с места прошлой выдачи ("next fit"), а освобождённая страница ниже
+ * подсказки сдвигает её назад.
+ */
+static UINT64 g_kmm_hint = 256;
+
+static UINT64 pmm_alloc_one(UINT64 limit_pages)
+{
+    for (UINTN pass = 0; pass < 2; pass++) {
+
+        UINT64 from = (pass == 0) ? g_kmm_hint : 256;
+        UINT64 to = (pass == 0) ? limit_pages : g_kmm_hint;
+
+        if (from < 256)
+            from = 256;
+
+        for (UINT64 p = from; p < to; p++) {
+
+            /* занятые слова по 64 страницы - целиком */
+            if ((p & 63u) == 0 && g_kmm_bitmap[p >> 6] == ~0ull) {
+                p += 63;
+                continue;
+            }
+
+            if (!pmm_test(p)) {
+                pmm_set(p);
+                g_kmm_free_pages--;
+                g_kmm_hint = p + 1;
+                return p * KMM_PAGE;
+            }
+        }
+    }
+
+    return 0;
+}
+
 UINT64 pmm_alloc_pages(UINT64 count, UINT64 limit)
 {
     if (!g_kmm_ready || count == 0 || count > g_kmm_free_pages)
         return 0;
+
+    if (count == 1 && limit == 0)
+        return pmm_alloc_one(g_kmm_total_pages);
 
     UINT64 limit_pages = g_kmm_total_pages;
 
@@ -345,8 +388,85 @@ void pmm_free_pages(UINT64 phys, UINT64 count)
         if (pmm_test(p)) {
             pmm_clear(p);
             g_kmm_free_pages++;
+            if (p < g_kmm_hint)
+                g_kmm_hint = p;
         }
     }
+}
+
+
+/* ================================================================
+ * Счётчики ссылок на страницы программ (этап 11)
+ *
+ * После fork родитель и потомок видят одни и те же физические
+ * страницы (только для чтения, "копирование при записи"): страницу
+ * можно отдать аллокатору, только когда её больше не видит никто.
+ * Счётчик - 16 бит на каждую страницу RAM (на 23 ГБ - 12 МБ); 0 и 1
+ * значат "один хозяин". Таблица заводится при первом обращении: к
+ * этому времени ядро уже отобразило всю RAM (P2V работает).
+ * ================================================================ */
+
+static UINT16 *g_kmm_refs;
+
+static BOOLEAN pmm_refs_ready(void)
+{
+    if (g_kmm_refs != NULL)
+        return TRUE;
+
+    UINT64 bytes = g_kmm_total_pages * sizeof(UINT16);
+    UINT64 pages = (bytes + KMM_PAGE - 1u) / KMM_PAGE;
+    UINT64 phys = pmm_alloc_zeroed(pages, 0);
+
+    if (phys == 0)
+        return FALSE;
+
+    g_kmm_refs = (UINT16 *)P2V(phys);
+    return TRUE;
+}
+
+/* Ещё один хозяин у страницы */
+void pmm_page_ref(UINT64 phys)
+{
+    UINT64 p = phys / KMM_PAGE;
+
+    if (p >= g_kmm_total_pages || !pmm_refs_ready())
+        return;
+
+    if (g_kmm_refs[p] == 0)
+        g_kmm_refs[p] = 1;          /* "0" - тоже один хозяин */
+
+    if (g_kmm_refs[p] != 0xFFFFu)   /* насыщение: такую уже не отдадим */
+        g_kmm_refs[p]++;
+}
+
+/* Хозяин больше не нужен: последний - отдаёт страницу аллокатору */
+void pmm_page_unref(UINT64 phys)
+{
+    UINT64 p = phys / KMM_PAGE;
+
+    if (p >= g_kmm_total_pages)
+        return;
+
+    if (g_kmm_refs == NULL || g_kmm_refs[p] <= 1u) {
+        if (g_kmm_refs != NULL)
+            g_kmm_refs[p] = 0;
+        pmm_free_pages(p * KMM_PAGE, 1);
+        return;
+    }
+
+    if (g_kmm_refs[p] != 0xFFFFu)
+        g_kmm_refs[p]--;
+}
+
+/* Сколько хозяев (1 - единственный: можно писать без копии) */
+UINT32 pmm_page_refs(UINT64 phys)
+{
+    UINT64 p = phys / KMM_PAGE;
+
+    if (p >= g_kmm_total_pages || g_kmm_refs == NULL || g_kmm_refs[p] == 0)
+        return 1;
+
+    return g_kmm_refs[p];
 }
 
 
