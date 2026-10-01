@@ -436,3 +436,63 @@ void aero_wallpaper(UINT32 *buf, UINT32 w, UINT32 h)
             }
     }
 }
+
+/* ---------------- обои-картинка ---------------- */
+
+extern const UINT8 g_wallpaper_rgb[], g_wallpaper_rgb_end[];
+extern const UINT32 g_wallpaper_w, g_wallpaper_h;
+
+/*
+ * Обои-картинка (gui/wallpaper/, вшита в ядро) - растянуть под экран
+ * w x h "с заполнением": масштаб такой, чтобы картинка закрыла весь
+ * экран, лишнее по краям обрезается (у экрана 16:10 - чуть-чуть слева
+ * и справа). Билинейная интерполяция: точка экрана - смесь четырёх
+ * соседних точек картинки, без "лесенки". FALSE - картинки нет.
+ */
+BOOLEAN aero_wallpaper_image(UINT32 *buf, UINT32 w, UINT32 h)
+{
+    UINT32 iw = g_wallpaper_w, ih = g_wallpaper_h;
+
+    if ((UINTN)(g_wallpaper_rgb_end - g_wallpaper_rgb) < (UINTN)iw * ih * 3u || iw == 0 || ih == 0)
+        return FALSE;
+
+    /* масштаб в 16.16: картинка/экран по той оси, где картинки "меньше" */
+    UINT64 sx = ((UINT64)iw << 16) / w, sy = ((UINT64)ih << 16) / h;
+    UINT64 s = sx < sy ? sx : sy;
+
+    /* сдвиг, чтобы обрезка была поровну с двух сторон */
+    UINT64 ox = (((UINT64)iw << 16) - s * w) / 2;
+    UINT64 oy = (((UINT64)ih << 16) - s * h) / 2;
+
+    for (UINT32 y = 0; y < h; y++) {
+
+        UINT64 fy = oy + s * y;
+        UINT32 y0 = (UINT32)(fy >> 16), ty = (UINT32)((fy >> 8) & 0xFF);
+        UINT32 y1 = (y0 + 1 < ih) ? y0 + 1 : y0;
+
+        const UINT8 *r0 = g_wallpaper_rgb + (UINTN)y0 * iw * 3u;
+        const UINT8 *r1 = g_wallpaper_rgb + (UINTN)y1 * iw * 3u;
+
+        for (UINT32 x = 0; x < w; x++) {
+
+            UINT64 fx = ox + s * x;
+            UINT32 x0 = (UINT32)(fx >> 16), tx = (UINT32)((fx >> 8) & 0xFF);
+            UINT32 x1 = (x0 + 1 < iw) ? x0 + 1 : x0;
+
+            UINT32 c[3];
+
+            for (int k = 0; k < 3; k++) {
+                UINT32 a = r0[x0 * 3 + k], b = r0[x1 * 3 + k];
+                UINT32 cc = r1[x0 * 3 + k], d = r1[x1 * 3 + k];
+                UINT32 top = a * (256 - tx) + b * tx;
+                UINT32 bot = cc * (256 - tx) + d * tx;
+                c[k] = (top * (256 - ty) + bot * ty) >> 16;
+            }
+
+            buf[(UINTN)y * w + x] = (c[0] << 16) | (c[1] << 8) | c[2];
+        }
+    }
+
+    return TRUE;
+}
+

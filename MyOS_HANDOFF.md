@@ -800,6 +800,13 @@ UEFI: всё — EfiLoaderData, а что ядру не трогать, пере
   `aero_wallpaper` (небо, сияние, две ленты-волны, два холма с бликом
   на гребне, 16 пузырей - детерминированно). Дробные числа в ядре
   можно (fxsave в kx_isr_common); свои `f_sqrt`, `f_sin`.
+* Обои-картинка: `tools/mkwallpaper.py картинка` (Pillow) делает
+  `gui/wallpaper/wallpaper.rgb` (1366x768, по 3 байта RGB на точку,
+  обрезка "cover") и `source.jpg` (исходник поменьше);
+  `gui/wallpaper/wallpaper.S` вшивает .rgb в ядро через `.incbin`
+  (`g_wallpaper_rgb`, `g_wallpaper_w/h`, ядро +3 МБ).
+  `aero_wallpaper_image` растягивает её билинейно "cover" под экран;
+  если картинки нет (FALSE) - рисуется `aero_wallpaper`.
 * `gui/wm.c`: обои рисуются в `g_wall` один раз (`wm: wallpaper drawn
   in N ms`, в QEMU ~0.4 с) и копируются в начале compose; стекло
   рамок/панели смешивается с уже нарисованным позади (compose - снизу

@@ -72,6 +72,7 @@ UACPI_CFLAGS := $(KCFLAGS) -U_FORTIFY_SOURCE -Ithird_party/uacpi/include $(UACPI
 
 LOBJS   := $(LSRCS:%.c=build/loader/%.o)
 KOBJS   := $(KSRCS:%.c=build/kernel/%.o) build/kernel/apps.o build/kernel/firmware.o \
+           build/kernel/wallpaper.o \
            $(FATFS_SRCS:%.c=build/kernel/%.o) $(UACPI_SRCS:%.c=build/kernel/%.o)
 DEPS    := $(LOBJS:.o=.d) $(KSRCS:%.c=build/kernel/%.d) $(UACPI_SRCS:%.c=build/kernel/%.d)
 
@@ -425,6 +426,12 @@ build/kernel/apps.o: build/apps.S
 
 # Прошивки устройств (firmware/): вклеиваются в ядро как есть
 build/kernel/firmware.o: firmware/firmware.S $(wildcard firmware/*/*.bin)
+	@mkdir -p $(dir $@)
+	@echo "  AS  $<"
+	@$(CC) $(KCFLAGS) -c $< -o $@
+
+# Обои рабочего стола (gui/wallpaper/, этап 10): готовые пиксели
+build/kernel/wallpaper.o: gui/wallpaper/wallpaper.S gui/wallpaper/wallpaper.rgb
 	@mkdir -p $(dir $@)
 	@echo "  AS  $<"
 	@$(CC) $(KCFLAGS) -c $< -o $@

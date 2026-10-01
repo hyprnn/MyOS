@@ -1031,7 +1031,9 @@ void wm_start(EFI_SYSTEM_TABLE *st)
         g_wall = (UINT32 *)kmalloc((UINTN)SCR_W * SCR_H * 4u);
         if (g_wall) {
             UINT64 t0 = g_kticks;
-            aero_wallpaper(g_wall, SCR_W, SCR_H);
+            /* картинка (gui/wallpaper/); нет её - рисованные обои */
+            if (!aero_wallpaper_image(g_wall, SCR_W, SCR_H))
+                aero_wallpaper(g_wall, SCR_W, SCR_H);
             g_wall_w = SCR_W;
             g_wall_h = SCR_H;
             klog("wm: wallpaper drawn in %u ms\n", (UINT32)(g_kticks - t0));
