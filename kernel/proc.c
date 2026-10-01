@@ -1098,6 +1098,16 @@ BOOLEAN proc_find_program(const char *name, char *path, UINTN cap)
                magic[2] == 'L' && magic[3] == 'F';
     }
 
+    /* программа Linux из корня Linux (этап 11): "bash", "python",
+       "firefox" - /usr/bin этого Linux. Команды MyOS (/bin) - первыми. */
+    char root[16];
+
+    if (lx_root_volume(root, sizeof(root))) {
+        ksnprintf(path, cap, "/%s/usr/bin/%s", root, name);
+        if (vfs_stat(path, &st) == VFS_OK && !st.node.is_dir)
+            return TRUE;
+    }
+
     return FALSE;
 }
 

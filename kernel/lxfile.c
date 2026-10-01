@@ -683,18 +683,469 @@ static BOOLEAN path_is(const char *s, const char *pre, const char **rest)
     return TRUE;
 }
 
-/*
- * Путь из памяти программы -> полный путь. dirfd - от какой папки
- * считать относительный (AT_FDCWD - текущая). "/tmp/..." -> "/ram/...".
- */
-INTN lx_resolve_path(KPROC *p, INT64 dirfd, UINT64 upath, char *out, UINTN cap)
+/* ================================================================
+ * Корень Linux (этап 11, шаг 2)
+ *
+ * Программам Linux нужен привычный "/": /usr/bin, /usr/lib, /etc.
+ * Если в MyOS смонтирован раздел ext4 с Linux (корень Arch на
+ * ноутбуке - /nvme0p2), он становится корнем Linux для программ:
+ *
+ *   путь Linux            путь MyOS
+ *   /usr/lib/libc.so.6 -> /nvme0p2/usr/lib/libc.so.6
+ *   /tmp/x             -> /tmp/x       (tmpfs MyOS: писать можно)
+ *   /dev/null, /proc -> свои   (kernel/lxfile.c)
+ *   /home/...          -> том из /etc/fstab этого Linux (UUID=...)
+ *   /myos/usb0p1/a     -> /usb0p1/a    (выход к томам MyOS)
+ *   /usb0p1/a          -> /usb0p1/a    (имя тома MyOS, которого нет
+ *                                       в корне Linux, - тоже можно)
+ *
+ * Символьные ссылки разбираются ЗДЕСЬ, по правилам Linux: ссылка
+ * "/usr/lib/x" - от корня Linux, "../proc/self/mounts" - может уйти
+ * из тома в /proc. В VFS приходит путь MyOS уже без ссылок.
+ *
+ * Корень выбирается при запуске программы из шелла MyOS (у потомков -
+ * тот же). Нет раздела Linux - всё как на шаге 1: пути = пути MyOS.
+ * ================================================================ */
+
+/* Точки монтирования из /etc/fstab корня Linux */
+typedef struct {
+    char point[64];             /* "/home" */
+    char vol[16];               /* том MyOS: "nvme0p3" */
+} LX_MNT;
+
+#define LX_MNT_MAX 8
+
+static LX_MNT g_lx_mnt[LX_MNT_MAX];
+static UINTN  g_lx_nmnt;
+static char   g_lx_mnt_root[16];        /* для какого корня прочитан fstab */
+
+static BOOLEAN str_eq(const char *a, const char *b)
 {
-    char tmp[VFS_PATH_MAX];
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+
+    return *a == *b;
+}
+
+/* Есть ли путь MyOS (не проходя последнюю ссылку) */
+static BOOLEAN my_exists(const char *my)
+{
+    VFS_DIRENT *e = (VFS_DIRENT *)kmalloc(sizeof(VFS_DIRENT));
+
+    if (e == NULL)
+        return FALSE;
+
+    BOOLEAN ok = vfs_lstat(my, e) == VFS_OK;
+
+    kfree(e);
+    return ok;
+}
+
+/* Прочитать /etc/fstab корня root: какие ещё тома и куда */
+static void read_fstab(const char *root)
+{
+    char path[64];
+    UINTN got = 0;
+    char *buf = (char *)kmalloc(8192);
+
+    g_lx_nmnt = 0;
+    ksnprintf(g_lx_mnt_root, sizeof(g_lx_mnt_root), "%s", root);
+
+    if (buf == NULL)
+        return;
+
+    ksnprintf(path, sizeof(path), "/%s/etc/fstab", root);
+
+    if (vfs_read_file(path, buf, 8191, &got) != VFS_OK)
+        got = 0;
+
+    buf[got] = '\0';
+
+    char *line = buf;
+
+    while (*line && g_lx_nmnt < LX_MNT_MAX) {
+
+        char *end = line;
+
+        while (*end && *end != '\n')
+            end++;
+
+        char saved = *end;
+        *end = '\0';
+
+        /* поля: что, куда, тип, ... */
+        char *f[3] = { NULL, NULL, NULL };
+        UINTN nf = 0;
+        char *c = line;
+
+        while (*c && nf < 3) {
+            while (*c == ' ' || *c == '\t')
+                c++;
+            if (!*c || *c == '#')
+                break;
+            f[nf++] = c;
+            while (*c && *c != ' ' && *c != '\t')
+                c++;
+            if (*c)
+                *c++ = '\0';
+        }
+
+        if (nf >= 2 && f[1][0] == '/' && f[1][1] != '\0') {
+
+            /* UUID=... или LABEL=... - ищем такой том ext4 среди томов MyOS */
+            BOOLEAN by_uuid = (f[0][0] == 'U' && f[0][1] == 'U' && f[0][2] == 'I' &&
+                               f[0][3] == 'D' && f[0][4] == '=');
+            BOOLEAN by_label = (f[0][0] == 'L' && f[0][1] == 'A' && f[0][2] == 'B' &&
+                                f[0][3] == 'E' && f[0][4] == 'L' && f[0][5] == '=');
+            const char *want = by_uuid ? f[0] + 5 : by_label ? f[0] + 6 : NULL;
+
+            for (UINTN i = 0; want != NULL && i < VFS_MAX_MOUNTS; i++) {
+
+                VFS_MOUNT *m = &g_mounts[i];
+                char uuid[40];
+
+                if (!m->used || m->ops != &g_ext4_ops || str_eq(m->name, root))
+                    continue;
+
+                BOOLEAN hit = by_uuid ? (ext4_uuid(m, uuid, sizeof(uuid)) && str_eq(uuid, want))
+                                      : str_eq(ext4_label(m), want);
+
+                if (hit) {
+                    LX_MNT *x = &g_lx_mnt[g_lx_nmnt++];
+                    ksnprintf(x->point, sizeof(x->point), "%s", f[1]);
+                    ksnprintf(x->vol, sizeof(x->vol), "%s", m->name);
+                    klog("linux: %s from /etc/fstab -> /%s\n", x->point, x->vol);
+                    break;
+                }
+            }
+        }
+
+        *end = saved;
+        line = (*end) ? end + 1 : end;
+    }
+
+    kfree(buf);
+}
+
+/*
+ * Том с корнем Linux: первый том ext4, где есть /etc/os-release (или
+ * /usr/lib/os-release). FALSE - такого нет.
+ */
+BOOLEAN lx_root_volume(char *out, UINTN cap)
+{
+    for (UINTN i = 0; i < VFS_MAX_MOUNTS; i++) {
+
+        VFS_MOUNT *m = &g_mounts[i];
+        char path[64];
+        VFS_DIRENT *e;
+
+        if (!m->used || m->ops != &g_ext4_ops)
+            continue;
+
+        e = (VFS_DIRENT *)kmalloc(sizeof(VFS_DIRENT));
+
+        if (e == NULL)
+            return FALSE;
+
+        ksnprintf(path, sizeof(path), "/%s/etc/os-release", m->name);
+        BOOLEAN ok = vfs_stat(path, e) == VFS_OK;
+
+        if (!ok) {
+            ksnprintf(path, sizeof(path), "/%s/usr/lib/os-release", m->name);
+            ok = vfs_stat(path, e) == VFS_OK;
+        }
+
+        kfree(e);
+
+        if (ok) {
+            ksnprintf(out, cap, "%s", m->name);
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/* Корень Linux для программы, запущенной из шелла MyOS (у потомков -
+   тот же, см. sys_clone) */
+void lx_choose_root(KPROC *p)
+{
+    if (p->lx == NULL)
+        return;
+
+    if (!lx_root_volume(p->lx->root, sizeof(p->lx->root)))
+        p->lx->root[0] = '\0';
+
+    if (p->lx->root[0] != '\0' && !str_eq(g_lx_mnt_root, p->lx->root))
+        read_fstab(p->lx->root);
+}
+
+/* Области, которые MyOS делает сама (не из корня Linux) */
+static BOOLEAN lx_own_area(const char *lin)
+{
+    return path_is(lin, "/dev", NULL) || path_is(lin, "/proc", NULL) ||
+           path_is(lin, "/sys", NULL) || path_is(lin, "/tmp", NULL);
+}
+
+/* Путь Linux (полный, без ссылок, "." и "..") -> путь MyOS */
+static void lin_to_myos(KPROC *p, const char *lin, char *out, UINTN cap)
+{
+    const char *root = (p->lx != NULL) ? p->lx->root : "";
+    const char *rest;
+
+    /* /dev/shm (общая память POSIX) - это папка .shm в /tmp */
+    if (path_is(lin, "/dev/shm", &rest)) {
+        ksnprintf(out, cap, "/tmp/.shm%s", rest);
+        return;
+    }
+
+    if (root[0] == '\0' || lx_own_area(lin)) {
+        ksnprintf(out, cap, "%s", lin);
+        return;
+    }
+
+    if (lin[0] == '/' && lin[1] == '\0') {
+        ksnprintf(out, cap, "/%s", root);
+        return;
+    }
+
+    if (path_is(lin, "/myos", &rest)) {
+        ksnprintf(out, cap, "%s", rest[0] ? rest : "/");
+        return;
+    }
+
+    for (UINTN i = 0; i < g_lx_nmnt; i++)
+        if (path_is(lin, g_lx_mnt[i].point, &rest)) {
+            ksnprintf(out, cap, "/%s%s", g_lx_mnt[i].vol, rest);
+            return;
+        }
+
+    /* /usb0p1/...: том MyOS, если в корне Linux такого имени нет */
+    char first[VFS_NAME_MAX + 2];
+    UINTN k = 0;
+
+    for (; lin[k + 1] && lin[k + 1] != '/' && k + 2 < sizeof(first); k++)
+        first[k + 1] = lin[k + 1];
+
+    first[0] = '/';
+    first[k + 1] = '\0';
+
+    if (my_exists(first)) {
+        char in_root[VFS_NAME_MAX + 24];
+        ksnprintf(in_root, sizeof(in_root), "/%s%s", root, first);
+        if (!my_exists(in_root)) {
+            ksnprintf(out, cap, "%s", lin);
+            return;
+        }
+    }
+
+    ksnprintf(out, cap, "/%s%s", root, lin);
+}
+
+/* Путь MyOS -> как его видит программа Linux (getcwd, /proc/self/exe) */
+void lx_path_to_linux(KPROC *p, const char *my, char *out, UINTN cap)
+{
+    const char *root = (p->lx != NULL) ? p->lx->root : "";
+    const char *rest;
+    char pre[24];
+
+    if (root[0] == '\0' || lx_own_area(my)) {
+        ksnprintf(out, cap, "%s", my);
+        return;
+    }
+
+    ksnprintf(pre, sizeof(pre), "/%s", root);
+
+    if (path_is(my, pre, &rest)) {
+        ksnprintf(out, cap, "%s", rest[0] ? rest : "/");
+        return;
+    }
+
+    for (UINTN i = 0; i < g_lx_nmnt; i++) {
+        ksnprintf(pre, sizeof(pre), "/%s", g_lx_mnt[i].vol);
+        if (path_is(my, pre, &rest)) {
+            ksnprintf(out, cap, "%s%s", g_lx_mnt[i].point, rest);
+            return;
+        }
+    }
+
+    /* остальное MyOS: прямо, если имя тома не спорит с корнем Linux
+       (/usb0p1), иначе через /myos (/bin - у Linux свой /bin) */
+    char first[VFS_NAME_MAX + 24];
+    UINTN n = (UINTN)ksnprintf(first, sizeof(first), "/%s", root);
+
+    for (UINTN k = 0; my[k] && (k == 0 || my[k] != '/') && n + 1 < sizeof(first); k++)
+        first[n++] = my[k];
+
+    first[n] = '\0';
+
+    if (my[1] == '\0' || my_exists(first))
+        ksnprintf(out, cap, "/myos%s", (my[1] == '\0') ? "" : my);
+    else
+        ksnprintf(out, cap, "%s", my);
+}
+
+/*
+ * Разобрать путь Linux (полный) по элементам, проходя символьные
+ * ссылки по правилам Linux. follow - проходить ли ссылку в самом
+ * конце (lstat, readlink, unlink - нет). Результат - путь MyOS.
+ */
+static INTN lx_walk(KPROC *p, const char *lpath, BOOLEAN follow, char *out, UINTN cap)
+{
+    char *work = (char *)kmalloc(VFS_PATH_MAX * 2);
+    char *nw = (char *)kmalloc(VFS_PATH_MAX * 2);
+    VFS_DIRENT *e = (VFS_DIRENT *)kmalloc(sizeof(VFS_DIRENT));
+    char lin[VFS_PATH_MAX];
+    char my[VFS_PATH_MAX];
+    char tgt[VFS_PATH_MAX];
+    UINTN hops = 0, i = 0;
+    INTN r = 0;
+
+    if (work == NULL || nw == NULL || e == NULL) {
+        r = -LX_ENOMEM;
+        goto out;
+    }
+
+    ksnprintf(work, VFS_PATH_MAX * 2, "%s", lpath);
+    lin[0] = '\0';
+
+    for (;;) {
+
+        while (work[i] == '/')
+            i++;
+
+        if (work[i] == '\0')
+            break;
+
+        UINTN s = i;
+
+        while (work[i] && work[i] != '/')
+            i++;
+
+        UINTN len = i - s, j = i;
+
+        while (work[j] == '/')
+            j++;
+
+        BOOLEAN last = work[j] == '\0';
+
+        if (len == 1 && work[s] == '.')
+            continue;
+
+        UINTN ll = 0;
+
+        while (lin[ll])
+            ll++;
+
+        if (len == 2 && work[s] == '.' && work[s + 1] == '.') {
+            while (ll > 0 && lin[ll - 1] != '/')
+                ll--;
+            if (ll > 0)
+                ll--;
+            lin[ll] = '\0';
+            continue;
+        }
+
+        if (ll + 1 + len + 1 > sizeof(lin) || len >= VFS_NAME_MAX) {
+            r = -LX_ENAMETOOLONG;
+            goto out;
+        }
+
+        lin[ll] = '/';
+        memcpy(lin + ll + 1, work + s, len);
+        lin[ll + 1 + len] = '\0';
+
+        if (last && !follow)
+            break;
+
+        /* /dev, /proc, /sys, /tmp - ссылок там нет */
+        if (p->lx != NULL && p->lx->root[0] != '\0' && lx_own_area(lin))
+            continue;
+
+        lin_to_myos(p, lin, my, sizeof(my));
+
+        if (vfs_lstat(my, e) != VFS_OK || !VFS_IS_LINK(&e->node))
+            continue;
+
+        /* символьная ссылка: дальше разбираем (цель + остаток пути) */
+        if (++hops > 40) {
+            r = -LX_ELOOP;
+            goto out;
+        }
+
+        INTN n = vfs_readlink(my, tgt, sizeof(tgt));
+
+        if (n <= 0) {
+            r = -LX_ENOENT;
+            goto out;
+        }
+
+        ksnprintf(nw, VFS_PATH_MAX * 2, "%s%s", tgt, work + i);
+        ksnprintf(work, VFS_PATH_MAX * 2, "%s", nw);
+        i = 0;
+        lin[ll] = '\0';                     /* сама ссылка - не часть пути */
+
+        if (tgt[0] == '/')
+            lin[0] = '\0';                  /* от корня Linux */
+    }
+
+    if (lin[0] == '\0') {
+        lin[0] = '/';
+        lin[1] = '\0';
+    }
+
+    lin_to_myos(p, lin, out, cap);
+
+out:
+    kfree(work);
+    kfree(nw);
+    kfree(e);
+    return r;
+}
+
+/*
+ * Путь (строка ядра) -> путь MyOS. dirfd - от какой папки считать
+ * относительный (AT_FDCWD - текущая).
+ */
+INTN lx_resolve_kpath(KPROC *p, INT64 dirfd, const char *kpath, BOOLEAN follow, char *out,
+                      UINTN cap)
+{
     char joined[VFS_PATH_MAX * 2];
 
     /* номер папки - int (как у Linux): AT_FDCWD (-100) может прийти и
        без знакового расширения в старшие 32 бита регистра */
     dirfd = (INT32)dirfd;
+
+    if (kpath[0] == '\0')
+        return -LX_ENOENT;
+
+    if (kpath[0] == '/') {
+        ksnprintf(joined, sizeof(joined), "%s", kpath);
+    } else {
+        const char *base = p->cwd;
+        char lbase[VFS_PATH_MAX];
+        if (dirfd != LX_AT_FDCWD) {
+            LFILE *d = fd_get(p, dirfd);
+            if (d == NULL)
+                return -LX_EBADF;
+            if (d->type != LF_DIR)
+                return -LX_ENOTDIR;
+            base = d->path;
+        }
+        lx_path_to_linux(p, base, lbase, sizeof(lbase));
+        ksnprintf(joined, sizeof(joined), "%s/%s", lbase, kpath);
+    }
+
+    return lx_walk(p, joined, follow, out, cap);
+}
+
+/* Путь из памяти программы -> путь MyOS (последняя ссылка - по follow) */
+static INTN lx_resolve_path_ex(KPROC *p, INT64 dirfd, UINT64 upath, BOOLEAN follow, char *out,
+                               UINTN cap)
+{
+    char tmp[VFS_PATH_MAX];
 
     for (UINTN i = 0; ; i++) {
 
@@ -711,38 +1162,12 @@ INTN lx_resolve_path(KPROC *p, INT64 dirfd, UINT64 upath, char *out, UINTN cap)
             break;
     }
 
-    if (tmp[0] == '\0')
-        return -LX_ENOENT;
+    return lx_resolve_kpath(p, dirfd, tmp, follow, out, cap);
+}
 
-    if (tmp[0] == '/') {
-        ksnprintf(joined, sizeof(joined), "%s", tmp);
-    } else {
-        const char *base = p->cwd;
-        if (dirfd != LX_AT_FDCWD) {
-            LFILE *d = fd_get(p, dirfd);
-            if (d == NULL)
-                return -LX_EBADF;
-            if (d->type != LF_DIR)
-                return -LX_ENOTDIR;
-            base = d->path;
-        }
-        ksnprintf(joined, sizeof(joined), "%s/%s", base, tmp);
-    }
-
-    char norm[VFS_PATH_MAX];
-
-    if (vfs_normalize(joined, norm, sizeof(norm)) != VFS_OK)
-        return -LX_ENAMETOOLONG;
-
-    const char *rest;
-
-    /* /dev/shm (общая память POSIX) - это папка shm в /tmp */
-    if (path_is(norm, "/dev/shm", &rest))
-        ksnprintf(out, cap, "/tmp/.shm%s", rest);
-    else
-        ksnprintf(out, cap, "%s", norm);
-
-    return 0;
+INTN lx_resolve_path(KPROC *p, INT64 dirfd, UINT64 upath, char *out, UINTN cap)
+{
+    return lx_resolve_path_ex(p, dirfd, upath, TRUE, out, cap);
 }
 
 /* /proc/self/... и /proc/<pid>/... -> процесс и остаток пути */
@@ -855,7 +1280,30 @@ static void fill_stat(LX_STAT *st, const char *path, UINT32 mode, UINT64 size, U
     st->atime = st->mtime = st->ctime = mtime;
 }
 
-/* Специальные пути (/dev, /proc): TRUE - это он, *st заполнен */
+/* ---------------- /sys: несколько файлов, которые читают программы ----
+   (glibc узнаёт число процессоров из /sys/devices/system/cpu/online) */
+
+static const char *const g_sys_files[] = {
+    "/sys/devices/system/cpu/online",
+    "/sys/devices/system/cpu/possible",
+    "/sys/devices/system/cpu/present",
+    "/sys/kernel/mm/transparent_hugepage/enabled",
+    NULL
+};
+
+/* /sys/...: 1 - файл, 2 - папка (начало пути какого-то файла), 0 - нет */
+static UINTN sys_kind(const char *path)
+{
+    for (UINTN i = 0; g_sys_files[i]; i++) {
+        const char *rest;
+        if (path_is(g_sys_files[i], path, &rest))
+            return (rest[0] == '\0') ? 1 : 2;
+    }
+
+    return 0;
+}
+
+/* Специальные пути (/dev, /proc, /sys): TRUE - это он, *st заполнен */
 static BOOLEAN special_stat(KPROC *p, const char *path, LX_STAT *st, INTN *err)
 {
     const char *rest;
@@ -897,9 +1345,59 @@ static BOOLEAN special_stat(KPROC *p, const char *path, LX_STAT *st, INTN *err)
         return TRUE;
     }
 
+    if (path_is(path, "/sys", NULL)) {
+        UINTN k = (path[4] == '\0') ? 2 : sys_kind(path);
+        if (k == 0)
+            *err = -LX_ENOENT;
+        else
+            fill_stat(st, path, (k == 2) ? (LX_S_IFDIR | 0555) : (LX_S_IFREG | 0444), 0, 0);
+        return TRUE;
+    }
+
     return FALSE;
 }
 
+/* Номер "устройства" тома: разный у разных томов (find -xdev, du и cp
+   так отличают файловые системы) - по имени тома */
+static UINT64 path_dev(const char *path)
+{
+    UINT32 h = 2166136261u;
+
+    for (UINTN i = 1; path[i] && path[i] != '/'; i++)
+        h = (h ^ (UINT8)path[i]) * 16777619u;
+
+    return 0x800u | (h & 0xFFu);
+}
+
+/* stat по узлу VFS (путь MyOS - для номера inode, если у ФС его нет) */
+static void stat_from_node(LX_STAT *st, const char *path, const VFS_NODE *n)
+{
+    if (n->mode != 0) {
+        /* ext4: всё настоящее */
+        fill_stat(st, path, n->mode, n->size, (UINT64)n->mtime);
+        st->ino = n->ino;
+        st->dev = path_dev(path);
+        st->nlink = n->nlink ? n->nlink : 1;
+        st->uid = n->uid;
+        st->gid = n->gid;
+        st->rdev = n->rdev;
+        st->atime = (UINT64)n->atime;
+        st->ctime = (UINT64)n->ctime;
+        return;
+    }
+
+    UINT64 mt = fat_to_unix(n->wdate, n->wtime);
+
+    if (n->is_dir)
+        fill_stat(st, path, LX_S_IFDIR | 0755, 4096, mt);
+    else
+        fill_stat(st, path, LX_S_IFREG | 0755, n->size, mt);
+
+    st->dev = path_dev(path);
+}
+
+/* stat пути MyOS (ссылки уже разобраны слоем Linux: последняя - сама
+   по себе, поэтому lstat) */
 static INTN do_stat_path(KPROC *p, const char *path, LX_STAT *st)
 {
     INTN err;
@@ -907,21 +1405,15 @@ static INTN do_stat_path(KPROC *p, const char *path, LX_STAT *st)
     if (special_stat(p, path, st, &err))
         return err;
 
-    /* /proc/self/exe и т.п. уже ответили; обычный путь - VFS */
     VFS_DIRENT *e = (VFS_DIRENT *)kmalloc(sizeof(VFS_DIRENT));
 
     if (e == NULL)
         return -LX_ENOMEM;
 
-    INTN r = vfs_stat(path, e);
+    INTN r = vfs_lstat(path, e);
 
-    if (r == VFS_OK) {
-        if (e->node.is_dir)
-            fill_stat(st, path, LX_S_IFDIR | 0755, 4096, fat_to_unix(e->node.wdate, e->node.wtime));
-        else
-            fill_stat(st, path, LX_S_IFREG | 0755, e->node.size,
-                      fat_to_unix(e->node.wdate, e->node.wtime));
-    }
+    if (r == VFS_OK)
+        stat_from_node(st, path, &e->node);
 
     kfree(e);
     return (r == VFS_OK) ? 0 : (INTN)linux_errno(r);
@@ -936,7 +1428,12 @@ static INTN do_stat_file(KPROC *p, LFILE *f, LX_STAT *st)
     case LF_VFS: {
         UINT64 size = 0;
         vfs_size(f->kfd, &size);
-        fill_stat(st, f->path, LX_S_IFREG | 0755, size, 0);
+        /* права, inode, время - по пути (файл мог быть удалён - тогда
+           хотя бы размер) */
+        if (do_stat_path(p, f->path, st) != 0 || (st->mode & LX_S_IFMT) != LX_S_IFREG)
+            fill_stat(st, f->path, LX_S_IFREG | 0755, size, 0);
+        st->size = (INT64)size;
+        st->blocks = (INT64)((size + 511u) / 512u);
         return 0;
     }
 
@@ -1125,6 +1622,26 @@ static BOOLEAN proc_file_text(KPROC *p, const char *path, TBUF *b)
     return FALSE;
 }
 
+/* Текст файла /sys (FALSE - такого нет) */
+static BOOLEAN sys_file_text(const char *path, TBUF *b)
+{
+    if (sys_kind(path) != 1)
+        return FALSE;
+
+    if (path_is(path, "/sys/kernel/mm/transparent_hugepage/enabled", NULL)) {
+        tb_printf(b, "always madvise [never]\n");
+        return TRUE;
+    }
+
+    /* online / possible / present: все процессоры */
+    if (g_ncpus > 1)
+        tb_printf(b, "0-%u\n", g_ncpus - 1u);
+    else
+        tb_printf(b, "0\n");
+
+    return TRUE;
+}
+
 
 /* ================================================================
  * open
@@ -1174,6 +1691,38 @@ static INT64 do_open(KPROC *p, const char *path, UINT32 flags)
                 kfree(b.s);
                 return -LX_ENOENT;
             }
+            f = lfile_new(LF_MEM, LX_O_RDONLY);
+            if (f != NULL) {
+                f->mem = b.s;
+                f->memlen = b.len;
+            } else {
+                kfree(b.s);
+            }
+        }
+
+        if (f == NULL)
+            return -LX_ENOMEM;
+
+        ksnprintf(f->path, sizeof(f->path), "%s", path);
+
+        INT64 fd = fd_install(p, f, 0, cloexec);
+        if (fd < 0)
+            lfile_unref(f);
+        return fd;
+    }
+
+    if (path_is(path, "/sys", NULL)) {
+
+        UINTN k = (path[4] == '\0') ? 2 : sys_kind(path);
+
+        if (k == 0)
+            return -LX_ENOENT;
+
+        if (k == 2) {
+            f = lfile_new(LF_DIR, flags & ~LX_O_CLOEXEC);
+        } else {
+            TBUF b = { NULL, 0, 0 };
+            sys_file_text(path, &b);
             f = lfile_new(LF_MEM, LX_O_RDONLY);
             if (f != NULL) {
                 f->mem = b.s;
@@ -1445,7 +1994,22 @@ typedef struct {
     const char *dirpath;
 } GD_CTX;
 
-static BOOLEAN gd_put(GD_CTX *c, const char *name, BOOLEAN dir, UINT64 ino)
+/* Тип записи папки (d_type) по узлу */
+static UINT8 dt_of(const VFS_NODE *n)
+{
+    switch (n->mode & LX_S_IFMT) {
+    case 0:            return n->is_dir ? 4 : 8;
+    case LX_S_IFDIR:   return 4;        /* DT_DIR */
+    case LX_S_IFLNK:   return 10;       /* DT_LNK */
+    case LX_S_IFCHR:   return 2;        /* DT_CHR */
+    case 0060000:      return 6;        /* DT_BLK */
+    case LX_S_IFIFO:   return 1;        /* DT_FIFO */
+    case 0140000:      return 12;       /* DT_SOCK */
+    default:           return 8;        /* DT_REG */
+    }
+}
+
+static BOOLEAN gd_put(GD_CTX *c, const char *name, UINT8 dtype, UINT64 ino)
 {
     UINTN nl = 0;
 
@@ -1467,7 +2031,7 @@ static BOOLEAN gd_put(GD_CTX *c, const char *name, BOOLEAN dir, UINT64 ino)
     memcpy(r + 8, &off, 8);
     UINT16 rl = (UINT16)reclen;
     memcpy(r + 16, &rl, 2);
-    r[18] = dir ? 4 : 8;            /* DT_DIR / DT_REG */
+    r[18] = dtype;
     memcpy(r + 19, name, nl);
 
     c->used += reclen;
@@ -1486,7 +2050,7 @@ static INTN gd_cb(void *ctx, const VFS_DIRENT *e)
     char full[VFS_PATH_MAX];
     ksnprintf(full, sizeof(full), "%s/%s", c->dirpath, e->name);
 
-    if (!gd_put(c, e->name, e->node.is_dir, path_ino(full)))
+    if (!gd_put(c, e->name, dt_of(&e->node), e->node.ino ? e->node.ino : path_ino(full)))
         return 1;                   /* буфер полон - хватит */
 
     c->idx++;
@@ -1504,12 +2068,12 @@ static INT64 do_getdents64(KPROC *p, LFILE *f, UINT8 *out, UINTN cap)
 
     /* "." и ".." - первыми (ls -a, find их ждут) */
     if (c.want == 0) {
-        if (!gd_put(&c, ".", TRUE, path_ino(f->path)))
+        if (!gd_put(&c, ".", 4, path_ino(f->path)))
             return -LX_EINVAL;
         c.idx = ++c.want;
     }
     if (c.want == 1) {
-        if (!gd_put(&c, "..", TRUE, 1)) {
+        if (!gd_put(&c, "..", 4, 1)) {
             f->pos = c.idx;
             return (INT64)c.used;
         }
@@ -1535,7 +2099,7 @@ static INT64 do_getdents64(KPROC *p, LFILE *f, UINT8 *out, UINTN cap)
                     c.idx++;
                     continue;
                 }
-                if (!gd_put(&c, names[i], is_dev ? FALSE : (i == 0), 0x100 + i))
+                if (!gd_put(&c, names[i], is_dev ? 2 : (i == 0) ? 10 : 8, 0x100 + i))
                     break;
                 c.idx++;
             }
@@ -1548,10 +2112,60 @@ static INT64 do_getdents64(KPROC *p, LFILE *f, UINT8 *out, UINTN cap)
                 }
                 char num[16];
                 ksnprintf(num, sizeof(num), "%u", g_procs[i].pid);
-                if (!gd_put(&c, num, TRUE, 0x10000 + g_procs[i].pid))
+                if (!gd_put(&c, num, 4, 0x10000 + g_procs[i].pid))
                     break;
                 c.idx++;
             }
+        }
+
+    } else if (path_is(f->path, "/sys", NULL)) {
+
+        /* дети папки /sys/...: следующие элементы путей файлов (без повторов) */
+        UINTN plen = 0;
+
+        while (f->path[plen])
+            plen++;
+
+        for (UINTN i = 0; g_sys_files[i] && !c.full; i++) {
+
+            const char *rest;
+
+            if (!path_is(g_sys_files[i], f->path, &rest) || rest[0] != '/')
+                continue;
+
+            char name[64];
+            UINTN n = 0;
+
+            for (const char *q = rest + 1; *q && *q != '/' && n + 1 < sizeof(name); q++)
+                name[n++] = *q;
+
+            name[n] = '\0';
+
+            /* было ли такое имя у файла раньше в таблице */
+            BOOLEAN dup = FALSE;
+
+            for (UINTN j = 0; j < i && !dup; j++) {
+                const char *r2;
+                if (path_is(g_sys_files[j], f->path, &r2) && r2[0] == '/') {
+                    UINTN k = 0;
+                    while (name[k] && r2[1 + k] == name[k])
+                        k++;
+                    dup = (name[k] == '\0' && (r2[1 + k] == '/' || r2[1 + k] == '\0'));
+                }
+            }
+
+            if (dup)
+                continue;
+
+            if (c.idx < c.want) {
+                c.idx++;
+                continue;
+            }
+
+            if (!gd_put(&c, name, (rest[1 + n] == '\0') ? 8 : 4, 0x200 + i))
+                break;
+
+            c.idx++;
         }
 
     } else {
@@ -1797,9 +2411,10 @@ static INT64 do_readlink(KPROC *p, const char *path, UINT64 ubuf, UINT64 cap)
     target[0] = '\0';
 
     if (q != NULL && path_is(rest, "/exe", NULL)) {
-        ksnprintf(target, sizeof(target), "%s", (q->lx && q->lx->exe[0]) ? q->lx->exe : q->path);
+        lx_path_to_linux(p, (q->lx && q->lx->exe[0]) ? q->lx->exe : q->path, target,
+                         sizeof(target));
     } else if (q != NULL && path_is(rest, "/cwd", NULL)) {
-        ksnprintf(target, sizeof(target), "%s", q->cwd);
+        lx_path_to_linux(p, q->cwd, target, sizeof(target));
     } else if (q != NULL && path_is(rest, "/fd", &rest) && rest[0] == '/') {
         INT64 fd = 0;
         for (const char *s = rest + 1; *s >= '0' && *s <= '9'; s++)
@@ -1810,12 +2425,18 @@ static INT64 do_readlink(KPROC *p, const char *path, UINT64 ubuf, UINT64 cap)
         if (f->type == LF_PIPE_R || f->type == LF_PIPE_W)
             ksnprintf(target, sizeof(target), "pipe:[%llu]", (UINT64)(UINTN)f->pipe & 0xFFFFFF);
         else
-            ksnprintf(target, sizeof(target), "%s", f->path);
+            lx_path_to_linux(p, f->path, target, sizeof(target));
     } else {
-        /* символических ссылок у FAT нет */
+        /* символьная ссылка тома (ext4): её текст как есть */
         LX_STAT st;
         INTN r = do_stat_path(p, path, &st);
-        return (r < 0) ? r : -LX_EINVAL;
+        if (r < 0)
+            return r;
+        if ((st.mode & LX_S_IFMT) != LX_S_IFLNK)
+            return -LX_EINVAL;
+        r = vfs_readlink(path, target, sizeof(target));
+        if (r < 0)
+            return linux_errno(r);
     }
 
     UINTN n = 0;
@@ -2129,9 +2750,14 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
         UINT64 up = (nr == NR_openat) ? a[1] : a[0];
         UINT32 flags = (nr == NR_openat) ? (UINT32)a[2] :
                        (nr == NR_creat) ? (LX_O_CREAT | LX_O_WRONLY | LX_O_TRUNC) : (UINT32)a[1];
-        r = lx_resolve_path(p, dirfd, up, path, sizeof(path));
+        r = lx_resolve_path_ex(p, dirfd, up, !(flags & LX_O_NOFOLLOW), path, sizeof(path));
         if (r < 0)
             return r;
+        if (flags & LX_O_NOFOLLOW) {
+            LX_STAT st;
+            if (do_stat_path(p, path, &st) == 0 && (st.mode & LX_S_IFMT) == LX_S_IFLNK)
+                return -LX_ELOOP;
+        }
         return do_open(p, path, flags);
     }
 
@@ -2200,13 +2826,14 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
                     return -LX_EBADF;
                 r = do_stat_file(p, f, &st);
             } else {
-                r = lx_resolve_path(p, (INT64)a[0], a[1], path, sizeof(path));
+                r = lx_resolve_path_ex(p, (INT64)a[0], a[1], !(a[3] & LX_AT_SYMLINK_NOFOLLOW),
+                                       path, sizeof(path));
                 if (r == 0)
                     r = do_stat_path(p, path, &st);
             }
         } else {
             ubuf = a[1];
-            r = lx_resolve_path(p, LX_AT_FDCWD, a[0], path, sizeof(path));
+            r = lx_resolve_path_ex(p, LX_AT_FDCWD, a[0], nr != NR_lstat, path, sizeof(path));
             if (r == 0)
                 r = do_stat_path(p, path, &st);
         }
@@ -2227,7 +2854,8 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
                 return -LX_EBADF;
             r = do_stat_file(p, f, &st);
         } else {
-            r = lx_resolve_path(p, (INT64)a[0], a[1], path, sizeof(path));
+            r = lx_resolve_path_ex(p, (INT64)a[0], a[1], !(a[2] & LX_AT_SYMLINK_NOFOLLOW), path,
+                                   sizeof(path));
             if (r == 0)
                 r = do_stat_path(p, path, &st);
         }
@@ -2256,12 +2884,12 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
     case NR_readlink:
     case NR_readlinkat:
         if (nr == NR_readlink) {
-            r = lx_resolve_path(p, LX_AT_FDCWD, a[0], path, sizeof(path));
+            r = lx_resolve_path_ex(p, LX_AT_FDCWD, a[0], FALSE, path, sizeof(path));
             if (r < 0)
                 return r;
             return do_readlink(p, path, a[1], a[2]);
         }
-        r = lx_resolve_path(p, (INT64)a[0], a[1], path, sizeof(path));
+        r = lx_resolve_path_ex(p, (INT64)a[0], a[1], FALSE, path, sizeof(path));
         if (r < 0)
             return r;
         return do_readlink(p, path, a[2], a[3]);
@@ -2274,14 +2902,16 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
         return do_getdents64(p, f, (UINT8 *)(UINTN)a[1], (UINTN)a[2]);
 
     case NR_getcwd: {
+        char lcwd[VFS_PATH_MAX];
         UINTN n = 0;
-        while (p->cwd[n])
+        lx_path_to_linux(p, p->cwd, lcwd, sizeof(lcwd));
+        while (lcwd[n])
             n++;
         if (n + 1 > a[1])
             return -LX_ERANGE;
         if (!uptr_ok(p, a[0], n + 1, TRUE))
             return -LX_EFAULT;
-        memcpy((void *)(UINTN)a[0], p->cwd, n + 1);
+        memcpy((void *)(UINTN)a[0], lcwd, n + 1);
         return (INT64)(n + 1);
     }
 
@@ -2322,8 +2952,8 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
     case NR_unlinkat: {
         LX_STAT st;
         BOOLEAN want_dir = (nr == NR_rmdir) || (nr == NR_unlinkat && (a[2] & LX_AT_REMOVEDIR));
-        r = (nr == NR_unlinkat) ? lx_resolve_path(p, (INT64)a[0], a[1], path, sizeof(path))
-                                : lx_resolve_path(p, LX_AT_FDCWD, a[0], path, sizeof(path));
+        r = (nr == NR_unlinkat) ? lx_resolve_path_ex(p, (INT64)a[0], a[1], FALSE, path, sizeof(path))
+                                : lx_resolve_path_ex(p, LX_AT_FDCWD, a[0], FALSE, path, sizeof(path));
         if (r < 0)
             return r;
         r = do_stat_path(p, path, &st);
@@ -2342,13 +2972,13 @@ INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled)
     case NR_renameat:
     case NR_renameat2:
         if (nr == NR_rename) {
-            r = lx_resolve_path(p, LX_AT_FDCWD, a[0], path, sizeof(path));
+            r = lx_resolve_path_ex(p, LX_AT_FDCWD, a[0], FALSE, path, sizeof(path));
             if (r == 0)
-                r = lx_resolve_path(p, LX_AT_FDCWD, a[1], path2, sizeof(path2));
+                r = lx_resolve_path_ex(p, LX_AT_FDCWD, a[1], FALSE, path2, sizeof(path2));
         } else {
-            r = lx_resolve_path(p, (INT64)a[0], a[1], path, sizeof(path));
+            r = lx_resolve_path_ex(p, (INT64)a[0], a[1], FALSE, path, sizeof(path));
             if (r == 0)
-                r = lx_resolve_path(p, (INT64)a[2], a[3], path2, sizeof(path2));
+                r = lx_resolve_path_ex(p, (INT64)a[2], a[3], FALSE, path2, sizeof(path2));
         }
         if (r < 0)
             return r;

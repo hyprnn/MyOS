@@ -476,13 +476,14 @@ static INTN blk_add_partition(UINTN disk, UINT32 no, UINT64 start, UINT64 count,
     return idx;
 }
 
-/* Попробовать смонтировать FAT на устройстве (тихо, если не FAT) */
+/* Попробовать смонтировать FAT, exFAT или ext4 на устройстве (тихо,
+   если там что-то другое) */
 static void blk_try_mount(UINTN idx)
 {
     FAT_VOL v;
     const char *why = NULL;
 
-    if (!fat_probe(idx, &v, &why) && !exfat_detect(idx)) {
+    if (!fat_probe(idx, &v, &why) && !exfat_detect(idx) && !ext4_detect(idx)) {
         if (why != NULL)
             klog("blk: %s: not mounted - %s\n", g_blk[idx].name, why);
         return;
@@ -745,7 +746,9 @@ void storage_init(SIMPLE_TEXT_OUTPUT_INTERFACE *out)
             char ty[12];
             vfs_fs_name(&g_mounts[i], ty, sizeof(ty));
             kprintf(out, "  mounted /%s: %s, label \"%s\"%s\n",
-                    g_mounts[i].name, ty, g_mounts[i].fat.label,
+                    g_mounts[i].name, ty,
+                    (g_mounts[i].ops == &g_ext4_ops) ? ext4_label(&g_mounts[i])
+                                                     : g_mounts[i].fat.label,
                     g_mounts[i].readonly ? " (read-only)" : "");
         }
     }

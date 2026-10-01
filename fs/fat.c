@@ -1541,5 +1541,6 @@ const VFS_OPS g_fat_ops = {
     fat_rename,
     fat_statfs,
     NULL,                         /* close: нечего дописывать */
-    NULL                          /* open: считать не нужно */
+    NULL,                         /* open: считать не нужно */
+    NULL                          /* readlink: ссылок нет */
 };

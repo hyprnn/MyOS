@@ -838,6 +838,7 @@ typedef struct BLKDEV {
 #define VFS_ENOSYS      -13      /* эта файловая система так не умеет */
 #define VFS_EGONE       -14      /* диск вынули */
 #define VFS_EXDEV       -15      /* между разными дисками так нельзя */
+#define VFS_ELOOP       -16      /* слишком много символьных ссылок подряд */
 
 /* флаги vfs_open */
 #define VFS_O_READ      0x01u
@@ -868,7 +869,23 @@ typedef struct {
        шло по цепочке от начала файла (этап 10: иначе чтение большого
        файла кусками - квадратичное время). 0 - подсказки нет. */
     UINT32  hint_ci, hint_cl;
+    /* Файловые системы Unix (ext4, этап 11): номер inode, тип и права
+       как в Linux (S_IFDIR | 0755 ...), владелец, время. У FAT и
+       RAM-диска mode = 0 - "не знаю", слой Linux придумает сам. */
+    UINT32  ino;
+    UINT32  mode;
+    UINT32  uid, gid;
+    UINT32  nlink;
+    UINT32  rdev;                /* устройство (/dev в образе): major<<8 | minor */
+    INT64   mtime, atime, ctime; /* секунды с 1970 года */
 } VFS_NODE;
+
+/* Тип узла по mode (как S_ISLNK в Linux) */
+#define VFS_MODE_FMT   0170000u
+#define VFS_MODE_LNK   0120000u
+#define VFS_MODE_DIR   0040000u
+#define VFS_MODE_REG   0100000u
+#define VFS_IS_LINK(n) (((n)->mode & VFS_MODE_FMT) == VFS_MODE_LNK)
 
 /* Запись каталога для ls */
 typedef struct {
@@ -897,6 +914,9 @@ typedef struct {
     /* файл открыт (может быть NULL): tmpfs считает открытия, чтобы
        удалённый, но открытый файл дожил до последнего close */
     INTN (*open)(struct VFS_MOUNT *m, VFS_NODE *f);
+    /* символьная ссылка: куда ведёт (может быть NULL - ссылок нет);
+       возвращает длину без нуля в конце */
+    INTN (*readlink)(struct VFS_MOUNT *m, VFS_NODE *n, char *buf, UINTN cap);
 } VFS_OPS;
 
 /* Том FAT (fs/fat.c) */
@@ -931,6 +951,7 @@ typedef struct VFS_MOUNT {
     BOOLEAN        gone;         /* диск пропал - том мёртв */
     FAT_VOL        fat;          /* FAT; у exFAT - только метка и размеры */
     void          *xfs;          /* exFAT: том FatFs (fs/exfat.c) */
+    void          *e4;           /* ext4: том (fs/ext4.c) */
 } VFS_MOUNT;
 
 
@@ -2455,7 +2476,8 @@ typedef struct LXPROC {
     INT32          exit_signal;       /* сигнал родителю при выходе (SIGCHLD) */
     BOOLEAN        vfork_wait;        /* родитель ждёт execve/exit потомка */
     BOOLEAN        stopped_by_signal;
-    char           exe[VFS_PATH_MAX]; /* /proc/self/exe */
+    char           exe[VFS_PATH_MAX]; /* /proc/self/exe (путь MyOS) */
+    char           root[16];          /* том с корнем Linux ("" - нет: пути как в MyOS) */
     UINT64         itimer_real_at;    /* alarm/setitimer: когда SIGALRM (мс) */
     UINT64         itimer_real_iv;    /* ...и период (мс) */
 } LXPROC;
@@ -2493,6 +2515,11 @@ void lx_files_free(KPROC *p);
 void lfile_unref(LFILE *f);
 INT64 lx_file_syscall(KPROC *p, UINT64 nr, UINT64 *a, BOOLEAN *handled);
 INTN lx_resolve_path(KPROC *p, INT64 dirfd, UINT64 upath, char *out, UINTN cap);
+INTN lx_resolve_kpath(KPROC *p, INT64 dirfd, const char *kpath, BOOLEAN follow, char *out,
+                      UINTN cap);
+void lx_path_to_linux(KPROC *p, const char *my, char *out, UINTN cap);
+void lx_choose_root(KPROC *p);
+BOOLEAN lx_root_volume(char *out, UINTN cap);
 INTN lx_lookup_exec(KPROC *p, const char *path, char *real, UINTN cap);
 void lx_poll_wake(void);
 INTN lx_file_read_kernel(LFILE *f, void *buf, UINTN n, UINT64 off);
@@ -2508,6 +2535,16 @@ void binfs_mount(void);
 
 /* --- fs/tmpfs.c --- */
 void tmpfs_mount(void);
+
+/* --- fs/ext4.c (ext4, только чтение) --- */
+extern const VFS_OPS g_ext4_ops;
+BOOLEAN ext4_detect(UINTN dev);
+BOOLEAN ext4_mount(UINTN dev, VFS_MOUNT *m);
+void ext4_release(VFS_MOUNT *m);
+void ext4_info(const VFS_MOUNT *m, char *buf, UINTN cap);
+BOOLEAN ext4_uuid(const VFS_MOUNT *m, char *buf, UINTN cap);
+const char *ext4_label(const VFS_MOUNT *m);
+void ext4_cache_stats(UINT64 *hits, UINT64 *misses, UINTN *names);
 
 /* --- drivers/blk.c --- */
 extern BLKDEV g_blk[BLK_MAX];
@@ -2559,6 +2596,8 @@ void vfs_forget_dev(UINTN dev);
 const char *vfs_strerror(INTN e);
 INTN vfs_normalize(const char *path, char *out, UINTN cap);
 INTN vfs_stat(const char *path, VFS_DIRENT *out);
+INTN vfs_lstat(const char *path, VFS_DIRENT *out);
+INTN vfs_readlink(const char *path, char *buf, UINTN cap);
 INTN vfs_list(const char *path, INTN (*cb)(void *ctx, const VFS_DIRENT *e), void *ctx);
 INTN vfs_open(const char *path, UINT32 flags);
 INTN vfs_read(INTN fd, VOID *buf, UINTN n);

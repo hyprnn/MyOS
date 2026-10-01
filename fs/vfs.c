@@ -271,7 +271,8 @@ static const VFS_OPS g_ram_ops = {
     ram_rename,
     ram_statfs,
     NULL,                         /* close: нечего дописывать */
-    NULL                          /* open: считать не нужно */
+    NULL,                         /* open: считать не нужно */
+    NULL                          /* readlink: ссылок нет */
 };
 
 
@@ -315,16 +316,20 @@ INTN vfs_mount_dev(UINTN dev, const char *name)
 
     raw_zero_mem((volatile UINT8 *)m, sizeof(*m));
 
-    /* FAT16/32 - свой драйвер (fs/fat.c); exFAT - через FatFs */
-    BOOLEAN exfat = FALSE;
+    /* FAT16/32 - свой драйвер (fs/fat.c); ext4 - fs/ext4.c (только
+       чтение); exFAT - через FatFs */
+    UINTN kind = 0;                     /* 0 FAT, 1 exFAT, 2 ext4 */
 
     if (!fat_probe(dev, &m->fat, &why)) {
         raw_zero_mem((volatile UINT8 *)m, sizeof(*m));
-        if (!exfat_mount(dev, m)) {
+        if (ext4_mount(dev, m)) {
+            kind = 2;
+        } else if (exfat_mount(dev, m)) {
+            kind = 1;
+        } else {
             kmutex_unlock(&g_vfs_mutex);
             return VFS_EINVAL;
         }
-        exfat = TRUE;
     }
 
     UINTN k = 0;
@@ -335,18 +340,24 @@ INTN vfs_mount_dev(UINTN dev, const char *name)
     }
 
     m->name[k] = '\0';
-    if (!exfat)
+    if (kind == 0)
         m->ops = &g_fat_ops;
     m->dev = dev;
     m->dev_gen = g_blk[dev].gen;
-    m->readonly = !g_blk[dev].writable;
+    m->readonly = !g_blk[dev].writable || kind == 2;
     m->used = TRUE;
 
-    char ty[12];
-    vfs_fs_name(m, ty, sizeof(ty));
-    klog("vfs: /%s mounted: %s, %u clusters of %u bytes, label \"%s\"%s\n",
-         m->name, ty, m->fat.clusters, m->fat.cluster_bytes,
-         m->fat.label, m->readonly ? ", read-only" : "");
+    if (kind == 2) {
+        char info[96];
+        ext4_info(m, info, sizeof(info));
+        klog("vfs: /%s mounted: %s, read-only\n", m->name, info);
+    } else {
+        char ty[12];
+        vfs_fs_name(m, ty, sizeof(ty));
+        klog("vfs: /%s mounted: %s, %u clusters of %u bytes, label \"%s\"%s\n",
+             m->name, ty, m->fat.clusters, m->fat.cluster_bytes,
+             m->fat.label, m->readonly ? ", read-only" : "");
+    }
 
     kmutex_unlock(&g_vfs_mutex);
 
@@ -393,6 +404,7 @@ void vfs_forget_dev(UINTN dev)
         proc_forget_volume(m->name);
 
         exfat_release(m);
+        ext4_release(m);
         m->used = FALSE;
         m->gone = TRUE;
     }
@@ -447,6 +459,7 @@ const char *vfs_strerror(INTN e)
     case VFS_ENOSYS:    return "this file system cannot do that (the RAM disk has no folders)";
     case VFS_EGONE:     return "the disk was removed";
     case VFS_EXDEV:     return "cannot move between disks this way";
+    case VFS_ELOOP:     return "too many symbolic links";
     default:            return "error";
     }
 }
@@ -534,16 +547,25 @@ INTN vfs_normalize(const char *path, char *out, UINTN cap)
  *   *mount = -1 - это корень "/".
  * Если последнего элемента нет, но папка есть, - ENOENT, а parent и
  * leaf заполнены (так vfs_open и vfs_mkdir создают новое).
+ *
+ * Символьные ссылки (ext4, этап 11): ссылка в середине пути проходится
+ * всегда, последняя - если follow (lstat и readlink хотят саму
+ * ссылку). Ссылка "/usr/lib" - от корня ТОГО ЖЕ тома: для шелла MyOS
+ * раздел Linux - это /nvme0p2, и его "/" - это /nvme0p2. Слой Linux
+ * (kernel/lxfile.c) сам разбирает ссылки по правилам Linux и приходит
+ * сюда уже с путём без ссылок.
  */
-static INTN vfs_resolve(const char *path, INTN *mount, VFS_NODE *node,
-                        VFS_NODE *parent, char *leaf)
+static INTN vfs_resolve_ex(const char *path, BOOLEAN follow, INTN *mount, VFS_NODE *node,
+                           VFS_NODE *parent, char *leaf)
 {
     char norm[VFS_PATH_MAX];
     INTN r = vfs_normalize(path, norm, sizeof(norm));
+    UINTN hops = 0;
 
     if (r != VFS_OK)
         return r;
 
+restart:
     if (leaf)
         leaf[0] = '\0';
 
@@ -617,6 +639,39 @@ static INTN vfs_resolve(const char *path, INTN *mount, VFS_NODE *node,
             return r;
         }
 
+        if (VFS_IS_LINK(&cur) && m->ops->readlink != NULL && (norm[i] != '\0' || follow)) {
+
+            /* ссылка: новый путь = (папка, где ссылка | корень тома) +
+               куда ведёт ссылка + остаток пути; и разбираем заново */
+            char tgt[VFS_PATH_MAX];
+            char next[VFS_PATH_MAX * 2];
+
+            if (++hops > 16)
+                return VFS_ELOOP;
+
+            INTN n = m->ops->readlink(m, &cur, tgt, sizeof(tgt));
+
+            if (n <= 0)
+                return (n < 0) ? n : VFS_ENOENT;
+
+            if (tgt[0] == '/') {
+                ksnprintf(next, sizeof(next), "/%s%s%s", m->name, tgt, norm + i);
+            } else {
+                /* norm[0..s) - путь папки со ссылкой, с '/' в конце */
+                char saved = norm[s];
+                norm[s] = '\0';
+                ksnprintf(next, sizeof(next), "%s%s%s", norm, tgt, norm + i);
+                norm[s] = saved;
+            }
+
+            r = vfs_normalize(next, norm, sizeof(norm));
+
+            if (r != VFS_OK)
+                return r;
+
+            goto restart;
+        }
+
         if (leaf)
             for (UINTN k = 0; k <= len; k++)
                 leaf[k] = name[k];
@@ -630,19 +685,25 @@ static INTN vfs_resolve(const char *path, INTN *mount, VFS_NODE *node,
     return VFS_OK;
 }
 
+static INTN vfs_resolve(const char *path, INTN *mount, VFS_NODE *node, VFS_NODE *parent,
+                        char *leaf)
+{
+    return vfs_resolve_ex(path, TRUE, mount, node, parent, leaf);
+}
+
 
 /* ================================================================
  * Операции с путями
  * ================================================================ */
 
-INTN vfs_stat(const char *path, VFS_DIRENT *out)
+static INTN vfs_stat_ex(const char *path, BOOLEAN follow, VFS_DIRENT *out)
 {
     blk_sync_usb();
     kmutex_lock(&g_vfs_mutex);
 
     INTN mi;
     char leaf[VFS_NAME_MAX];
-    INTN r = vfs_resolve(path, &mi, &out->node, NULL, leaf);
+    INTN r = vfs_resolve_ex(path, follow, &mi, &out->node, NULL, leaf);
 
     if (r == VFS_OK) {
         UINTN k = 0;
@@ -655,6 +716,38 @@ INTN vfs_stat(const char *path, VFS_DIRENT *out)
                 out->name[k] = g_mounts[mi].name[k];
             out->name[k] = '\0';
         }
+    }
+
+    kmutex_unlock(&g_vfs_mutex);
+    return r;
+}
+
+INTN vfs_stat(const char *path, VFS_DIRENT *out)
+{
+    return vfs_stat_ex(path, TRUE, out);
+}
+
+/* Как vfs_stat, но последняя символьная ссылка - сама по себе (lstat) */
+INTN vfs_lstat(const char *path, VFS_DIRENT *out)
+{
+    return vfs_stat_ex(path, FALSE, out);
+}
+
+/* Куда ведёт символьная ссылка path. Длина или ошибка (EINVAL - не ссылка) */
+INTN vfs_readlink(const char *path, char *buf, UINTN cap)
+{
+    blk_sync_usb();
+    kmutex_lock(&g_vfs_mutex);
+
+    INTN mi;
+    VFS_NODE node;
+    INTN r = vfs_resolve_ex(path, FALSE, &mi, &node, NULL, NULL);
+
+    if (r == VFS_OK) {
+        if (mi < 0 || !VFS_IS_LINK(&node) || g_mounts[mi].ops->readlink == NULL)
+            r = VFS_EINVAL;
+        else
+            r = g_mounts[mi].ops->readlink(&g_mounts[mi], &node, buf, cap);
     }
 
     kmutex_unlock(&g_vfs_mutex);
@@ -953,7 +1046,7 @@ INTN vfs_close(INTN fd)
 /* Том на диске (FAT или exFAT), а не RAM-диск или /bin */
 BOOLEAN vfs_is_disk(const VFS_MOUNT *m)
 {
-    return m->ops == &g_fat_ops || m->ops == &g_exfat_ops;
+    return m->ops == &g_fat_ops || m->ops == &g_exfat_ops || m->ops == &g_ext4_ops;
 }
 
 /* "FAT32", "exFAT", "bin", "ram" - для ls / и df */
@@ -963,6 +1056,8 @@ void vfs_fs_name(const VFS_MOUNT *m, char *buf, UINTN cap)
         ksnprintf(buf, cap, "FAT%u", m->fat.fat_bits);
     else if (m->ops == &g_exfat_ops)
         ksnprintf(buf, cap, "exFAT");
+    else if (m->ops == &g_ext4_ops)
+        ksnprintf(buf, cap, "ext4");
     else if (m->ops == &g_bin_ops)
         ksnprintf(buf, cap, "bin");
     else

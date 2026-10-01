@@ -395,6 +395,7 @@ static const VFS_OPS g_tmp_ops = {
     t_statfs,
     t_close,
     t_open,
+    NULL,                         /* readlink: ссылок (пока) нет */
 };
 
 void tmpfs_mount(void)

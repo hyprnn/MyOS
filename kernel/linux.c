@@ -573,9 +573,11 @@ static INTN lx_load_program(KPROC *p, const char *path, LX_LOADINFO *li, const c
 
         char real[VFS_PATH_MAX];
 
-        /* путь интерпретатора - как видит его программа (/lib64/...);
-           на этапе 11 корень Linux ещё не подключён - ищем как есть */
-        ksnprintf(real, sizeof(real), "%s", interp);
+        /* путь интерпретатора - как видит его программа Linux
+           (/lib64/ld-linux-x86-64.so.2 -> ссылка lib64 -> usr/lib):
+           ищем в корне Linux, проходя ссылки */
+        if (lx_resolve_kpath(p, LX_AT_FDCWD, interp, TRUE, real, sizeof(real)) < 0)
+            ksnprintf(real, sizeof(real), "%s", interp);
         r = lx_load_one(p, real, TRUE, li, NULL, 0, why);
 
         if (r != VFS_OK) {
@@ -784,9 +786,12 @@ static UINTN split_args(const char *name, const char *args, char *out, UINTN cap
 static UINTN default_env(KPROC *p, char *out, UINTN cap, UINTN *len)
 {
     char line[VFS_PATH_MAX + 8];
+    /* домашняя папка: при корне Linux - в /tmp (раздел Linux только
+       для чтения, а программы пишут в ~ настройки и историю) */
+    BOOLEAN has_root = p->lx != NULL && p->lx->root[0] != '\0';
     const char *const envs[] = {
-        "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
-        "HOME=/ram",
+        "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        has_root ? "HOME=/tmp/root" : "HOME=/ram",
         "LANG=C.UTF-8",
         "USER=root",
         "LOGNAME=root",
@@ -811,7 +816,11 @@ static UINTN default_env(KPROC *p, char *out, UINTN cap, UINTN *len)
     out[n++] = '\0';
     envc++;
 
-    ksnprintf(line, sizeof(line), "PWD=%s", p->cwd);
+    {
+        char lcwd[VFS_PATH_MAX];
+        lx_path_to_linux(p, p->cwd, lcwd, sizeof(lcwd));
+        ksnprintf(line, sizeof(line), "PWD=%s", lcwd);
+    }
 
     for (UINTN k = 0; line[k] && n + 1 < cap; k++)
         out[n++] = line[k];
@@ -837,7 +846,17 @@ INTN linux_proc_start(KPROC *p, const char *path, const char *args, const char *
     p->lx->pgid = p->pid;
     p->lx->sid = p->pid;
     ksnprintf(p->lx->exe, sizeof(p->lx->exe), "%s", path);
+    lx_choose_root(p);
     lx_files_init(p);
+
+    if (p->lx->root[0] != '\0') {
+        vfs_mkdir("/tmp/root");             /* HOME (см. default_env) */
+        klog("linux: pid %u: Linux root is /%s\n", p->pid, p->lx->root);
+    }
+
+    /* путь программы, как его видит она сама (argv[0], AT_EXECFN) */
+    char lpath[VFS_PATH_MAX];
+    lx_path_to_linux(p, path, lpath, sizeof(lpath));
 
     LX_LOADINFO li;
     INTN r = lx_load_program(p, path, &li, why);
@@ -864,10 +883,10 @@ INTN linux_proc_start(KPROC *p, const char *path, const char *args, const char *
         while (strs[n0])
             n0++;
         UINTN pl = 0;
-        while (path[pl])
+        while (lpath[pl])
             pl++;
         if (pl + 1 + (len - n0 - 1) < sizeof(tmp)) {
-            memcpy(tmp, path, pl + 1);
+            memcpy(tmp, lpath, pl + 1);
             memcpy(tmp + pl + 1, strs + n0 + 1, len - n0 - 1);
             len = pl + 1 + (len - n0 - 1);
             memcpy(strs, tmp, len);
@@ -877,7 +896,7 @@ INTN linux_proc_start(KPROC *p, const char *path, const char *args, const char *
     UINTN envc = default_env(p, strs, 8192, &len);
     UINT64 sp = 0;
 
-    r = lx_build_stack(p, &li, strs, len, argc, envc, path, &sp);
+    r = lx_build_stack(p, &li, strs, len, argc, envc, lpath, &sp);
     kfree(strs);
 
     if (r != VFS_OK) {
@@ -1449,6 +1468,7 @@ static INT64 sys_clone(KPROC *p, UINT64 *f, UINT64 flags, UINT64 newsp, UINT64 p
     c->lx->sid = p->lx->sid;
     c->lx->exit_signal = (INT32)(flags & 0xFFu);
     ksnprintf(c->lx->exe, sizeof(c->lx->exe), "%s", p->lx->exe);
+    ksnprintf(c->lx->root, sizeof(c->lx->root), "%s", p->lx->root);
     lx_files_fork(p, c);
 
     if (!uvm_fork(p, c)) {
@@ -1862,14 +1882,17 @@ static INT64 sys_execve(KPROC *p, INT64 dirfd, UINT64 upath, UINT64 uargv, UINT6
             ksnprintf(opt, sizeof(opt), "%s", o);
         }
 
-        /* новый argv: interp [opt] путь argv[1..] */
+        /* новый argv: interp [opt] путь argv[1..] (путь - как его
+           видит Linux: интерпретатор откроет его сам) */
         char *na = (char *)kmalloc(LX_MAX_ARGS);
         if (na == NULL) {
             r = -LX_ENOMEM;
             break;
         }
+        char lreal[VFS_PATH_MAX];
+        lx_path_to_linux(p, real, lreal, sizeof(lreal));
         UINTN nl = 0, nc = 0;
-        const char *parts[3] = { interp, opt[0] ? opt : NULL, real };
+        const char *parts[3] = { interp, opt[0] ? opt : NULL, lreal };
         for (UINTN k = 0; k < 3; k++) {
             if (parts[k] == NULL)
                 continue;
@@ -1900,7 +1923,8 @@ static INT64 sys_execve(KPROC *p, INT64 dirfd, UINT64 upath, UINT64 uargv, UINT6
         argc = nc;
 
         ksnprintf(path, sizeof(path), "%s", interp);
-        ksnprintf(real, sizeof(real), "%s", interp);
+        if (lx_resolve_kpath(p, LX_AT_FDCWD, interp, TRUE, real, sizeof(real)) < 0)
+            ksnprintf(real, sizeof(real), "%s", interp);
     }
 
     if (r != 0) {
@@ -1951,9 +1975,11 @@ static INT64 sys_execve(KPROC *p, INT64 dirfd, UINT64 upath, UINT64 uargv, UINT6
         if (all == NULL) {
             lr = VFS_ENOSPC;
         } else {
+            char lreal[VFS_PATH_MAX];
+            lx_path_to_linux(p, real, lreal, sizeof(lreal));
             memcpy(all, args, alen);
             memcpy(all + alen, envs, elen);
-            lr = lx_build_stack(p, &li, all, alen + elen, argc, envc, real, &sp);
+            lr = lx_build_stack(p, &li, all, alen + elen, argc, envc, lreal, &sp);
             kfree(all);
         }
     }
@@ -2543,6 +2569,15 @@ static INT64 lx_dispatch(KPROC *p, UINT64 *f, UINT64 nr, UINT64 *a)
 
     case NR_memfd_create:
         return -LX_ENOSYS;
+
+    /* расширенные атрибуты (xattr: ACL, SELinux): у нас их нет - как
+       у файловой системы без xattr ("не поддерживается"); ls -l и cp
+       спрашивают и спокойно идут дальше */
+    case 188: case 189: case 190:       /* setxattr, lsetxattr, fsetxattr */
+    case 191: case 192: case 193:       /* getxattr, lgetxattr, fgetxattr */
+    case 194: case 195: case 196:       /* listxattr ... */
+    case 197: case 198: case 199:       /* removexattr ... */
+        return -LX_EOPNOTSUPP;
     }
 
     if (nr < sizeof(g_lx_unknown_said) && !g_lx_unknown_said[nr]) {

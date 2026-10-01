@@ -132,7 +132,10 @@ class VM:
             '"': 'shift-apostrophe', "'": 'apostrophe', '~': 'shift-grave_accent',
             '(': 'shift-9', ')': 'shift-0', '+': 'shift-equal', '!': 'shift-1',
             '?': 'shift-slash', '%': 'shift-5', '&': 'shift-7', '>': 'shift-dot',
-            '<': 'shift-comma', '|': 'shift-backslash', '#': 'shift-3', '$': 'shift-4'}
+            '<': 'shift-comma', '|': 'shift-backslash', '#': 'shift-3', '$': 'shift-4',
+            ';': 'semicolon', '\\': 'backslash', '[': 'bracket_left', ']': 'bracket_right',
+            '{': 'shift-bracket_left', '}': 'shift-bracket_right', '@': 'shift-2',
+            '^': 'shift-6', '`': 'grave_accent'}
 
     def type(self, text):
         for ch in text:

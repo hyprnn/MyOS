@@ -19,6 +19,7 @@ tools/fatimg.py - образы дисков с FAT для автотеста MyO
     python3 tools/fatimg.py check disk.img        # проверить все разделы
     python3 tools/fatimg.py ls disk.img /myos     # посмотреть папку
 """
+import os
 import struct, sys, uuid, zlib
 
 SECTOR = 512
@@ -275,6 +276,59 @@ def make_disk(path, total_mib, part_bytes, scheme='mbr', gpt_type='basic'):
         img[(total - 33) * SECTOR:(total - 33) * SECTOR + len(ents)] = ents
         img[(total - 1) * SECTOR:(total - 1) * SECTOR + 92] = header(total - 1, 1, total - 33)
     open(path, 'wb').write(img)
+
+
+def gpt_wrap(path, part_path, gpt_type, name='MyOS test'):
+    """Диск path: GPT и один раздел с сектора 2048, содержимое - файл
+    part_path (большой - например, ext4 с корнем Linux на сотни МиБ:
+    поэтому без чтения в память, а копированием кусками и с "дырами")."""
+    psize = os.path.getsize(part_path)
+    start = 2048
+    count = (psize + SECTOR - 1) // SECTOR
+    total = start + count + 2048
+    types = {'basic': 'EBD0A0A2-B9E5-4433-87C0-68B6B72699C7',
+             'efi': 'C12A7328-F81F-11D2-BA4B-00A0C93EC93B',
+             'linux': '0FC63DAF-8483-4772-8E79-3D69D8477DE4'}
+    ents = bytearray(128 * 128)
+    ents[0:16] = uuid.UUID(types[gpt_type]).bytes_le
+    ents[16:32] = uuid.uuid4().bytes_le
+    struct.pack_into('<QQQ', ents, 32, start, start + count - 1, 0)
+    ents[56:56 + 2 * len(name)] = name.encode('utf-16-le')
+    ecrc = zlib.crc32(ents) & 0xFFFFFFFF
+
+    def header(my, alt, ent_lba):
+        h = bytearray(92)
+        h[0:8] = b'EFI PART'
+        struct.pack_into('<IIIIQQQQ16sQIII', h, 8, 0x00010000, 92, 0, 0, my, alt,
+                         34, total - 34, uuid.uuid4().bytes_le, ent_lba, 128, 128, ecrc)
+        struct.pack_into('<I', h, 16, zlib.crc32(h) & 0xFFFFFFFF)
+        return h
+    mbr = bytearray(SECTOR)
+    e = bytearray(16)
+    e[4] = 0xEE
+    struct.pack_into('<II', e, 8, 1, min(total - 1, 0xFFFFFFFF))
+    mbr[446:462] = e
+    mbr[510], mbr[511] = 0x55, 0xAA
+    with open(path, 'wb') as f:
+        f.truncate(total * SECTOR)
+        f.seek(0)
+        f.write(mbr)
+        f.write(header(1, total - 1, 2) + bytes(SECTOR - 92))
+        f.write(ents)
+        f.seek((total - 33) * SECTOR)
+        f.write(ents)
+        f.seek((total - 1) * SECTOR)
+        f.write(header(total - 1, 1, total - 33))
+        with open(part_path, 'rb') as src:
+            off = start * SECTOR
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                if chunk.count(0) != len(chunk):      # нули - "дыра", не пишем
+                    f.seek(off)
+                    f.write(chunk)
+                off += len(chunk)
 
 
 # ----------------------------------------------------------------- чтение
