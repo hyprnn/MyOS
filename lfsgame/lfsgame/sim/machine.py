@@ -17,6 +17,7 @@ from .vfs import (FsError, file_node, link_node, mkdir_node, normpath, now, spli
                   tree_size)
 
 HOSTNAME = "host"
+CORES = 8
 HOST_FS_BASE_USED = int(11.2 * dk.GiB)  # the host OS itself (not modelled file by file)
 
 ROOT_ENV = {
@@ -60,6 +61,14 @@ ver_check Xz        xz   5.0.0
 ver_check Kernel    uname 5.4
 """
 
+BASH_BASHRC = """# /etc/bash.bashrc: system-wide settings of the host distribution,
+# read by every interactive non-login bash.
+alias ls='ls --color=auto'
+# use the distributed compile farm at the office (needs network + distccd)
+export CC="distcc gcc"
+export CXX="distcc g++"
+"""
+
 TOOL_ALIASES = {"sort": "coreutils", "ld": "binutils", "diff": "diffutils", "find": "findutils",
                 "python3": "python", "texi2any": "texinfo", "uname": "kernel"}
 
@@ -73,7 +82,7 @@ class Res(NamedTuple):
 
 class Machine:
     FIELDS = ("disks", "fs", "mounts", "swaps", "users", "groups", "user", "env", "cwd",
-              "umask", "su_stack", "dirstack", "flags", "glitch_file")
+              "umask", "su_stack", "dirstack", "flags", "glitch_file", "clock")
 
     def __init__(self):
         self.disks: Dict[str, dict] = {}
@@ -90,6 +99,7 @@ class Machine:
         self.dirstack: List[str] = []
         self.flags: List[str] = []
         self.glitch_file = ""
+        self.clock = 0.0                       # simulated seconds spent (make, tar, ...)
         self.last_status = 0
         self.rng = random.Random()
 
@@ -164,6 +174,7 @@ class Machine:
             c["var"]["c"][name] = mkdir_node()
         etc = c["etc"]["c"]
         etc["hostname"] = file_node(HOSTNAME + "\n")
+        etc["bash.bashrc"] = file_node(BASH_BASHRC)
         etc["os-release"] = file_node('NAME="Host Linux"\nPRETTY_NAME="Host Linux (simulated)"\n'
                                       'ID=hostlinux\n')
         etc["fstab"] = file_node("# <device>  <dir>  <type>  <options>  <dump> <pass>\n"
@@ -188,6 +199,8 @@ class Machine:
         for k in cls.FIELDS:
             if k in data:
                 want = type(getattr(m, k))
+                if want is float and isinstance(data[k], int):
+                    data = dict(data, **{k: float(data[k])})
                 if not isinstance(data[k], want) or isinstance(data[k], bool):
                     raise ValueError(f"machine.{k}: expected {want.__name__}")
                 setattr(m, k, copy.deepcopy(data[k]))
@@ -199,7 +212,14 @@ class Machine:
             raise ValueError("machine has no root filesystem")
         if m.user not in m.users:
             raise ValueError("unknown current user")
+        m.upgrade()
         return m
+
+    def upgrade(self):
+        """Bring machines from older saves up to date (new host files etc.)."""
+        etc = self.fs["/dev/sda2"]["root"]["c"].get("etc", {}).get("c")
+        if etc is not None and "bash.bashrc" not in etc and "bash.bashrc.NOUSE" not in etc:
+            etc["bash.bashrc"] = file_node(BASH_BASHRC)
 
     # ------------------------------------------------------------ session
     @property
@@ -211,10 +231,26 @@ class Machine:
 
     def prompt(self) -> str:
         cwd = self.cwd
-        h = self.home()
+        h = self.env.get("HOME") or self.home()
         if h != "/" and (cwd == h or cwd.startswith(h + "/")):
             cwd = "~" + cwd[len(h):]
-        return f"{self.user}@{HOSTNAME}:{cwd}{'#' if self.is_root else '$'} "
+        sign = "#" if self.is_root else "$"
+        ps1 = self.env.get("PS1")
+        if not ps1:
+            return f"{self.user}@{HOSTNAME}:{cwd}{sign} "
+        out, i = [], 0
+        while i < len(ps1):
+            c = ps1[i]
+            if c == "\\" and i + 1 < len(ps1):
+                e = ps1[i + 1]
+                out.append({"u": self.user, "h": HOSTNAME, "H": HOSTNAME, "w": cwd,
+                            "W": cwd.rstrip("/").rsplit("/", 1)[-1] or "/", "$": sign,
+                            "\\": "\\", "[": "", "]": "", "n": " "}.get(e, "\\" + e))
+                i += 2
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
 
     def flag(self, name: str):
         if name not in self.flags:
@@ -351,6 +387,10 @@ class Machine:
 
     def write_file(self, path: str, data: str, append: bool = False, **extra) -> dict:
         r = self.resolve(path)
+        if r.node is not None and r.node["t"] == "b":
+            if r.path == "/dev/null":
+                return r.node
+            raise FsError("writing to raw devices is not simulated")
         if r.node is not None:
             if r.node["t"] == "d":
                 raise FsError("Is a directory")
@@ -372,9 +412,10 @@ class Machine:
         r.parent["c"][r.name] = node
         return node
 
-    def put_blob(self, path: str, size: int, md5: str, partial: bool = False) -> dict:
+    def put_blob(self, path: str, size: int, md5: str, partial: bool = False,
+                 data: str = "") -> dict:
         """Create/replace a downloaded file (contents are not modelled, only size + checksum)."""
-        node = self.write_file(path, "")
+        node = self.write_file(path, data)
         node["size"] = size
         node["md5"] = md5
         if partial:

@@ -62,7 +62,24 @@ PACKAGES: List[Package] = [
     Package("xz", "xz-5.6.2.tar.xz", "https://github.com/tukaani-project/xz/releases/download/v5.6.2/xz-5.6.2.tar.xz", int(1.3 * _M)),
     Package("zlib", "zlib-1.3.1.tar.gz", "https://zlib.net/fossils/zlib-1.3.1.tar.gz", int(1.5 * _M)),
     Package("zstd", "zstd-1.5.6.tar.gz", "https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz", int(2.3 * _M)),
+    Package("glibc-fhs-patch", "glibc-2.40-fhs-1.patch",
+            "https://www.linuxfromscratch.org/patches/lfs/12.2/glibc-2.40-fhs-1.patch", 3_011),
 ]
+
+# Patches are text files: their contents matter to the 'patch' command.
+PATCH_TEXT = {
+    "glibc-2.40-fhs-1.patch": (
+        "Submitted By:            (simulated)\n"
+        "Description:             Moves the nss_db and nscd files to FHS compliant\n"
+        "                         locations (/var/lib/nss_db instead of /var/db).\n"
+        "lfsgame-patch: glibc-fhs\n"
+        "diff -Naur glibc-2.40.orig/Makeconfig glibc-2.40/Makeconfig\n"
+        "--- glibc-2.40.orig/Makeconfig\n"
+        "+++ glibc-2.40/Makeconfig\n"
+        "@@ -1 +1 @@\n"
+        "-vardbdir = $(localstatedir)/db\n"
+        "+vardbdir = $(localstatedir)/lib/nss_db\n"),
+}
 
 BY_FILE: Dict[str, Package] = {p.file: p for p in PACKAGES}
 BY_URL: Dict[str, Package] = {p.url: p for p in PACKAGES}

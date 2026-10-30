@@ -156,7 +156,8 @@ def _wget(ctx, args):
             if kind == "list":
                 m.write_file(dest, data)
             else:
-                m.put_blob(dest, size, pk.fake_md5(what.file))
+                m.put_blob(dest, size, pk.fake_md5(what.file),
+                           data=pk.PATCH_TEXT.get(what.file, ""))
         except FsError as exc:
             ctx.write(f"{dest}: {exc}\nCannot write to ‘{dest}’ ({exc}).\n", "err")
             failed += 1

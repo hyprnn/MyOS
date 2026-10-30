@@ -20,7 +20,7 @@ class CommandTests(unittest.TestCase):
 
     def test_bad_quotes(self):
         self.assertEqual(self.c.run('echo "x'), 2)
-        self.assertIn("unexpected EOF", self.c.text())
+        self.assertIn("unexpected end of file", self.c.text())
 
     def test_empty(self):
         self.c.run("   ")
@@ -58,7 +58,7 @@ class CommandTests(unittest.TestCase):
 
     def test_tasks_and_hint(self):
         self.c.run("tasks")
-        self.assertIn("0/12", self.c.text())
+        self.assertIn("0/21", self.c.text())
         self.c.run("hint")
         self.assertIn("lsblk", self.c.text())
 
@@ -118,8 +118,16 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("ERROR", self.c.text())
         self.assertEqual(self.c.text().count("OK:"), 21)
 
-    def test_pipes_rejected(self):
-        self.assertEqual(self.c.run("ls | wc"), 2)
+    def test_pipes(self):
+        self.c.run("printf_missing | wc -l")
+        self.assertIn("command not found", self.c.errors())
+        self.c.run("cat /etc/passwd | grep root | wc -l")
+        self.assertEqual(self.c.text(), "1\n")
+        self.assertEqual(self.c.run("echo abc | grep -q x"), 1)
+        self.assertEqual(self.c.run("! echo abc | grep -q x"), 0)
+
+    def test_background_rejected(self):
+        self.assertEqual(self.c.run("ls &"), 2)
         self.assertIn("not supported", self.c.errors())
 
 

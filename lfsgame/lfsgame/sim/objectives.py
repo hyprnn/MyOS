@@ -94,6 +94,65 @@ def _owner_ok(m: Machine) -> bool:
     return all(_node(m, f"{LFS}/{d}")["u"] == "lfs" for d in LAYOUT_DIRS)
 
 
+TGT = "x86_64-lfs-linux-gnu"
+TOOLS = f"{LFS}/tools"
+GCCLIB = f"{TOOLS}/lib/gcc/{TGT}/14.2.0"
+
+
+def _exists(m: Machine, path: str, kind: Optional[str] = None) -> bool:
+    n = _node(m, path)
+    return n is not None and (kind is None or n["t"] == kind)
+
+
+def _lfs_env_ok(m: Machine) -> bool:
+    e = m.env
+    return (m.user == "lfs" and e.get("LFS") == LFS and e.get("LFS_TGT") == TGT
+            and e.get("PATH", "").split(":")[0] == f"{TOOLS}/bin" and e.get("LC_ALL") == "POSIX"
+            and "CC" not in e and "CXX" not in e and m.umask == 0o022)
+
+
+def _limits_ok(m: Machine) -> bool:
+    n = _node(m, f"{GCCLIB}/include/limits.h")
+    if n is None or n["t"] != "f":
+        return False
+    d = n.get("data", "")
+    return all(k in d for k in ("LIMITX", "GLIMITS", "LIMITY")) and \
+        d.index("LIMITX") < d.index("GLIMITS") < d.index("LIMITY")
+
+
+def _headers_ok(m: Machine) -> bool:
+    inc = _node(m, f"{LFS}/usr/include")
+    if inc is None or not _exists(m, f"{LFS}/usr/include/linux/version.h", "f"):
+        return False
+
+    def clean(node):
+        for name, ch in node["c"].items():
+            if ch["t"] == "d" and not clean(ch):
+                return False
+            if ch["t"] == "f" and not name.endswith(".h"):
+                return False
+        return True
+    return clean(inc)
+
+
+def _glibc_ok(m: Machine) -> bool:
+    if not _exists(m, f"{LFS}/usr/lib/libc.so.6", "f"):
+        return False
+    for link in (f"{LFS}/lib64/ld-linux-x86-64.so.2", f"{LFS}/lib64/ld-lsb-x86-64.so.3"):
+        n = _node(m, link, follow=False)
+        if n is None or n["t"] != "l":
+            return False
+    ldd = _node(m, f"{LFS}/usr/bin/ldd")
+    return ldd is not None and 'RTLDLIST="/lib/' in ldd.get("data", "") and m.has_flag("glibc_fhs")
+
+
+def _libstdcxx_ok(m: Machine) -> bool:
+    return (_exists(m, f"{LFS}/usr/lib/libstdc++.so.6.0.33", "f")
+            and _exists(m, f"{TOOLS}/{TGT}/include/c++/14.2.0/iostream", "f")
+            and not any(_exists(m, f"{LFS}/usr/lib/{la}") for la in
+                        ("libstdc++.la", "libstdc++exp.la", "libstdc++fs.la", "libsupc++.la")))
+
+
 OBJECTIVES: List[Objective] = [
     Objective("explore", "Find the empty disk meant for LFS (lsblk or fdisk -l)", "2.4",
               "Type 'lsblk'. Which disk has no partitions at all?",
@@ -136,6 +195,45 @@ OBJECTIVES: List[Objective] = [
     Objective("su", "Log in as lfs: su - lfs", "4.3",
               "su - lfs   (type 'exit' to return to root)",
               lambda m: m.has_flag("su_lfs")),
+    Objective("bashrc", "As root, move the host's /etc/bash.bashrc out of the way", "4.4",
+              "exit (back to root), then: [ ! -e /etc/bash.bashrc ] || "
+              "mv -v /etc/bash.bashrc /etc/bash.bashrc.NOUSE",
+              lambda m: not _exists(m, "/etc/bash.bashrc")),
+    Objective("lfsenv", "Give lfs a clean build environment (.bash_profile + .bashrc)", "4.4",
+              "as lfs: write ~/.bash_profile and ~/.bashrc as in book 4.4, then: "
+              "source ~/.bash_profile",
+              _lfs_env_ok),
+    Objective("makeflags", "Optional: build in parallel (MAKEFLAGS=-j$(nproc))", "4.4",
+              "cat >> ~/.bashrc << \"EOF\" / export MAKEFLAGS=-j$(nproc) / EOF, then "
+              "source ~/.bash_profile",
+              lambda m: m.env.get("MAKEFLAGS", "").startswith("-j"), optional=True),
+    Objective("binutils1", "Build and install Binutils pass 1", "5.2",
+              "cd $LFS/sources; tar -xf binutils-2.43.1.tar.xz; cd binutils-2.43.1; "
+              "mkdir -v build; cd build; ../configure ... (book 5.2)",
+              lambda m: _exists(m, f"{TOOLS}/bin/{TGT}-ld", "f")
+              and _exists(m, f"{TOOLS}/{TGT}/bin/as", "f")),
+    Objective("gcc1", "Build and install GCC pass 1", "5.3",
+              "unpack gcc, put mpfr/gmp/mpc inside it, build in gcc-14.2.0/build (book 5.3)",
+              lambda m: _exists(m, f"{TOOLS}/bin/{TGT}-gcc", "f")),
+    Objective("limits", "Create the full internal limits.h of GCC", "5.3",
+              "cd .. (to gcc-14.2.0), then the 'cat gcc/limitx.h ... > .../limits.h' "
+              "command from book 5.3",
+              _limits_ok),
+    Objective("headers", "Install the Linux API headers into $LFS/usr/include", "5.4",
+              "tar -xf linux-6.10.5.tar.xz; cd linux-6.10.5; make mrproper; make headers; "
+              "find usr/include -type f ! -name '*.h' -delete; cp -rv usr/include $LFS/usr",
+              _headers_ok),
+    Objective("glibc", "Build and install Glibc (FHS patch, DESTDIR=$LFS, ldd fix)", "5.5",
+              "symlinks in $LFS/lib64, patch -Np1 -i ../glibc-2.40-fhs-1.patch, build dir, "
+              "configure, make, make DESTDIR=$LFS install, sed on ldd (book 5.5)",
+              _glibc_ok),
+    Objective("sanity", "Sanity check: compile a test program with the cross toolchain", "5.5",
+              "echo 'int main(){}' | $LFS_TGT-gcc -xc -   then   readelf -l a.out | grep ld-linux",
+              lambda m: m.has_flag("sanity_ok")),
+    Objective("libstdcxx", "Build and install Libstdc++ (and remove the .la files)", "5.6",
+              "fresh gcc tree, build dir, ../libstdc++-v3/configure ..., make, "
+              "make DESTDIR=$LFS install, rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la",
+              _libstdcxx_ok),
 ]
 
 BY_ID = {o.id: o for o in OBJECTIVES}

@@ -5,6 +5,8 @@ Files: lfsgame/book/content/*.txt, read in file-name order. Markup (one per line
   @section ID | Title      start a new section (ID like "2.4")
   ## text                  sub-heading
   $ command                shell command (clickable in the reader: pastes into the terminal)
+  + text                   continuation line of the previous command (here-docs, long
+                           configure lines); "+" alone is an empty continuation line
   > text                   preformatted output / example
   ! text                   note / warning
   - text                   bullet item
@@ -61,6 +63,12 @@ def parse(text: str, chapter: str = "") -> List[Section]:
         elif not line.strip():
             flush()
         else:
+            if line.startswith("+ ") or line == "+":
+                blocks = sections[-1].blocks
+                if para or not blocks or blocks[-1][0] != "cmd":
+                    raise BookError(f"line {lineno}: '+' continuation without a '$' command")
+                blocks[-1] = ("cmd", blocks[-1][1] + "\n" + line[2:])
+                continue
             if line.startswith("## "):
                 kind, body = "h2", line[3:]
             elif line[:2] in MARKERS:

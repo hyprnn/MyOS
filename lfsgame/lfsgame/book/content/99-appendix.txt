@@ -4,21 +4,25 @@
 This shell imitates bash, but only a part of it.
 
 ## Supported
-- Quotes 'single' and "double", backslash escapes, # comments.
-- Variables: $NAME, ${NAME}, $? (status of the last command), ~ for the home directory.
+- Quotes 'single' and "double", backslash escapes, # comments. A line ending in a backslash continues on the next line.
+- Variables: $NAME, ${NAME}, $? (status of the last command), ~ for the home directory. NAME=value sets a variable; export makes it part of the environment.
+- Command substitution: $(command) and `command`.
 - Brace expansion {a,b} (also nested) and globs * ? [abc].
-- Several commands on one line: a ; b, a && b (b only if a succeeded), a || b (b only if a failed).
-- Output redirection: > file and >> file.
+- Several commands: a ; b, a && b (b only if a succeeded), a || b (b only if a failed), pipes a | b.
+- Redirection: > file, >> file, < file, and here-documents (cat > file << "EOF" ... EOF).
+- if ...; then ...; elif ...; then ...; else ...; fi and for NAME in WORDS; do ...; done.
+- Unfinished input (open quote, missing fi, a here-document) gives a "> " prompt for more lines.
 
 ## Not supported
-- Pipes (|), input redirection (<), background jobs (&).
-- Command substitution $(...), loops, if, functions.
+- case, while, functions, subshells ( ), background jobs (&), 2> redirections.
 
 ## Useful commands
-- Files: ls -l, cat, mkdir -p, touch, rm -r, ln -s, chmod, chown, cp, mv, pushd/popd.
+- Files: ls -l, cat, mkdir -p, touch, rm -r, ln -s, chmod, chown, cp -r, mv, pushd/popd, find.
+- Text: grep, sed, wc, head, tail, echo.
 - Disks: lsblk -f, blkid, fdisk -l, fdisk DEVICE, mkfs, mkswap, swapon, mount, umount, df -h, free -h.
 - Network: wget, md5sum -c.
-- Users: groupadd, useradd, passwd, su, whoami, id, exit.
+- Building: tar -xf, patch, make, readelf, time, nproc.
+- Users and shells: groupadd, useradd, passwd, su, whoami, id, env, source, exit.
 - Game: tasks, hint, book, save, menu.
 
 $ help

@@ -1,125 +1,418 @@
-"""Tokenize and expand a command line. Pure, no tkinter.
+"""Tokenize, parse and expand shell input. Pure, no tkinter.
 
-Supported: 'single' "double" \\escapes, # comments, ; && || > >>, $VAR ${VAR} $? $$,
-~ and ~user, brace expansion {a,b} (nested, e.g. usr{,/*}), globs * ? [..].
-Not supported (reported as errors): pipes |, <, background &, $(...), loops.
+Supported: 'single' "double" \\escapes and \\<newline> continuation, # comments,
+; && || | newlines, > >> < redirections, here-documents (<< and <<-, quoted or not),
+$VAR ${VAR} $? $$, $(...) and `...` command substitution, ~ and ~user,
+brace expansion {a,b} (nested), globs * ? [..], word splitting of unquoted expansions,
+compound commands: if/elif/else/fi, for NAME in WORDS; do ...; done, ! pipeline.
+Not supported: case, while/until, functions, subshells ( ), background &, 2>.
 
-A word is kept as a list of (char, quote) pairs until expansion so we know which
-characters were quoted. quote: None (bare), "'" / "\\" (literal), '"' (double), "v" (came
-from a variable — not brace/glob expanded).
+Incomplete input (open quote, trailing backslash or |/&&, missing fi/done, here-doc
+without its terminator) raises ``Incomplete`` so an interactive shell can ask for more
+lines with a "> " prompt, like bash does.
+
+A word is kept as a list of (text, quote) pairs until expansion. quote: None (bare),
+"'" / "\\" (literal), '"' (double quoted), "S"/"SQ" (command substitution outside/inside double quotes, text = command),
+"v" (expansion result, quoted), "u" (expansion result, unquoted: subject to splitting).
 """
 from __future__ import annotations
 
 import fnmatch
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 Chars = List[Tuple[str, Optional[str]]]
-OPS = ("&&", "||", ">>", ";", "|", ">", "<", "&")
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+OPCHARS = ";&|<>"
+RESERVED = {"then", "elif", "else", "fi", "do", "done"}
 
 
 class ParseError(Exception):
     pass
 
 
+class Incomplete(ParseError):
+    """More input is needed (bash would show the PS2 '> ' prompt)."""
+
+
+@dataclass
+class HereDoc:
+    delim: str
+    quoted: bool
+    strip_tabs: bool
+    body: Optional[str] = None
+
+
 @dataclass
 class Simple:
     words: List[Chars] = field(default_factory=list)
-    redirs: List[Tuple[str, Chars]] = field(default_factory=list)
-    conn: Optional[str] = None  # operator before this command: None, ";", "&&", "||"
+    redirs: List[Tuple[str, Union[Chars, HereDoc]]] = field(default_factory=list)
 
 
-def tokenize(line: str) -> List[Tuple[str, object]]:
-    toks: List[Tuple[str, object]] = []
-    cur: Optional[Chars] = None
-    i, n = 0, len(line)
+@dataclass
+class Pipeline:
+    cmds: List[Simple]
+    negate: bool = False
 
-    def flush():
-        nonlocal cur
-        if cur is not None:
-            toks.append(("word", cur))
-            cur = None
 
-    while i < n:
-        c = line[i]
-        if c in " \t\n":
-            flush()
-            i += 1
-        elif c == "#" and cur is None:
-            break
-        elif c in ";&|<>":
-            flush()
-            op = line[i:i + 2] if line[i:i + 2] in OPS else c
-            toks.append(("op", op))
-            i += len(op)
-        elif c == "'":
-            j = line.find("'", i + 1)
-            if j < 0:
-                raise ParseError("unexpected EOF while looking for matching `''")
-            cur = (cur or []) + [(ch, "'") for ch in line[i + 1:j]]
-            i = j + 1
-        elif c == '"':
-            cur = cur or []
-            i += 1
+@dataclass
+class If:
+    clauses: list            # [(cond CmdList, body CmdList), ...]
+    else_body: Optional[list] = None
+
+
+@dataclass
+class For:
+    var: str
+    words: Optional[List[Chars]]
+    body: list
+
+
+Node = Union[Simple, Pipeline, If, For]
+CmdList = List[Tuple[Optional[str], Node]]   # (connector before: None ; && ||, node)
+
+
+# ---------------------------------------------------------------- lexer
+class _Lexer:
+    def __init__(self, text: str):
+        self.s = text
+        self.i = 0
+        self.toks: list = []
+        self.pending: List[HereDoc] = []
+
+    def run(self):
+        s, n = self.s, len(self.s)
+        while self.i < n:
+            c = s[self.i]
+            if c == "\\" and s[self.i + 1:self.i + 2] == "\n":
+                self.i += 2
+            elif c in " \t\r":
+                self.i += 1
+            elif c == "\n":
+                self.toks.append(("op", "\n"))
+                self.i += 1
+                if self.pending:
+                    self._bodies()
+            elif c == "#":
+                while self.i < n and s[self.i] != "\n":
+                    self.i += 1
+            elif c in OPCHARS:
+                self._operator()
+            else:
+                self.toks.append(("word", self._word()))
+        if self.pending:
+            raise Incomplete("here-document")
+        return self.toks
+
+    def _operator(self):
+        s = self.s
+        for op in ("<<-", "&&", "||", ">>", "<<", ";;", ";", "|", ">", "<", "&"):
+            if s.startswith(op, self.i):
+                break
+        self.i += len(op)
+        if op in ("<<", "<<-"):
+            while self.i < len(s) and s[self.i] in " \t":
+                self.i += 1
+            if self.i >= len(s) or s[self.i] in "\n" + OPCHARS:
+                raise ParseError("syntax error near unexpected token `newline'")
+            w = self._word()
+            hd = HereDoc(word_text(w), any(q is not None for _, q in w), op == "<<-")
+            self.pending.append(hd)
+            self.toks.append(("op", "<<", hd))
+        elif op == ";;":
+            raise ParseError("syntax error near unexpected token `;;' (case is not supported)")
+        else:
+            self.toks.append(("op", op))
+
+    def _bodies(self):
+        s = self.s
+        for hd in self.pending:
+            lines = []
             while True:
-                if i >= n:
-                    raise ParseError("unexpected EOF while looking for matching `\"'")
-                ch = line[i]
-                if ch == '"':
-                    i += 1
+                if self.i >= len(s):
+                    raise Incomplete("here-document")
+                j = s.find("\n", self.i)
+                line = s[self.i:] if j < 0 else s[self.i:j]
+                self.i = len(s) if j < 0 else j + 1
+                check = line.lstrip("\t") if hd.strip_tabs else line
+                if check == hd.delim:
                     break
-                if ch == "\\" and i + 1 < n and line[i + 1] in '"\\$`':
-                    cur.append((line[i + 1], "\\"))
-                    i += 2
+                lines.append(check)
+            hd.body = "".join(ln + "\n" for ln in lines)
+        self.pending = []
+
+    def _subst(self, start: int, close: str) -> int:
+        """Return the index of the closing ')' or '`' for a substitution starting at start."""
+        s, depth, j = self.s, 1, start
+        while j < len(s):
+            c = s[j]
+            if c == "\\":
+                j += 2
+                continue
+            if close == ")":
+                if c == "'":
+                    k = s.find("'", j + 1)
+                    if k < 0:
+                        break
+                    j = k + 1
                     continue
-                cur.append((ch, '"'))
-                i += 1
-        elif c == "\\":
-            cur = cur or []
-            if i + 1 < n:
-                cur.append((line[i + 1], "\\"))
-            i += 2
-        else:
-            cur = (cur or []) + [(c, None)]
-            i += 1
-    flush()
-    return toks
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return j
+            elif c == "`":
+                return j
+            j += 1
+        raise Incomplete("command substitution")
+
+    def _word(self) -> Chars:
+        s, n = self.s, len(self.s)
+        out: Chars = []
+        while self.i < n:
+            c = s[self.i]
+            if c in " \t\r\n" or c in OPCHARS:
+                break
+            if c == "\\":
+                if self.i + 1 >= n:
+                    raise Incomplete("backslash")
+                if s[self.i + 1] != "\n":
+                    out.append((s[self.i + 1], "\\"))
+                self.i += 2
+            elif c == "'":
+                j = s.find("'", self.i + 1)
+                if j < 0:
+                    raise Incomplete("quote")
+                out += [(ch, "'") for ch in s[self.i + 1:j]]
+                if j == self.i + 1:
+                    out.append(("", "'"))  # keeps '' as an (empty) quoted word
+                self.i = j + 1
+            elif c == '"':
+                self.i += 1
+                start_len = len(out)
+                while True:
+                    if self.i >= n:
+                        raise Incomplete("quote")
+                    ch = s[self.i]
+                    if ch == '"':
+                        self.i += 1
+                        break
+                    if ch == "\\" and self.i + 1 < n and s[self.i + 1] in '"\\$`\n':
+                        if s[self.i + 1] != "\n":
+                            out.append((s[self.i + 1], "\\"))
+                        self.i += 2
+                    elif ch == "$" and s[self.i + 1:self.i + 2] == "(":
+                        j = self._subst(self.i + 2, ")")
+                        out.append((s[self.i + 2:j], "SQ"))
+                        self.i = j + 1
+                    elif ch == "`":
+                        j = self._subst(self.i + 1, "`")
+                        out.append((s[self.i + 1:j], "SQ"))
+                        self.i = j + 1
+                    else:
+                        out.append((ch, '"'))
+                        self.i += 1
+                if len(out) == start_len:
+                    out.append(("", '"'))
+            elif c == "$" and s[self.i + 1:self.i + 2] == "(":
+                j = self._subst(self.i + 2, ")")
+                out.append((s[self.i + 2:j], "S"))
+                self.i = j + 1
+            elif c == "`":
+                j = self._subst(self.i + 1, "`")
+                out.append((s[self.i + 1:j], "S"))
+                self.i = j + 1
+            else:
+                out.append((c, None))
+                self.i += 1
+        return out
 
 
-def parse(line: str) -> List[Simple]:
-    cmds: List[Simple] = []
-    cur = Simple()
-    toks = tokenize(line)
-    k = 0
-    while k < len(toks):
-        kind, val = toks[k]
-        if kind == "word":
-            cur.words.append(val)
-        elif val in (">", ">>"):
-            if k + 1 >= len(toks) or toks[k + 1][0] != "word":
-                raise ParseError(f"syntax error near unexpected token `{val}'")
-            cur.redirs.append((val, toks[k + 1][1]))
-            k += 1
-        elif val in (";", "&&", "||"):
-            if not cur.words and not cur.redirs:
-                raise ParseError(f"syntax error near unexpected token `{val}'")
-            cmds.append(cur)
-            cur = Simple(conn=val)
-        elif val == "|":
-            raise ParseError("pipes (|) are not supported in this simulation")
-        elif val == "&":
-            raise ParseError("background jobs (&) are not supported in this simulation")
-        else:
-            raise ParseError(f"'{val}' redirection is not supported in this simulation")
-        k += 1
-    if cur.words or cur.redirs:
-        cmds.append(cur)
-    elif cur.conn in ("&&", "||"):
-        raise ParseError("syntax error: unexpected end of line")
-    return cmds
+def tokenize(text: str) -> list:
+    return _Lexer(text).run()
+
+
+# ---------------------------------------------------------------- parser
+class _Parser:
+    def __init__(self, toks):
+        self.t = toks
+        self.k = 0
+
+    def peek(self):
+        return self.t[self.k] if self.k < len(self.t) else None
+
+    def kw(self) -> Optional[str]:
+        tok = self.peek()
+        if tok and tok[0] == "word" and tok[1] and all(q is None for _, q in tok[1]):
+            return word_text(tok[1])
+        return None
+
+    def is_op(self, *ops) -> bool:
+        tok = self.peek()
+        return tok is not None and tok[0] == "op" and tok[1] in ops
+
+    def skip_newlines(self):
+        while self.is_op("\n"):
+            self.k += 1
+
+    def parse_list(self, stops=frozenset()) -> Tuple[CmdList, Optional[str]]:
+        items: CmdList = []
+        conn: Optional[str] = None
+        self.skip_newlines()
+        while True:
+            tok = self.peek()
+            if tok is None:
+                if stops or conn in ("&&", "||"):
+                    raise Incomplete("more input")
+                return items, None
+            kw = self.kw()
+            if kw in stops:
+                if not items:
+                    raise ParseError(f"syntax error near unexpected token `{kw}'")
+                return items, kw
+            if tok[0] == "op" and tok[1] not in (">", ">>", "<", "<<"):
+                raise ParseError(f"syntax error near unexpected token `{_tok_text(tok)}'")
+            items.append((conn, self.parse_command()))
+            conn = None
+            tok = self.peek()
+            if tok is None:
+                continue
+            if tok[0] == "op" and tok[1] in (";", "\n"):
+                self.k += 1
+                conn = ";"
+                self.skip_newlines()
+            elif tok[0] == "op" and tok[1] in ("&&", "||"):
+                self.k += 1
+                conn = tok[1]
+                self.skip_newlines()
+            elif tok[0] == "op" and tok[1] == "&":
+                raise ParseError("background jobs (&) are not supported in this simulation")
+            else:
+                raise ParseError(f"syntax error near unexpected token `{_tok_text(tok)}'")
+
+    def parse_command(self) -> Node:
+        kw = self.kw()
+        if kw == "if":
+            return self.parse_if()
+        if kw == "for":
+            return self.parse_for()
+        if kw in RESERVED:
+            raise ParseError(f"syntax error near unexpected token `{kw}'")
+        if kw in ("case", "while", "until", "function", "select"):
+            raise ParseError(f"'{kw}' is not supported in this simulation (if and for are)")
+        negate = False
+        if kw == "!":
+            self.k += 1
+            negate = True
+        cmds = [self.parse_simple()]
+        while self.is_op("|"):
+            self.k += 1
+            self.skip_newlines()
+            if self.peek() is None:
+                raise Incomplete("|")
+            cmds.append(self.parse_simple())
+        if len(cmds) == 1 and not negate:
+            return cmds[0]
+        return Pipeline(cmds, negate)
+
+    def parse_simple(self) -> Simple:
+        sc = Simple()
+        while True:
+            tok = self.peek()
+            if tok is None:
+                break
+            if tok[0] == "word":
+                sc.words.append(tok[1])
+                self.k += 1
+            elif tok[1] in (">", ">>", "<"):
+                self.k += 1
+                nxt = self.peek()
+                if nxt is None or nxt[0] != "word":
+                    raise ParseError(f"syntax error near unexpected token `"
+                                     f"{_tok_text(nxt) if nxt else 'newline'}'")
+                sc.redirs.append((tok[1], nxt[1]))
+                self.k += 1
+            elif tok[1] == "<<":
+                sc.redirs.append(("<<", tok[2]))
+                self.k += 1
+            else:
+                break
+        if not sc.words and not sc.redirs:
+            tok = self.peek()
+            raise ParseError(f"syntax error near unexpected token `"
+                             f"{_tok_text(tok) if tok else 'newline'}'")
+        return sc
+
+    def expect(self, word: str):
+        if self.peek() is None:
+            raise Incomplete(word)
+        if self.kw() != word:
+            raise ParseError(f"syntax error near unexpected token `{_tok_text(self.peek())}'")
+        self.k += 1
+
+    def parse_if(self) -> If:
+        self.k += 1
+        clauses = []
+        cond, _ = self.parse_list({"then"})
+        self.expect("then")
+        body, kw = self.parse_list({"elif", "else", "fi"})
+        clauses.append((cond, body))
+        else_body = None
+        while kw == "elif":
+            self.k += 1
+            cond, _ = self.parse_list({"then"})
+            self.expect("then")
+            body, kw = self.parse_list({"elif", "else", "fi"})
+            clauses.append((cond, body))
+        if kw == "else":
+            self.k += 1
+            else_body, kw = self.parse_list({"fi"})
+        self.expect("fi")
+        return If(clauses, else_body)
+
+    def parse_for(self) -> For:
+        self.k += 1
+        tok = self.peek()
+        if tok is None:
+            raise Incomplete("for")
+        name = self.kw()
+        if tok[0] != "word" or not name or not NAME_RE.fullmatch(name):
+            raise ParseError(f"`{_tok_text(tok)}': not a valid identifier")
+        self.k += 1
+        words: Optional[List[Chars]] = None
+        self.skip_newlines()
+        if self.kw() == "in":
+            self.k += 1
+            words = []
+            while self.peek() is not None and self.peek()[0] == "word":
+                words.append(self.peek()[1])
+                self.k += 1
+        if self.peek() is None:
+            raise Incomplete("for")
+        if self.is_op(";", "\n"):
+            self.k += 1
+        self.skip_newlines()
+        self.expect("do")
+        body, _ = self.parse_list({"done"})
+        self.expect("done")
+        return For(name, words, body)
+
+
+def _tok_text(tok) -> str:
+    if tok is None:
+        return "newline"
+    if tok[0] == "word":
+        return word_text(tok[1])
+    return "newline" if tok[1] == "\n" else tok[1]
+
+
+def parse(text: str) -> CmdList:
+    p = _Parser(tokenize(text))
+    items, _ = p.parse_list()
+    return items
 
 
 # ---------------------------------------------------------------- expansion
@@ -157,12 +450,17 @@ def _brace(chars: Chars) -> List[Chars]:
     return [chars]
 
 
-def _vars(chars: Chars, getvar) -> Chars:
+def _vars(chars: Chars, getvar, subst) -> Chars:
     out: Chars = []
     i, n = 0, len(chars)
     while i < n:
         c, q = chars[i]
-        if c == "$" and q in (None, '"') and i + 1 < n and chars[i + 1][1] in (None, '"'):
+        if q in ("S", "SQ"):
+            out += [(ch, "u" if q == "S" else "v") for ch in subst(c).rstrip("\n")]
+            i += 1
+            continue
+        if c == "$" and q in (None, '"') and i + 1 < n and chars[i + 1][1] == q:
+            mark = "u" if q is None else "v"
             nxt = chars[i + 1][0]
             name, j = None, i + 1
             if nxt == "{":
@@ -176,14 +474,12 @@ def _vars(chars: Chars, getvar) -> Chars:
                     raise ParseError(f"${{{name}}}: bad substitution")
             elif nxt in "?$":
                 name, j = nxt, j + 1
-            elif nxt == "(":
-                raise ParseError("command substitution $(...) is not supported in this simulation")
             else:
                 m = NAME_RE.match("".join(ch for ch, _ in chars[j:]))
                 if m:
                     name, j = m.group(0), j + len(m.group(0))
             if name is not None:
-                out += [(ch, "v") for ch in getvar(name)]
+                out += [(ch, mark) for ch in getvar(name)]
                 i = j
                 continue
         out.append((c, q))
@@ -204,18 +500,23 @@ def _tilde(chars: Chars, home_of) -> Chars:
     return [(c, "v") for c in home] + chars[k:]
 
 
+def _split(chars: Chars) -> List[Chars]:
+    fields: List[Chars] = [[]]
+    for c, q in chars:
+        if q == "u" and c in " \t\n":
+            if fields[-1]:
+                fields.append([])
+            continue
+        fields[-1].append((c, q))
+    return [f for f in fields if f]
+
+
 def _is_glob(chars: Chars) -> bool:
     return any(q is None and c in "*?[" for c, q in chars)
 
 
 def _pattern(chars: Chars) -> str:
-    out = []
-    for c, q in chars:
-        if q is not None and c in "*?[]":
-            out.append(f"[{c}]")
-        else:
-            out.append(c)
-    return "".join(out)
+    return "".join(f"[{c}]" if q is not None and c in "*?[]" else c for c, q in chars)
 
 
 def _glob(chars: Chars, listdir) -> List[str]:
@@ -260,28 +561,76 @@ def _join(base: str, name: str) -> str:
     return base + name if base.endswith("/") else base + "/" + name
 
 
-def expand(word: Chars, getvar, home_of, listdir, exists) -> List[str]:
+def expand(word: Chars, getvar, home_of, listdir, exists, subst=None) -> List[str]:
     """Expand one word into zero or more argument strings."""
+    subst = subst or (lambda cmd: "")
     results: List[str] = []
-    quoted = any(q is not None for _, q in word)
+    quoted = any(q is not None and q != "S" for _, q in word)
     for alt in _brace(word):
-        chars = _tilde(_vars(alt, getvar), home_of)
-        if _is_glob(chars):
-            matches = [p for p in _glob(chars, listdir) if exists(p)]
-            if matches:
-                results += matches
-                continue
-        s = "".join(c for c, _ in chars)
-        if s == "" and not quoted:
+        chars = _tilde(_vars(alt, getvar, subst), home_of)
+        fields = _split(chars)
+        if not fields:
+            if quoted:
+                results.append("")
             continue
-        results.append(s)
+        for f in fields:
+            if _is_glob(f):
+                matches = [p for p in _glob(f, listdir) if exists(p)]
+                if matches:
+                    results += matches
+                    continue
+            results.append("".join(c for c, _ in f))
     return results
 
 
+def expand_heredoc(body: str, getvar, subst) -> str:
+    """Expansion inside an unquoted here-document: $VAR ${VAR} $(cmd) `cmd` and \\$ \\` \\\\."""
+    out = []
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\" and i + 1 < n and body[i + 1] in "$`\\":
+            out.append(body[i + 1])
+            i += 2
+        elif c == "$" and body[i + 1:i + 2] == "(":
+            lx = _Lexer(body)
+            j = lx._subst(i + 2, ")")
+            out.append(subst(body[i + 2:j]).rstrip("\n"))
+            i = j + 1
+        elif c == "`":
+            j = body.find("`", i + 1)
+            if j < 0:
+                out.append(c)
+                i += 1
+                continue
+            out.append(subst(body[i + 1:j]).rstrip("\n"))
+            i = j + 1
+        elif c == "$" and body[i + 1:i + 2] == "{":
+            j = body.find("}", i)
+            out.append(getvar(body[i + 2:j]) if j > 0 else "$")
+            i = j + 1 if j > 0 else i + 1
+        elif c == "$":
+            m = NAME_RE.match(body, i + 1)
+            if m:
+                out.append(getvar(m.group(0)))
+                i = m.end()
+            elif body[i + 1:i + 2] in ("?", "$"):
+                out.append(getvar(body[i + 1]))
+                i += 2
+            else:
+                out.append(c)
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def word_text(word: Chars) -> str:
-    return "".join(c for c, _ in word)
+    return "".join(c for c, q in word if q not in ("S", "SQ"))
 
 
 def is_assignment(word: Chars) -> bool:
-    return bool(ASSIGN_RE.match(word_text(word))) and all(
-        q is None for _, q in word[:word_text(word).index("=") + 1])
+    text = "".join(c if q not in ("S", "SQ") else "\0" for c, q in word)
+    m = ASSIGN_RE.match(text)
+    return bool(m) and all(q is None for _, q in word[:m.end()])

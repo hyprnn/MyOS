@@ -43,6 +43,7 @@ class TerminalScreen(tk.Frame):
         self._waiting: Optional[Input] = None
         self._sleep_job = None
         self._secret: List[str] = []
+        self._typeahead: List[str] = []   # keys typed while a process was busy
 
         self.text = tk.Text(
             self, bg=theme.BG, fg=theme.FG, font=theme.font(), bd=0,
@@ -210,6 +211,7 @@ class TerminalScreen(tk.Frame):
             self._waiting = req
             self._secret = []
             self._new_prompt(req.prompt, tag=())
+            self._feed_typeahead()
         else:
             self._advance(None)
 
@@ -225,7 +227,7 @@ class TerminalScreen(tk.Frame):
         if new:
             if self.game.finished():
                 self.write("\n All objectives of this version are done! ", "banner")
-                self.write("\nThe cross toolchain (chapter 5) comes in a future version. "
+                self.write("\nChapter 6 (cross compiling the temporary tools) comes in a future version. "
                            "Don't forget to save.\n", "ok")
             else:
                 nxt = self.game.current()
@@ -233,6 +235,22 @@ class TerminalScreen(tk.Frame):
             self._on_progress()
         if self.winfo_exists():
             self._new_prompt()
+            self._feed_typeahead()
+
+    def _feed_typeahead(self):
+        """Replay keys typed while busy: text up to the first newline goes into the input
+        line; if a newline was typed, it is submitted (after the UI had a chance to draw)."""
+        if not self._typeahead:
+            return
+        buf = "".join(self._typeahead)
+        line, nl, rest = buf.partition("\n")
+        self._typeahead = list(rest)
+        if self._waiting is not None and self._waiting.secret:
+            self._secret.extend(line)
+        else:
+            self.text.insert("end-1c", line)
+        if nl:
+            self.after(20, self._submit)
 
     def _kill_proc(self):
         if self._sleep_job is not None:
@@ -243,6 +261,7 @@ class TerminalScreen(tk.Frame):
         self._proc = None
         self._waiting = None
         self._secret = []
+        self._typeahead = []
 
     def _interrupt(self):
         if self._proc is not None:
@@ -275,7 +294,7 @@ class TerminalScreen(tk.Frame):
             return "break"
         if self._sleep_job is None and not (self._waiting and self._waiting.secret):
             self._clamp_cursor()
-            self.text.insert("insert", data.replace("\n", " "))
+            self.text.insert("insert", data.rstrip("\n"))  # multi-line: runs on Enter
         return "break"
 
     def _on_key(self, event):
@@ -292,8 +311,14 @@ class TerminalScreen(tk.Frame):
         if key == "Escape":
             self._on_exit()
             return "break"
-        if self._sleep_job is not None:
-            return "break"  # a process is busy
+        if self._sleep_job is not None:  # a process is busy: buffer the keys like a tty
+            if key in ("Return", "KP_Enter"):
+                self._typeahead.append("\n")
+            elif key == "BackSpace" and self._typeahead and self._typeahead[-1] != "\n":
+                self._typeahead.pop()
+            elif event.char and event.char.isprintable() and not ctrl:
+                self._typeahead.append(event.char)
+            return "break"
         if ctrl and key.lower() == "d":
             if self._waiting is not None and not self._current_input() and not self._secret:
                 self.text.insert("end", "\n")

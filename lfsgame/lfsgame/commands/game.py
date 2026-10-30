@@ -8,23 +8,37 @@ from ..sim.objectives import OBJECTIVES
 G = "game"
 
 
-@command("tasks", "show your LFS objectives and progress", G, aliases=("status", "quest"))
+CHAPTERS = {"2": "Chapter 2: partition, filesystem, mount", "3": "Chapter 3: packages",
+            "4": "Chapter 4: final preparations", "5": "Chapter 5: cross-toolchain"}
+
+
+@command("tasks", "show your LFS objectives and progress (-a: list finished ones too)", G,
+         aliases=("status", "quest"))
 def _tasks(ctx, args):
     game = ctx.game
     cur = game.current()
     done, total = game.score()
     ctx.write(f"LFS progress: {done}/{total}\n", "accent")
+    groups = {}
     for o in OBJECTIVES:
-        if o.id in game.done:
+        groups.setdefault(o.section.split(".")[0], []).append(o)
+    for chapter, objs in groups.items():
+        if all(o.id in game.done or o.optional for o in objs) and "-a" not in args:
             ctx.write("  [x] ", "ok")
-            ctx.write(f"{o.title}\n", "dim")
-        else:
-            mark = "  >> " if cur is not None and o.id == cur.id else "  [ ] "
-            ctx.write(mark, "warn" if mark.strip() == ">>" else None)
-            ctx.write(o.title)
-            ctx.write(f"   (book {o.section}{', optional' if o.optional else ''})\n", "dim")
+            ctx.write(f"{CHAPTERS.get(chapter, 'Chapter ' + chapter)}: "
+                      f"all done  (tasks -a shows them)\n", "dim")
+            continue
+        for o in objs:
+            if o.id in game.done:
+                ctx.write("  [x] ", "ok")
+                ctx.write(f"{o.title}\n", "dim")
+            else:
+                mark = "  >> " if cur is not None and o.id == cur.id else "  [ ] "
+                ctx.write(mark, "warn" if mark.strip() == ">>" else None)
+                ctx.write(o.title)
+                ctx.write(f"   (book {o.section}{', optional' if o.optional else ''})\n", "dim")
     if cur is None:
-        ctx.write("\nAll objectives done! Chapter 5 (the cross toolchain) is not in the game yet.\n",
+        ctx.write("\nAll objectives done! Chapter 6 (temporary tools) is not in the game yet.\n",
                   "ok")
     else:
         ctx.write("\nStuck? Type 'hint' or open the book with F2 / 'book'.\n", "dim")

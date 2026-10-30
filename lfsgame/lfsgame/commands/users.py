@@ -6,6 +6,7 @@ import hashlib
 from ..shell.opts import Opts
 from ..shell.runner import Input, UsageError, command
 from ..sim.vfs import FsError
+from .core import login_startup
 
 G = "users"
 
@@ -102,3 +103,4 @@ def _su(ctx, args):
     m.su(name)
     if name == "lfs" and login:
         m.flag("su_lfs")
+    yield from login_startup(ctx)

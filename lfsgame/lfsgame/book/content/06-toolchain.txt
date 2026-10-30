@@ -1,0 +1,279 @@
+@chapter 5. Compiling a Cross-Toolchain
+@section 5.1 | Introduction
+
+Now the real building starts. The goal of this chapter is a cross-toolchain: an assembler, linker, compiler and C library that run on the host but produce programs for the new system. Everything goes into $LFS/tools (the tools themselves) and $LFS/usr (the C library), never into the host's own directories.
+
+Why "cross"? The host might have a different C library or compiler version. By pretending the new system is a different machine (x86_64-lfs-linux-gnu instead of the host's x86_64-pc-linux-gnu) the build cannot accidentally pick up anything from the host.
+
+## Work as lfs
+Everything in this chapter is done as the lfs user, in the environment from section 4.4. Check before every session:
+
+$ whoami
+$ echo $LFS $LFS_TGT
+
+## How every package is built
+The steps are the same for each package:
+- cd $LFS/sources
+- Unpack the archive with tar and cd into the new directory.
+- Follow the package's section: usually configure, make, make install.
+- Go back to $LFS/sources and delete the unpacked directory (rm -rf), unless the book says otherwise.
+
+$ cd $LFS/sources
+
+Never build a package in a leftover directory from an earlier attempt: delete it and unpack it again.
+
+## Configure, make, make install
+- configure checks the system and writes a Makefile. Its options (--prefix, --target, ...) decide where things go and what is built. Typos here are the most common source of trouble.
+- make compiles. It takes time.
+- make install copies the results into place. With DESTDIR=DIR everything is installed below DIR instead of /.
+
+## SBU: Standard Build Units
+Build times are measured in SBUs: one SBU is the time Binutils pass 1 takes on your machine, and every other package is given as a multiple. In the game 1 SBU is about two simulated minutes; real seconds pass too, and fewer of them with MAKEFLAGS=-j8. Use time to measure:
+
+$ time make
+
+@section 5.2 | Binutils-2.43.1 - Pass 1
+
+Binutils contains the assembler (as), the linker (ld) and other tools for object files. It comes first, because GCC needs an assembler and linker for the new target. Build time: 1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf binutils-2.43.1.tar.xz
+$ cd binutils-2.43.1
+
+Binutils wants to be built in a separate directory:
+
+$ mkdir -v build
+$ cd build
+
+Configure it. The lines end in a backslash: the command continues on the next line. Click the block to paste it whole.
+
+$ ../configure --prefix=$LFS/tools \
++              --with-sysroot=$LFS \
++              --target=$LFS_TGT   \
++              --disable-nls       \
++              --enable-gprofng=no \
++              --disable-werror    \
++              --enable-new-dtags  \
++              --enable-default-hash-style=gnu
+
+- --prefix=$LFS/tools: install the programs into $LFS/tools.
+- --with-sysroot=$LFS: when looking for libraries, the linker treats $LFS as the root directory.
+- --target=$LFS_TGT: build tools for the new machine. Their names get the prefix x86_64-lfs-linux-gnu-.
+- --disable-nls: no translated messages; --disable-werror: warnings do not stop the build.
+
+$ make
+$ make install
+
+Check that the cross linker exists, then clean up:
+
+$ ls $LFS/tools/bin
+$ cd $LFS/sources
+$ rm -rf binutils-2.43.1
+
+@section 5.3 | GCC-14.2.0 - Pass 1
+
+The GNU Compiler Collection. This first pass builds a C and C++ compiler without a C library: just enough to compile Glibc. Build time: 3.8 SBU.
+
+$ cd $LFS/sources
+$ tar -xf gcc-14.2.0.tar.xz
+$ cd gcc-14.2.0
+
+GCC needs three math libraries. Unpack them inside the GCC tree under the names GCC expects; it then builds them automatically:
+
+$ tar -xf ../mpfr-4.2.1.tar.xz
+$ mv -v mpfr-4.2.1 mpfr
+$ tar -xf ../gmp-6.3.0.tar.xz
+$ mv -v gmp-6.3.0 gmp
+$ tar -xf ../mpc-1.3.1.tar.gz
+$ mv -v mpc-1.3.1 mpc
+
+On x86_64, tell GCC to put its 64-bit libraries into "lib" instead of "lib64". The real book wraps this in a case statement for the different CPU types; the simulated machine is x86_64, so run it directly:
+
+$ sed -e '/m64=/s/lib64/lib/' -i.orig gcc/config/i386/t-linux64
+
+GCC must also be built in a separate directory:
+
+$ mkdir -v build
+$ cd build
+
+$ ../configure                  \
++     --target=$LFS_TGT         \
++     --prefix=$LFS/tools       \
++     --with-glibc-version=2.40 \
++     --with-sysroot=$LFS       \
++     --with-newlib             \
++     --without-headers         \
++     --enable-default-pie      \
++     --enable-default-ssp      \
++     --disable-nls             \
++     --disable-shared          \
++     --disable-multilib        \
++     --disable-threads         \
++     --disable-libatomic       \
++     --disable-libgomp         \
++     --disable-libquadmath     \
++     --disable-libssp          \
++     --disable-libvtv          \
++     --disable-libstdcxx       \
++     --enable-languages=c,c++
+
+The important ones:
+- --with-newlib and --without-headers: there is no C library yet, so do not build anything that needs one.
+- --disable-shared, --disable-threads and the --disable-lib... options: skip the parts that cannot work without a C library.
+- --disable-libstdcxx: the C++ library is built later (section 5.6), when Glibc exists.
+- --enable-languages=c,c++: only these two compilers are needed.
+
+$ make
+$ make install
+
+## The complete limits.h
+GCC installed only a partial limits.h, because there was no C library to look at. Build the full one by joining three files from the GCC sources. Go back to the top of the GCC tree first:
+
+$ cd ..
+$ cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
++   `dirname $($LFS_TGT-gcc -print-libgcc-file-name)`/include/limits.h
+
+The part in backticks asks the new compiler where its own files are and strips the file name, which gives the directory of GCC's internal headers.
+
+$ cd $LFS/sources
+$ rm -rf gcc-14.2.0
+
+@section 5.4 | Linux-6.10.5 API Headers
+
+Glibc talks to the kernel, so it needs the kernel's "API headers": the C header files that describe system calls and data structures. They come from the kernel sources. Build time: less than 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf linux-6.10.5.tar.xz
+$ cd linux-6.10.5
+
+Start from a perfectly clean tree, then extract the user-visible headers:
+
+$ make mrproper
+$ make headers
+
+make headers leaves some helper files next to the headers. Delete everything that is not a .h file, then copy the result into the new system:
+
+$ find usr/include -type f ! -name '*.h' -delete
+$ cp -rv usr/include $LFS/usr
+
+The find command reads as: in usr/include, find files (-type f) whose name does not (!) end in .h, and delete them.
+
+$ cd $LFS/sources
+$ rm -rf linux-6.10.5
+
+@section 5.5 | Glibc-2.40
+
+The GNU C library: memory, files, strings, threads, starting programs. Almost every program uses it. Build time: 1.4 SBU.
+
+## Compatibility links
+Some programs expect the dynamic loader in /lib64. Create symbolic links for it:
+
+$ ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64
+$ ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64/ld-lsb-x86-64.so.3
+
+## Unpack and patch
+$ cd $LFS/sources
+$ tar -xf glibc-2.40.tar.xz
+$ cd glibc-2.40
+
+Glibc keeps some data in /var/db by default, which is not where the Filesystem Hierarchy Standard wants it. A patch from the LFS project fixes that. Patches are downloaded with the packages; if yours is missing, get it:
+
+$ ls ../glibc-2.40-fhs-1.patch
+$ wget https://www.linuxfromscratch.org/patches/lfs/12.2/glibc-2.40-fhs-1.patch --directory-prefix=$LFS/sources
+
+Apply it from the top of the source tree. -p1 strips the first directory of the paths in the patch, -N skips the patch if it was already applied:
+
+$ patch -Np1 -i ../glibc-2.40-fhs-1.patch
+
+## Build
+Glibc refuses to be built inside its source directory:
+
+$ mkdir -v build
+$ cd build
+
+Make sure ldconfig and sln end up in /usr/sbin:
+
+$ echo "rootsbindir=/usr/sbin" > configparms
+
+$ ../configure                             \
++       --prefix=/usr                      \
++       --host=$LFS_TGT                    \
++       --build=$(../scripts/config.guess) \
++       --enable-kernel=4.19               \
++       --with-headers=$LFS/usr/include    \
++       --disable-nscd                     \
++       libc_cv_slibdir=/usr/lib
+
+- --host=$LFS_TGT together with --build: cross compile with the tools from $LFS/tools.
+- --with-headers: the kernel headers from section 5.4.
+- --prefix=/usr: Glibc will live in /usr of the new system...
+
+$ make
+
+## Install with DESTDIR
+...which is why the installation MUST use DESTDIR. Without it, Glibc would be installed into the host's /usr and replace the host's own C library: the host would be broken at once. As lfs you are protected, because lfs may not write there; as root you are not.
+
+$ make DESTDIR=$LFS install
+
+One path in the ldd script is wrong for the new system; fix it:
+
+$ sed '/RTLDLIST=/s@/usr@@g' -i $LFS/usr/bin/ldd
+
+## Sanity check
+Now the cross compiler, the cross linker and the new C library must work together. Compile an empty program and check which dynamic loader it asks for:
+
+$ echo 'int main(){}' | $LFS_TGT-gcc -xc -
+$ readelf -l a.out | grep ld-linux
+
+The output must be:
+
+>       [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
+
+If there is no output, or an error, something earlier went wrong: do not continue until it works. Then clean up:
+
+$ rm -v a.out
+$ cd $LFS/sources
+$ rm -rf glibc-2.40
+
+@section 5.6 | Libstdc++ from GCC-14.2.0
+
+Libstdc++ is the standard C++ library. It could not be built in pass 1 because it needs Glibc. It comes from the GCC sources, so unpack GCC again (fresh!). Build time: 0.2 SBU.
+
+$ cd $LFS/sources
+$ tar -xf gcc-14.2.0.tar.xz
+$ cd gcc-14.2.0
+$ mkdir -v build
+$ cd build
+
+Note the path: this time the configure script of the libstdc++-v3 subdirectory is used.
+
+$ ../libstdc++-v3/configure           \
++     --host=$LFS_TGT                 \
++     --build=$(../config.guess)      \
++     --prefix=/usr                   \
++     --disable-multilib              \
++     --disable-nls                   \
++     --disable-libstdcxx-pch         \
++     --with-gxx-include-dir=/tools/$LFS_TGT/include/c++/14.2.0
+
+--with-gxx-include-dir puts the C++ headers where the cross compiler looks for them. It is relative to DESTDIR, so they land in $LFS/tools.
+
+$ make
+$ make DESTDIR=$LFS install
+
+The libtool archive files (.la) would cause trouble when other packages are cross compiled. Remove them:
+
+$ rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la
+
+$ cd $LFS/sources
+$ rm -rf gcc-14.2.0
+
+@chapter 6. Coming Next
+@section 6.0 | To Be Continued
+
+The cross-toolchain is complete. In the real book, chapter 6 uses it to cross compile the basic tools (M4, Ncurses, Bash, Coreutils, ...) into $LFS, then builds Binutils and GCC a second time. Chapter 7 enters the chroot.
+
+That is planned for a later version of the game. Save now!
+
+$ tasks
+$ df -h $LFS

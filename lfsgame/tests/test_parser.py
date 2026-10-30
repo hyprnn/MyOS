@@ -6,13 +6,13 @@ from lfsgame.shell.complete import complete
 from lfsgame.sim.machine import Machine
 
 
-def words(line, env=None, files=()):
+def words(line, env=None, files=(), subst=None):
     env = env or {}
-    (cmd,) = parser.parse(line)
+    ((_, cmd),) = parser.parse(line)
     out = []
     for w in cmd.words:
         out += parser.expand(w, lambda n: env.get(n, ""), lambda u: "/root" if u == "" else None,
-                             lambda p: list(files), lambda p: True)
+                             lambda p: list(files), lambda p: True, subst)
     return out
 
 
@@ -48,18 +48,53 @@ class ParserTests(unittest.TestCase):
 
     def test_operators(self):
         cmds = parser.parse("a && b || c; d > f")
-        self.assertEqual([c.conn for c in cmds], [None, "&&", "||", ";"])
-        self.assertEqual(cmds[3].redirs[0][0], ">")
+        self.assertEqual([c for c, _ in cmds], [None, "&&", "||", ";"])
+        self.assertEqual(cmds[3][1].redirs[0][0], ">")
+
+    def test_pipeline_if_for(self):
+        ((_, p),) = parser.parse("echo x | grep x | wc -l")
+        self.assertIsInstance(p, parser.Pipeline)
+        self.assertEqual(len(p.cmds), 3)
+        ((_, node),) = parser.parse("if [ -e x ]; then a; elif b; then c; else d; fi")
+        self.assertIsInstance(node, parser.If)
+        self.assertEqual(len(node.clauses), 2)
+        self.assertIsNotNone(node.else_body)
+        ((_, node),) = parser.parse("for i in a b c\ndo\n echo $i\ndone")
+        self.assertIsInstance(node, parser.For)
+        self.assertEqual(len(node.words), 3)
+
+    def test_heredoc(self):
+        ((_, cmd), (conn, nxt)) = parser.parse('cat > f << "EOF"\nA $X\n\tB\nEOF\necho done')
+        op, hd = cmd.redirs[1]
+        self.assertEqual((op, hd.delim, hd.quoted, hd.body), ("<<", "EOF", True, "A $X\n\tB\n"))
+        ((_, cmd),) = parser.parse("cat <<-END\n\tx\n\tEND")
+        self.assertEqual(cmd.redirs[0][1].body, "x\n")
+
+    def test_heredoc_expansion(self):
+        body = parser.expand_heredoc("a $X ${X}y \\$X $(cmd)\n", lambda n: "v", lambda c: c.upper() + "\n")
+        self.assertEqual(body, "a v vy $X CMD\n")
+
+    def test_incomplete(self):
+        for text in ("echo 'x", 'echo "x', "ls \\", "a &&", "a |", "if true; then x",
+                     "for i in a; do", "cat << EOF\nabc", "echo $(ls", "echo `ls"):
+            with self.assertRaises(parser.Incomplete, msg=text):
+                parser.parse(text)
+
+    def test_continuation_joins(self):
+        self.assertEqual(words("echo a \\\n  b"), ["echo", "a", "b"])
+
+    def test_command_substitution_and_splitting(self):
+        self.assertEqual(words("x $(m)-lfs `m` \"$(two)\" $(two)",
+                               subst=lambda c: {"m": "x86_64\n", "two": "a b\n"}[c]),
+                         ["x", "x86_64-lfs", "x86_64", "a b", "a", "b"])
 
     def test_comment(self):
         self.assertEqual(words("echo hi # comment"), ["echo", "hi"])
 
     def test_errors(self):
-        for bad in ("a |b", "&& a", "a &&", "echo $(ls)", "x >", "a &"):
+        for bad in ("&& a", "; a", "x >", "a &", "fi", "then x", "case x in", "if; then a; fi"):
             with self.assertRaises(parser.ParseError, msg=bad):
-                (cmd, *_) = parser.parse(bad)
-                for w in cmd.words:
-                    parser.expand(w, lambda n: "", lambda u: None, lambda p: [], lambda p: True)
+                parser.parse(bad)
 
 
 class CompleteTests(unittest.TestCase):

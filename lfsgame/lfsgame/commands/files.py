@@ -112,11 +112,14 @@ def _ls(ctx, args):
     return status
 
 
-@command("cat", "print file contents", G)
+@command("cat", "print files (no FILE or '-': read piped input)", G)
 def _cat(ctx, args):
     m = ctx.machine
     status = 0
-    for p in args:
+    for p in args or ["-"]:
+        if p == "-":
+            ctx.write(getattr(ctx, "stdin", None) or "")
+            continue
         try:
             node = m.lookup(p)
         except FsError as exc:
@@ -127,15 +130,14 @@ def _cat(ctx, args):
             ctx.write(f"cat: {p}: Is a directory\n", "err")
             status = 1
         elif node["t"] == "b":
-            ctx.write(f"cat: {p}: reading raw devices is not simulated\n", "err")
-            status = 1
-        elif node.get("md5"):
-            ctx.write(f"cat: {p}: compressed tarball ({human(node['size'])}), "
+            if not p.endswith("/null"):
+                ctx.write(f"cat: {p}: reading raw devices is not simulated\n", "err")
+                status = 1
+        elif node.get("md5") or node.get("prog") in ("elf", "binary"):
+            ctx.write(f"cat: {p}: binary file ({human(node.get('size', 0))}), "
                       f"contents not simulated\n", "dim")
         else:
             ctx.write(node.get("data", ""))
-    if not args:
-        raise UsageError("reading from stdin is not simulated; give a file name")
     return status
 
 
@@ -229,15 +231,21 @@ def _ln(ctx, args):
     if len(o.args) != 2:
         raise UsageError("usage: ln -s TARGET LINK_NAME")
     target, link = o.args
-    if "f" in o and m.exists(link, follow=False) and m.lookup(link, follow=False)["t"] != "d":
-        m.remove(link)
+    if "f" in o:
+        r = m.resolve(link, follow=False)
+        if r.node is not None and r.node["t"] == "d":  # ln -sf x dir/ => dir/x
+            r = m.resolve(link.rstrip("/") + "/" + target.rstrip("/").rsplit("/", 1)[-1],
+                          follow=False)
+        if r.node is not None and r.node["t"] != "d":
+            m.remove(r.path)
     try:
-        m.symlink(target, link)
+        made = m.symlink(target, link)
     except FsError as exc:
         ctx.write(f"ln: failed to create symbolic link {_say(link)}: {exc}\n", "err")
         return 1
     if "v" in o:
-        ctx.write(f"{_say(link)} -> {_say(target)}\n")
+        shown = link if m.abspath(link) == made else made
+        ctx.write(f"{_say(shown)} -> {_say(target)}\n")
 
 
 SYM_RE = re.compile(r"^([ugoa]*)([-+=])([rwxXst]*)$")
@@ -365,36 +373,66 @@ def _chown(ctx, args):
     return status
 
 
+def _merge_copy(m, node, parent, name, src_label, dst_label, out, owner):
+    """cp -r: copy node into parent[name], merging into an existing directory."""
+    existing = parent["c"].get(name)
+    if node["t"] == "d":
+        if existing is None or existing["t"] != "d":
+            new = copy.deepcopy(node)
+            new["c"] = {}
+            new["u"], new["g"] = owner
+            new["m"] = node["m"]
+            parent["c"][name] = new
+            existing = new
+        out.append(f"'{src_label}' -> '{dst_label}'")
+        for cname, child in sorted(node["c"].items()):
+            _merge_copy(m, child, existing, cname, f"{src_label}/{cname}",
+                        f"{dst_label}/{cname}", out, owner)
+    else:
+        if existing is not None and existing["t"] == "d":
+            raise FsError(f"cannot overwrite directory '{dst_label}' with non-directory")
+        new = copy.deepcopy(node)
+        new["u"], new["g"] = owner
+        parent["c"][name] = new
+        out.append(f"'{src_label}' -> '{dst_label}'")
+
+
 def _copy_or_move(ctx, args, move):
     m = ctx.machine
     name = "mv" if move else "cp"
-    o = Opts(args, "vrRf", "", {"verbose": "v", "recursive": "r"})
+    o = Opts(args, "vrRfa", "", {"verbose": "v", "recursive": "r"})
     if len(o.args) < 2:
         raise UsageError(f"usage: {name} SOURCE... DEST")
     *srcs, dest = o.args
     dest_is_dir = m.isdir(dest)
     if len(srcs) > 1 and not dest_is_dir:
         raise FsError(f"target {_say(dest)} is not a directory")
+    lines = []
     for s in srcs:
         node = m.lookup(s, follow=not move)
-        if node["t"] == "d" and not move and not ("r" in o or "R" in o):
+        recursive = "r" in o or "R" in o or "a" in o
+        if node["t"] == "d" and not move and not recursive:
             raise FsError(f"-r not specified; omitting directory {_say(s)}")
         target = dest.rstrip("/") + "/" + s.rstrip("/").rsplit("/", 1)[-1] if dest_is_dir else dest
         r = m.resolve(target, follow=False)
         if r.parent is None:
             raise FsError(f"cannot {'move' if move else 'copy'} to {_say(target)}")
-        if r.node is not None and r.node["t"] == "d":
-            raise FsError(f"cannot overwrite directory {_say(target)}")
         if not m.can_write(r.parent):
             raise FsError(f"cannot create {_say(target)}: Permission denied")
         if move:
+            if r.node is not None and r.node["t"] == "d":
+                raise FsError(f"cannot overwrite directory {_say(target)}")
             m.remove(s, recursive=True)
             r = m.resolve(target, follow=False)
             r.parent["c"][r.name] = node
+            lines.append(f"renamed {_say(s)} -> {_say(target)}")
         else:
-            r.parent["c"][r.name] = copy.deepcopy(node)
-        if "v" in o:
-            ctx.write(f"{'renamed ' if move else ''}{_say(s)} -> {_say(target)}\n")
+            _merge_copy(m, node, r.parent, r.name, s.rstrip("/"), target, lines, m._owner())
+    if "v" in o:
+        for line in lines[:25]:
+            ctx.write(line + "\n")
+        if len(lines) > 25:
+            ctx.write(f"(... {len(lines) - 25} more)\n", "dim")
 
 
 @command("mv", "move/rename files", G)

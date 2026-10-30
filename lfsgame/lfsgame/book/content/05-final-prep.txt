@@ -49,13 +49,74 @@ $ su - lfs
 
 Your prompt changes and ends in $ instead of #: you are no longer root. 'exit' returns to the root shell.
 
-! Notice that the LFS variable is empty for the lfs user. In the real book, section 4.4 writes .bash_profile and .bashrc files for lfs that set it up.
+! Notice that the LFS variable is empty for the lfs user. Section 4.4 fixes that.
 
-@chapter 5. Coming Next
-@section 5.0 | To Be Continued
+@section 4.4 | Setting Up the Environment
 
-Here the game ends for now. In the real book the lfs user sets up a clean environment (section 4.4) and then builds a cross toolchain: Binutils and GCC that produce programs for the new system, the Linux API headers, Glibc and Libstdc++.
+The lfs user needs a small, predictable environment: compilers and build scripts react to environment variables, and anything inherited from the host can change how the packages are built. Two startup files do the job.
 
-That part, compiling packages with all their configure options, is planned for a later version of the game.
+## First, as root: a hidden trap on the host
+Many distributions ship /etc/bash.bashrc, which every interactive bash reads, also for lfs. Have a look at this host's version:
 
-$ tasks
+$ cat /etc/bash.bashrc
+
+Variables like CC decide which compiler configure scripts use. Move the file out of the way (run this as root; type exit first if you are still lfs):
+
+$ [ ! -e /etc/bash.bashrc ] || mv -v /etc/bash.bashrc /etc/bash.bashrc.NOUSE
+
+"[ ! -e FILE ] || command" runs the command only if the file exists. When LFS is finished you can move it back.
+
+## Then, as lfs: .bash_profile
+Log in as lfs again:
+
+$ su - lfs
+
+A login shell reads ~/.bash_profile. Ours replaces the shell at once with a new one that starts with an EMPTY environment (env -i) except HOME, TERM and the prompt PS1:
+
+$ cat > ~/.bash_profile << "EOF"
++ exec env -i HOME=$HOME TERM=$TERM PS1='\u:\w\$ ' /bin/bash
++ EOF
+
+"cat > FILE << "EOF"" is a here-document: every following line is written into the file, until a line that contains only EOF. Because the word EOF is quoted, $HOME stays literally in the file instead of being replaced now. If you type it by hand, the shell shows a "> " prompt for each line. Clicking the block above pastes all of it at once.
+
+## .bashrc
+The new shell is not a login shell, so it reads ~/.bashrc:
+
+$ cat > ~/.bashrc << "EOF"
++ set +h
++ umask 022
++ LFS=/mnt/lfs
++ LC_ALL=POSIX
++ LFS_TGT=$(uname -m)-lfs-linux-gnu
++ PATH=/usr/bin
++ if [ ! -L /bin ]; then PATH=/bin:$PATH; fi
++ PATH=$LFS/tools/bin:$PATH
++ CONFIG_SITE=$LFS/usr/share/config.site
++ export LFS LC_ALL LFS_TGT PATH CONFIG_SITE
++ EOF
+
+What the lines mean:
+- set +h turns off bash's memory of where programs are, so a newly installed tool in $LFS/tools/bin is found immediately.
+- umask 022 and LFS: as in chapter 2.
+- LC_ALL=POSIX keeps programs from using translated messages or unusual number formats.
+- LFS_TGT is the name of the machine the cross tools build for: x86_64-lfs-linux-gnu. $(uname -m) is replaced by the output of uname -m.
+- PATH starts with $LFS/tools/bin, so the cross tools win over the host's tools as soon as they are installed.
+- CONFIG_SITE keeps configure scripts from reading the host's site configuration.
+
+## Parallel builds
+Modern machines have many cores. MAKEFLAGS tells every make to use all of them, which makes the builds in the next chapters several times faster (in the game too):
+
+$ cat >> ~/.bashrc << "EOF"
++ export MAKEFLAGS=-j$(nproc)
++ EOF
+
+Note the >>: it appends to the file instead of replacing it.
+
+## Start the new environment
+$ source ~/.bash_profile
+
+The prompt changes to lfs:~$ and the variables are set. Check:
+
+$ env
+
+! The environment must show LFS, LFS_TGT, PATH starting with /mnt/lfs/tools/bin, and no CC. If CC is there, /etc/bash.bashrc was still in place: move it as root and source ~/.bash_profile again.

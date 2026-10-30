@@ -1,7 +1,7 @@
 =====================================================================
 LFS GAME — CONTEXT HANDOFF FOR ANOTHER AI
 Keep this file updated with every change (together with reports/NNNN-*.md).
-Last updated: 2026-10-30, after report 0003 (version 0.3.0)
+Last updated: 2026-10-30, after report 0004 (version 0.4.0)
 =====================================================================
 
 1. WHO / WHAT
@@ -19,7 +19,8 @@ Last updated: 2026-10-30, after report 0003 (version 0.3.0)
      menu, LFS logo, later the LFS book. Real multi-file project. A report per change.
  R2. Saving + slide-out LFS side panel + this context file.
  R3. "Continue the game, add the book, more commands, disk partitioning, etc." (v0.3.0)
- NOT done yet: LFS 4.4 and chapter 5+ (actually building packages).
+ R4. "Continue, make chapter 5 and 4.4" (v0.4.0)
+ NOT done yet: chapter 6+ (temporary tools, chroot, final system).
 
 3. WORKING RULES (must keep)
  - Every code change => new report reports/NNNN-slug.md (template in reports/README.md),
@@ -30,22 +31,22 @@ Last updated: 2026-10-30, after report 0003 (version 0.3.0)
  - Book text must be our own paraphrase, never copied from the real LFS book.
  - GUI can be tested headless: python3.12 + python3-tk + Xvfb (see report 0003).
 
-4. CURRENT STATE (v0.3.0)
- Menu: Resume (if session in memory) / New game / Load saved game (date) / LFS Book /
-   Quit. Confirm line for New/Load/Quit when there is unsaved progress (also window X).
- Terminal: bash-like shell on a simulated host. Prompt root@host:~# (dynamic).
-   ~55 commands (help lists them by group). Processes: fdisk is interactive, mkfs/wget
-   take time, passwd/su read secret input. Tab completion, history, Ctrl+C/D/L/S/U/A.
-   Objective notifications after each command.
- Machine: sda (host, mounted /, /boot/efi), sdb (empty 32G target), sdc (USB stick decoy).
- Gameplay: 13 objectives (tasks/hint): explore disks, partition sdb (>=10G linux), mkfs
-   ext4, [optional swap], export LFS=/mnt/lfs, mount, $LFS/sources a+wt, wget all
-   packages (one random package breaks at 43% once -> md5sum FAILED -> wget --continue),
-   md5sum -c OK, directory layout, lfs user+group, chown, su - lfs. Then "to be continued".
- Book (side panel, F2; F3/F4 prev/next): TOC with progress marks, sections 0, 1.1,
-   2.2-2.7, 3.1, 3.2, 4.2, 4.3, 5.0, A; clicking a "$ command" pastes it into the input.
- Save: JSON v2 at ~/.local/share/lfsgame/save.json (+ .bak), atomic; stores history,
-   colored scrollback runs, full machine + progress + book section. v1 saves migrate.
+4. CURRENT STATE (v0.4.0)
+ Menu: Resume / New game / Load saved game (date) / LFS Book / Quit; confirms when
+   there is unsaved progress (also window X).
+ Terminal: bash-like shell on a simulated host. Prompt from PS1 if set (lfs:~$ after 4.4),
+   else user@host:cwd#. ~80 commands (help lists them by group). Pipes, here-docs,
+   $(...), if/for, multi-line input with "> " prompts, typeahead while busy, Tab
+   completion, history, Ctrl+C/D/L/S/U/A.
+ Machine: sda (host, /, /boot/efi), sdb (empty 32G target), sdc (USB decoy). Host has
+   /etc/bash.bashrc exporting CC="distcc gcc" (the 4.4 trap).
+ Gameplay: 23 objectives (2 optional), chapters 2.4 -> 5.6. Chapter 5 builds are
+   simulated (sim/build.py): tar -> configure (validated options) -> make (SBU timing,
+   realistic failures) -> make install (files in $LFS/tools or DESTDIR). Sanity check
+   with the cross gcc + readelf. After 5.6: "to be continued" (book 6.0).
+ Book: sections 0, 1.1, 2.2-2.7, 3.1, 3.2, 4.2-4.4, 5.1-5.6, 6.0, A. Multi-line command
+   blocks ("+ " lines) paste whole on click.
+ Save: JSON v2 (unchanged format; Machine.upgrade() patches old machines).
 
 5. FILE MAP
  main.py                        entry (python main.py)
@@ -62,15 +63,20 @@ Last updated: 2026-10-30, after report 0003 (version 0.3.0)
  lfsgame/sim/packages.py        package list, wget-list/md5sums text, fake md5
  lfsgame/sim/objectives.py      OBJECTIVES (predicates + book section + hint)
  lfsgame/sim/game.py            Game = Machine + done + book_section
- lfsgame/shell/parser.py        tokenizer + expansions
- lfsgame/shell/runner.py        REGISTRY, @command, Sleep/Input, start_line, run_line
+ lfsgame/sim/build.py           chapter-5 build model: source trees, configure checks,
+                                build failures, installed files, SBU timing
+ lfsgame/shell/parser.py        lexer + parser (AST: Simple/Pipeline/If/For, HereDoc) + expansions
+ lfsgame/shell/runner.py        interpreter: REGISTRY, PROGRAMS, Sub ctx, PATH lookup, scripts
  lfsgame/shell/opts.py          getopt helper; shell/complete.py Tab completion
- lfsgame/commands/*.py          core, files, disk, fdisk (session), net, users, game
+ lfsgame/commands/*.py          core, files, text, disk, fdisk (session), net, users, build, game
  lfsgame/book/__init__.py       markup parser + Book; book/content/*.txt the text
- tests/                         73 headless tests: python -m unittest -v
- reports/                       0001, 0002, 0003
+ tests/                         104 headless tests: python -m unittest -v
+ reports/                       0001 .. 0004
 
 6. KEY CONVENTIONS / APIs
+ - Programs in the fs: a file node {"prog": NAME, m: 0o755} runs PROGRAMS[NAME](ctx, args,
+   path, node) when found by path or $PATH (@program("name")). "#!" files run as scripts.
+ - ctx.stdin holds piped/redirected input (None if none); ctx.in_script inside scripts.
  - Command: @command("name", "help", group, hidden=False, aliases=()) def fn(ctx, args).
    Return int/None, or be a generator: `yield Sleep(ms)`, `line = yield Input(prompt,
    secret=False)` (None = EOF/Ctrl+D), `return status`. Raise UsageError (status 2) or
@@ -88,13 +94,13 @@ Last updated: 2026-10-30, after report 0003 (version 0.3.0)
 
 7. KNOWN ISSUES / OPEN POINTS
  - Not tested on real Wayland/Hyprland; mouse wheel, HiDPI, clipboard paste untested.
- - No pipes/loops/$(...)/here-docs; simplified permissions; minimal cp/mv.
+ - No case/while/functions/subshells/2>; simplified permissions; small sed/find/grep.
  - Fixed pixel sizes (panel 440 px).
 
 8. LIKELY NEXT STEPS
- - LFS 4.4 (.bash_profile/.bashrc for lfs; needs here-docs or an editor).
- - Chapter 5: simulated builds (tar, configure, make, make install, SBU timing, errors).
- - Possibly a Russian translation of the book; shell loops; tar/grep/wc.
+ - Chapter 6: more components in sim/build.py (M4, Ncurses, Bash, Coreutils, ...,
+   Binutils/GCC pass 2), cross-compiled with --host=$LFS_TGT and DESTDIR=$LFS.
+ - Chapter 7: chroot (needs a second root in Machine). Maybe `case`, Russian book.
 
 9. HOW TO RUN
  sudo pacman -S tk && python main.py

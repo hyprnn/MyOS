@@ -33,6 +33,7 @@ class SidePanel(tk.Frame):
         self._x = -self.HANDLE
         self._job = None
         self.section: Optional[str] = None   # None = table of contents
+        self._cmds: dict = {}                # "cmd#N" tag -> full command text
         try:
             self.book: Optional[Book] = Book.load()
             self.book_error = ""
@@ -211,6 +212,7 @@ class SidePanel(tk.Frame):
 
     def _render_section(self, s):
         t = self.text
+        self._cmds = {}
         t.insert("end", s.chapter + "\n", "chapter")
         t.insert("end", f"{s.id}. {s.title}\n" if s.id[0].isdigit() and s.id != "0"
                  else f"{s.title}\n", "title")
@@ -220,7 +222,12 @@ class SidePanel(tk.Frame):
             elif kind == "h2":
                 t.insert("end", body + "\n", "h2")
             elif kind == "cmd":
-                t.insert("end", "$ " + body + "\n", "cmd")
+                tag = f"cmd#{len(self._cmds)}"
+                self._cmds[tag] = body
+                first, *rest = body.split("\n")
+                t.insert("end", "$ " + first + "\n", ("cmd", tag))
+                for line in rest:
+                    t.insert("end", "  " + line + "\n", ("cmd", tag))
             elif kind == "pre":
                 t.insert("end", body + "\n", "pre")
             elif kind == "note":
@@ -240,20 +247,24 @@ class SidePanel(tk.Frame):
         return ("▶" if self.is_open else "◀") + "\n\nL\nF\nS"
 
     # ---- clicks ----
-    def _cmd_at(self, event) -> Optional[str]:
+    def _cmd_tag_at(self, event) -> Optional[str]:
         idx = self.text.index(f"@{event.x},{event.y}")
-        line = self.text.get(f"{idx} linestart", f"{idx} lineend")
-        return line[2:] if line.startswith("$ ") else None
+        for tag in self.text.tag_names(idx):
+            if tag.startswith("cmd#"):
+                return tag
+        return None
 
     def _click_cmd(self, event):
-        cmd = self._cmd_at(event)
-        if cmd:
-            self.on_command(cmd)
+        tag = self._cmd_tag_at(event)
+        if tag in self._cmds:
+            self.on_command(self._cmds[tag])
 
     def _hover_cmd(self, event):
-        idx = self.text.index(f"@{event.x},{event.y}")
+        tag = self._cmd_tag_at(event)
         self.text.tag_remove("cmd_hover", "1.0", "end")
-        self.text.tag_add("cmd_hover", f"{idx} linestart", f"{idx} lineend")
+        if tag:
+            ranges = self.text.tag_ranges(tag)
+            self.text.tag_add("cmd_hover", ranges[0], ranges[-1])
 
     # ---- animation ----
     def _animate(self, target: int, done: Optional[Callable[[], None]] = None):

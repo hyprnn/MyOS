@@ -4,7 +4,8 @@ from __future__ import annotations
 import time
 
 from ..shell.opts import Opts
-from ..shell.runner import REGISTRY, Sleep, UsageError, command, start_line
+from ..shell.runner import (REGISTRY, ScriptExit, Sleep, UsageError, command, find_program,
+                            run_argv, run_script, source_file)
 from ..sim import machine as mach
 from ..sim.vfs import FsError
 
@@ -25,7 +26,7 @@ def _help(ctx, args):
     for name, cmd in REGISTRY.items():
         if not cmd.hidden:
             groups.setdefault(cmd.group, []).append(name)
-    order = ["game", "shell", "files", "disks", "network", "users", "misc"]
+    order = ["game", "shell", "files", "text", "disks", "network", "users", "build", "misc"]
     for g in sorted(groups, key=lambda g: order.index(g) if g in order else 99):
         ctx.write(f"{g}:\n", "accent")
         for name in sorted(groups[g]):
@@ -125,8 +126,8 @@ def _unset(ctx, args):
         ctx.machine.env.pop(a, None)
 
 
-@command("env", "print the environment", G, aliases=("printenv",))
-def _env(ctx, args):
+@command("printenv", "print environment variables", G)
+def _printenv(ctx, args):
     env = ctx.machine.env
     if args:
         for a in args:
@@ -135,6 +136,41 @@ def _env(ctx, args):
         return 0 if all(a in env for a in args) else 1
     for k in sorted(env):
         ctx.write(f"{k}={env[k]}\n")
+
+
+@command("env", "print the environment; env -i A=1 B=2 /bin/bash starts a clean shell", G)
+def _env(ctx, args):
+    m = ctx.machine
+    clean = False
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("-i", "-", "--ignore-environment"):
+            clean = True
+        else:
+            raise UsageError(f"invalid option -- '{args[i].lstrip('-')}'")
+        i += 1
+    new_env = {} if clean else dict(m.env)
+    while i < len(args) and "=" in args[i] and not args[i].startswith("="):
+        k, _, v = args[i].partition("=")
+        new_env[k] = v
+        i += 1
+    rest = args[i:]
+    if not rest:
+        for k in sorted(new_env):
+            ctx.write(f"{k}={new_env[k]}\n")
+        return 0
+    if rest[0].rsplit("/", 1)[-1] in ("bash", "sh") and len(rest) == 1:
+        # a new interactive shell with exactly this environment (LFS 4.4 .bash_profile)
+        m.env = new_env
+        yield from interactive_startup(ctx)
+        return 0
+    old = m.env
+    m.env = new_env
+    try:
+        return (yield from run_argv(ctx, rest))
+    finally:
+        if m.env is new_env:
+            m.env = old
 
 
 @command("umask", "show or set the file creation mask (umask 022)", G)
@@ -226,7 +262,10 @@ def _sleep(ctx, args):
 def _which(ctx, args):
     status = 0
     for a in args:
-        if a in REGISTRY:
+        found = find_program(ctx.machine, a)
+        if found is not None:
+            ctx.write(found[0] + "\n")
+        elif a in REGISTRY:
             ctx.write(f"/usr/bin/{a}\n")
         else:
             status = 1
@@ -239,20 +278,160 @@ def _man(ctx, args):
               "LFS book with F2 / 'book'.\n", "dim")
 
 
-@command("bash", "run a shell script: bash FILE", G, aliases=("sh", "source", "."))
+def interactive_startup(ctx):
+    """What an interactive non-login bash reads: /etc/bash.bashrc, then ~/.bashrc."""
+    m = ctx.machine
+    for path in ("/etc/bash.bashrc", m.env.get("HOME", m.home()) + "/.bashrc"):
+        if m.exists(path) and m.lookup(path)["t"] == "f":
+            yield from source_file(ctx, path)
+
+
+def login_startup(ctx):
+    """What a login bash reads (su -): the first of ~/.bash_profile, ~/.bash_login, ~/.profile."""
+    m = ctx.machine
+    home = m.env.get("HOME", m.home())
+    for name in (".bash_profile", ".bash_login", ".profile"):
+        if m.exists(f"{home}/{name}"):
+            yield from source_file(ctx, f"{home}/{name}")
+            return
+
+
+@command("bash", "run a script in a subshell: bash FILE  (no FILE: new shell)", G,
+         aliases=("sh",))
 def _bash(ctx, args):
     m = ctx.machine
-    if not args:
-        ctx.write("Interactive sub-shells are not simulated. You are already in bash :)\n", "dim")
+    if args and args[0] == "-c" and len(args) > 1:
+        return (yield from run_script(ctx, args[1], subshell=True))
+    if not args or args[0] in ("-i", "-l", "--login"):
+        ctx.write("(a new interactive shell: reading the startup files)\n", "dim")
+        if args and args[0] in ("-l", "--login"):
+            yield from login_startup(ctx)
+        else:
+            yield from interactive_startup(ctx)
         return 0
     node = m.lookup(args[0])
     if node["t"] != "f":
         raise FsError(f"{args[0]}: Is a directory")
+    return (yield from run_script(ctx, node.get("data", ""), subshell=True))
+
+
+@command("source", "run a file in the CURRENT shell: source FILE  (also: . FILE)", G,
+         aliases=(".",))
+def _source(ctx, args):
+    if not args:
+        raise UsageError("filename argument required")
+    m = ctx.machine
+    if not m.exists(args[0]):
+        raise FsError(f"{args[0]}: No such file or directory")
+    return (yield from source_file(ctx, args[0]))
+
+
+@command("exec", "replace the shell with a command (here: just run it)", G)
+def _exec(ctx, args):
+    if not args:
+        return 0
+    return (yield from run_argv(ctx, args))
+
+
+@command("set", "shell options (set +h is accepted; no args: list variables)", G)
+def _set(ctx, args):
+    if not args:
+        for k in sorted(ctx.machine.env):
+            ctx.write(f"{k}={ctx.machine.env[k]}\n")
+    return 0
+
+
+def _test(m, a):
+    """Evaluate a test expression (list of strings). Returns bool or raises UsageError."""
+    if not a:
+        return False
+    if a[0] == "!":
+        return not _test(m, a[1:])
+    if len(a) == 1:
+        return a[0] != ""
+    if len(a) == 2:
+        op, x = a
+        if op == "-z":
+            return x == ""
+        if op == "-n":
+            return x != ""
+        if op in ("-e", "-f", "-d", "-L", "-h", "-x", "-s", "-r", "-w"):
+            try:
+                node = m.resolve(x, follow=op not in ("-L", "-h")).node
+            except FsError:
+                return False
+            if node is None:
+                return False
+            return {"-e": True, "-r": True, "-w": True, "-f": node["t"] == "f",
+                    "-d": node["t"] == "d", "-L": node["t"] == "l", "-h": node["t"] == "l",
+                    "-x": bool(node["m"] & 0o111), "-s": node.get("size", 4096) > 0}[op]
+        raise UsageError(f"{op}: unary operator expected")
+    if len(a) == 3:
+        x, op, y = a
+        if op in ("=", "=="):
+            return x == y
+        if op == "!=":
+            return x != y
+        if op in ("-eq", "-ne", "-lt", "-le", "-gt", "-ge"):
+            try:
+                xi, yi = int(x), int(y)
+            except ValueError:
+                raise UsageError(f"{x}: integer expression expected")
+            return {"-eq": xi == yi, "-ne": xi != yi, "-lt": xi < yi, "-le": xi <= yi,
+                    "-gt": xi > yi, "-ge": xi >= yi}[op]
+        raise UsageError(f"{op}: binary operator expected")
+    if "-a" in a:
+        i = a.index("-a")
+        return _test(m, a[:i]) and _test(m, a[i + 1:])
+    if "-o" in a:
+        i = a.index("-o")
+        return _test(m, a[:i]) or _test(m, a[i + 1:])
+    raise UsageError("too many arguments")
+
+
+@command("test", "evaluate a condition: test -e FILE, [ -L /bin ], [ \"$A\" = b ]", G,
+         aliases=("[",))
+def _test_cmd(ctx, args):
+    if args and args[-1] == "]":
+        args = args[:-1]
+    return 0 if _test(ctx.machine, args) else 1
+
+
+@command("nproc", "number of CPU cores", G)
+def _nproc(ctx, args):
+    ctx.write(f"{mach.CORES}\n")
+
+
+@command("time", "time a command: time make", G)
+def _time(ctx, args):
+    m = ctx.machine
+    start = m.clock
     status = 0
-    for line in node.get("data", "").splitlines():
-        if line.strip() and not line.lstrip().startswith("#"):
-            status = yield from start_line(ctx, line)
+    if args:
+        status = yield from run_argv(ctx, args)
+    real = m.clock - start + 0.004
+    ctx.write(f"\nreal\t{int(real // 60)}m{real % 60:.3f}s\n"
+              f"user\t{int(real * 0.9 // 60)}m{real * 0.9 % 60:.3f}s\n"
+              f"sys\t0m{real * 0.08 % 60:.3f}s\n", "dim")
     return status
+
+
+@command("dirname", "strip the last component from a path", G)
+def _dirname(ctx, args):
+    for a in args or [""]:
+        a = a.rstrip("/") or "/"
+        head = a.rsplit("/", 1)[0] if "/" in a else "."
+        ctx.write((head or "/") + "\n")
+
+
+@command("basename", "strip the directory (and a suffix) from a path", G)
+def _basename(ctx, args):
+    if not args:
+        raise UsageError("missing operand")
+    name = args[0].rstrip("/").rsplit("/", 1)[-1] or "/"
+    if len(args) > 1 and name.endswith(args[1]) and name != args[1]:
+        name = name[:-len(args[1])]
+    ctx.write(name + "\n")
 
 
 def _ver_tuple(v: str):
@@ -283,6 +462,9 @@ def _ver_check(ctx, args):
 
 @command("exit", "leave 'su' session, or return to the main menu", G, aliases=("logout",))
 def _exit(ctx, args):
+    status = int(args[0]) if args and args[0].isdigit() else 0
+    if getattr(ctx, "in_script", False):
+        raise ScriptExit(status)
     if ctx.machine.logout():
         ctx.write("logout\n")
         return 0
