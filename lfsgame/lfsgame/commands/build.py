@@ -7,6 +7,7 @@ import re
 from ..shell.opts import Opts
 from ..shell.runner import Input, Sleep, UsageError, command, find_program, program
 from ..sim import build as bd
+from ..sim import ch8
 from ..sim import packages as pk
 from ..sim.vfs import FsError, mkdir_node, node_md5, tree_size
 
@@ -98,7 +99,12 @@ def _tar(ctx, args):
         raise FsError(f"{top}: Cannot mkdir: Permission denied")
     u, g = m._owner()
     _chown_tree(tree, u, g)
+    if tree.get("flat"):  # tzdata: the files land in the current directory
+        target_dir.node["c"].update(tree["c"])
+        return 0
     target_dir.node["c"][top] = tree
+    if tree.get("build"):  # packages with a plain Makefile (no configure)
+        tree["build"]["srcdir"] = target_dir.path.rstrip("/") + "/" + top
     return 0
 
 
@@ -136,10 +142,6 @@ def _tar_create(ctx, files, dest):
 
 
 # ------------------------------------------------------------------ patch
-PATCHED_FILES = ["Makeconfig", "nscd/nscd.h", "nss/db-Makefile", "sunrpc/rpc_main.c",
-                 "sysdeps/generic/paths.h", "sysdeps/unix/sysv/linux/paths.h"]
-
-
 @command("patch", "apply a patch: patch -Np1 -i ../FILE.patch", G)
 def _patch(ctx, args):
     m = ctx.machine
@@ -150,54 +152,58 @@ def _patch(ctx, args):
         text = m.lookup(o.args[-1]).get("data", "")
     else:
         text = getattr(ctx, "stdin", None) or ""
-    mo = re.search(r"lfsgame-patch: (\S+)", text)
     if not text.strip():
         ctx.write("patch: **** Only garbage was found in the patch input.\n", "err")
         return 2
+    mo = re.search(r"lfsgame-patch: (\S+)(?: (\S+))?", text)
     if not mo:
         ctx.write("patch: **** this patch is not known to the simulation\n", "err")
         return 2
-    name = mo.group(1).split("-", 1)[1]           # "fhs"
+    pkg, name = (mo.group(1), mo.group(2)) if mo.group(2) else mo.group(1).split("-", 1)
+    files = pk.PATCH_FILES.get((pkg, name), ["Makefile"])
     top = m.lookup(".")
-    if top.get("srcpkg") != "glibc" or o.vals.get("p", "0") != "1":
+    if top.get("srcpkg") != pkg or o.vals.get("p", "0") != "1":
         ctx.write("can't find file to patch at input line 5\n"
                   "Perhaps you used the wrong -p or --strip option?\n"
                   "The text leading up to this was:\n"
                   "--------------------------\n"
-                  "|diff -Naur glibc-2.40.orig/Makeconfig glibc-2.40/Makeconfig\n"
+                  f"|diff -Naur {files[0]} {files[0]}\n"
                   "--------------------------\n")
         if "f" not in o and "s" not in o:
             yield Input("File to patch: ")
         ctx.write("Skip this patch? [y] \nSkipping patch.\n1 out of 1 hunk ignored\n", "err")
-        _hint(ctx, "run patch -Np1 from the top of the unpacked glibc source tree")
+        _hint(ctx, f"run patch -Np1 from the top of the unpacked {pkg} source tree")
         return 1
     applied = name in top.get("patches", [])
     reverse = "R" in o
     if applied and not reverse:
-        ctx.write("patching file Makeconfig\n")
+        ctx.write(f"patching file {files[0]}\n")
         if "N" in o:
             ctx.write("Reversed (or previously applied) patch detected!  Skipping patch.\n"
-                      "1 out of 1 hunk ignored -- saving rejects to file Makeconfig.rej\n", "err")
+                      f"1 out of 1 hunk ignored -- saving rejects to file {files[0]}.rej\n", "err")
             return 1
         ans = yield Input("Reversed (or previously applied) patch detected!  Assume -R? [n] ")
         if ans and ans.strip().lower().startswith("y"):
             reverse = True
         else:
-            ans = yield Input("Apply anyway? [n] ")
-            ctx.write("Skipping patch.\n1 out of 1 hunk ignored -- saving rejects to file "
-                      "Makeconfig.rej\n", "err")
+            yield Input("Apply anyway? [n] ")
+            ctx.write(f"Skipping patch.\n1 out of 1 hunk ignored -- saving rejects to file "
+                      f"{files[0]}.rej\n", "err")
             return 1
     if reverse and not applied:
-        ctx.write("patching file Makeconfig\nUnreversed patch detected!  Ignore -R? [n] \n"
+        ctx.write(f"patching file {files[0]}\nUnreversed patch detected!  Ignore -R? [n] \n"
                   "Skipping patch.\n", "err")
         return 1
-    for f in PATCHED_FILES:
+    for f in files:
         ctx.write(f"patching file {f}\n")
+    first = top["c"].get(files[0]) if "/" not in files[0] else None
+    if first is not None and first["t"] == "f" and not reverse:
+        first["data"] = first.get("data", "") + f"# patched: {name}\n"
     patches = [p for p in top.get("patches", []) if p != name]
     if not reverse:
         patches.append(name)
     top["patches"] = patches
-    if "Makeconfig" in top["c"]:
+    if pkg == "glibc" and "Makeconfig" in top["c"]:
         mk = top["c"]["Makeconfig"]
         mk["data"] = mk["data"].replace("/db\n", "/lib/nss_db\n") if not reverse else \
             mk["data"].replace("/lib/nss_db\n", "/db\n")
@@ -229,7 +235,9 @@ def _configure(ctx, args, path, node):
         mk["prog"] = "makefile"
         m.lookup(sub)["build"] = dict(meta, sub=sub, opts=dict(meta["opts"]))
     m.write_file("config.status", "#! /bin/sh\n# config.status (simulated)\n")
-    mk = m.write_file("Makefile", f"# Makefile generated by configure for {meta['component']}\n")
+    spec8 = ch8.BY_KEY.get(meta["component"]) if meta.get("ch8") else None
+    mk = m.write_file("Makefile", (spec8.makefile if spec8 is not None and spec8.makefile else
+                                   f"# Makefile generated by configure for {meta['component']}\n"))
     mk["prog"] = "makefile"
     cwd["build"] = meta
     m.clock += 25 * bd.SBU.get(meta["component"], 1)
@@ -247,6 +255,9 @@ VERSIONS = {"perl": "This is perl 5, version 40, subversion 0 (v5.40.0) built fo
             "m4": "m4 (GNU M4) 1.4.19", "gawk": "GNU Awk 5.3.0", "bash": "GNU bash, version 5.2.32"}
 
 
+TOOL_HANDLERS = {}  # tool name -> fn(ctx, args, path, node); filled by commands/ch8tools.py
+
+
 @program("binary")
 def _binary(ctx, args, path, node):
     if node.get("native") and node.get("tool") == "file":
@@ -258,6 +269,12 @@ def _binary(ctx, args, path, node):
             return (yield from _gcc_compile(ctx, args, path, dict(node, prefix="/usr",
                                                                   sysroot="/")))
         tool = node.get("tool", path.rsplit("/", 1)[-1])
+        handler = TOOL_HANDLERS.get(tool)
+        if handler is not None:
+            res = handler(ctx, args, path, node)
+            if hasattr(res, "send"):
+                res = yield from res
+            return res
         if "--version" in args or "-v" in args or "-V" in args:
             ctx.write(VERSIONS.get(tool, f"{tool} (simulated)") + "\n")
             return 0
@@ -366,10 +383,40 @@ def _gcc_compile(ctx, args, path, node):
             ctx.write(f"{ldpath}: cannot find {f}: No such file or directory\n", "err")
         ctx.write("collect2: error: ld returned 1 exit status\n", "err")
         return 1
+    if "-v" in args:
+        for line in _gcc_verbose(t, name):
+            ctx.write(line + "\n", "err")
     exe = m.write_file(out, "")
     exe.update({"prog": "elf", "m": 0o755, "size": 15_800, "interp": "/lib64/ld-linux-x86-64.so.2",
                 "cross": t == bd.TARGET, "sysroot": sysroot})
+    if node.get("ch8"):
+        exe["ch8native"] = True
     return 0
+
+
+def _gcc_verbose(t, name):
+    lib = f"/usr/lib/gcc/{t}/{bd.GCC_VER}"
+    return [
+        "Using built-in specs.", f"COLLECT_GCC={name}",
+        f"COLLECT_LTO_WRAPPER=/usr/libexec/gcc/{t}/{bd.GCC_VER}/lto-wrapper",
+        f"Target: {t}", "Configured with: ../configure --prefix=/usr LD=ld ...",
+        "Thread model: posix", f"gcc version {bd.GCC_VER} (GCC)",
+        f" /usr/libexec/gcc/{t}/{bd.GCC_VER}/cc1 -quiet -v dummy.c -o /tmp/ccA1b2C3.s",
+        "#include \"...\" search starts here:", "#include <...> search starts here:",
+        f" {lib}/include", " /usr/local/include", f" {lib}/include-fixed", " /usr/include",
+        "End of search list.",
+        f" /usr/libexec/gcc/{t}/{bd.GCC_VER}/collect2 -plugin ... --verbose",
+        "GNU ld (GNU Binutils) 2.43.1",
+        f'SEARCH_DIR("/usr/{t}/lib64"); SEARCH_DIR("/usr/local/lib64"); SEARCH_DIR("/lib64"); '
+        f'SEARCH_DIR("/usr/lib64"); SEARCH_DIR("/usr/{t}/lib"); SEARCH_DIR("/usr/local/lib"); '
+        f'SEARCH_DIR("/lib"); SEARCH_DIR("/usr/lib");',
+        f"attempt to open {lib}/../../../../lib/Scrt1.o succeeded",
+        f"attempt to open {lib}/../../../../lib/crti.o succeeded",
+        f"attempt to open {lib}/crtbeginS.o succeeded",
+        "found ld-linux-x86-64.so.2 at /usr/lib/ld-linux-x86-64.so.2",
+        "attempt to open /usr/lib/libc.so.6 succeeded",
+        f"attempt to open {lib}/../../../../lib/crtn.o succeeded",
+    ]
 
 
 @program("gcc")
@@ -424,6 +471,8 @@ def _readelf(ctx, args):
                       f"      [Requesting program interpreter: {interp}]\n")
             if node.get("cross") and interp == "/lib64/ld-linux-x86-64.so.2":
                 m.flag("sanity_ok")
+            if node.get("ch8native") and interp == "/lib64/ld-linux-x86-64.so.2":
+                m.flag("sanity8")
         ctx.write("  LOAD           0x0000000000000000 0x0000000000000000 0x0000000000000000\n"
                   "                 0x0000000000000628 0x0000000000000628  R      0x1000\n")
     return status
@@ -437,6 +486,10 @@ def _make_args(args):
         a = args[i]
         if a == "-C" and i + 1 < len(args):
             cdir = args[i + 1]
+            i += 2
+            continue
+        if a == "-f" and i + 1 < len(args):
+            vars_["__makefile"] = args[i + 1]
             i += 2
             continue
         if re.fullmatch(r"-j\d*|--jobs(=\d+)?", a):
@@ -462,16 +515,23 @@ def _make(ctx, args):
     try:
         here = m.lookup(".")
         mk = None
-        for name in ("GNUmakefile", "makefile", "Makefile"):
+        mkfile = vars_.pop("__makefile", None)
+        for name in ([mkfile] if mkfile else ["GNUmakefile", "makefile", "Makefile"]):
             if name in here["c"]:
                 mk = here["c"][name]
                 break
+        if mkfile and mk is None:
+            ctx.write(f"make: {mkfile}: No such file or directory\n"
+                      f"make: *** No rule to make target '{mkfile}'.  Stop.\n", "err")
+            return 2
         if mk is None:
             ctx.write("make: *** No targets specified and no makefile found.  Stop.\n", "err")
             return 2
         if mk.get("prog") == "kbuild":
             return (yield from _kbuild(ctx, here, targets or ["all"], jflags))
         meta = here.get("build")
+        if meta and meta.get("ch8") and (mk.get("prog") == "makefile" or mkfile):
+            return (yield from _make8(ctx, here, meta, targets, vars_, jflags, mkfile))
         if mk.get("prog") != "makefile" or not meta:
             ctx.write("make: nothing to do here in the simulation (this Makefile was not "
                       "generated by a simulated configure)\n", "err")
@@ -547,21 +607,28 @@ def _sub_make(ctx, here, meta, target, jobs_n):
     return 0
 
 
-def _build(ctx, meta, jobs_n, make_vars=None):
+def _build(ctx, meta, jobs_n, make_vars=None, products_key="all"):
     m = ctx.machine
     comp = meta["component"]
-    if meta["state"] in ("built", "installed"):
+    spec8 = ch8.BY_KEY.get(comp) if meta.get("ch8") else None
+    if meta["state"] in ("built", "installed") and products_key == "all":
         ctx.write("make: Nothing to be done for 'all'.\n")
         return 0
     sbu = bd.SBU_PASS2.get(comp, 1.0) if meta.get("pass") == 2 else bd.SBU.get(comp, 1.0)
     if meta.get("native"):
         sbu = 0.1
+    if spec8 is not None:
+        sbu = spec8.sbu or 0.05
     speed = bd.speedup(jobs_n)
     total_ms = sbu * bd.SBU_REAL_MS / speed
+    if spec8 is not None:
+        total_ms = min(total_ms, 12000)
     files = bd.COMPILE_FILES.get(comp, ["main.c"])
     steps = 24
     failure = bd.build_failure(m, meta, make_vars)
-    ctx.write(f"make[1]: Entering directory '{m.cwd}'\n", "dim")
+    ninja_style = "build.ninja" in m.lookup(".")["c"]
+    if not ninja_style:
+        ctx.write(f"make[1]: Entering directory '{m.cwd}'\n", "dim")
     if comp == "binutils" and meta.get("pass") == 2:
         ltmain = m.resolve(meta["srcdir"] + "/ltmain.sh").node or {}
         meta["ltmain_ok"] = bd.LTMAIN_LINE not in ltmain.get("data", "")
@@ -578,19 +645,31 @@ def _build(ctx, meta, jobs_n, make_vars=None):
             _hint(ctx, failure.hint)
             m.clock += sbu * bd.SBU_SECONDS * 0.6 / speed
             return 2
-        ctx.write(bd.compile_line(comp, files[k % len(files)], meta, m.cwd) + "\n")
+        if ninja_style:
+            obj = files[k % len(files)].rsplit(".", 1)[0]
+            ctx.write(f"[{(k + 1) * 56}/{steps * 56}] Compiling C object {obj}.o\n")
+        else:
+            ctx.write(bd.compile_line(comp, files[k % len(files)], meta, m.cwd) + "\n")
         yield Sleep(int(total_ms / steps))
-    ctx.write(f"make[1]: Leaving directory '{m.cwd}'\n", "dim")
+    if not ninja_style:
+        ctx.write(f"make[1]: Leaving directory '{m.cwd}'\n", "dim")
     secs = sbu * bd.SBU_SECONDS / speed
     m.clock += secs
     meta["state"] = "built"
     if meta.get("native") and comp == "file":
         _native_bin(m, m.cwd.rstrip("/") + "/src/file", "file")
-    for rel in bd.PRODUCTS.get(comp, []):
-        node = m.write_file(m.cwd.rstrip("/") + "/" + rel, "")
-        node.update({"prog": "binary", "tool": rel.rsplit("/", 1)[-1], "cross": True,
-                     "target": bd.TARGET, "m": 0o755, "size": 1_200_000})
-    if comp == "python":
+    rels = spec8.products.get(products_key, []) if spec8 is not None else \
+        bd.PRODUCTS.get(comp, [])
+    for rel in rels:
+        path = m.cwd.rstrip("/") + "/" + rel
+        m.mkdir(path.rsplit("/", 1)[0] or "/", parents=True)
+        node = m.write_file(path, "# generated\n" if rel.endswith(".pc") else "")
+        if not rel.endswith((".pc", ".log")):
+            node.update({"prog": "binary", "tool": rel.rsplit("/", 1)[-1], "cross": True,
+                         "target": bd.TARGET, "m": 0o755, "size": 1_200_000})
+        if spec8 is not None:
+            node["ch8"] = True
+    if comp == "python" and spec8 is None:
         ctx.write(bd.PYTHON_MISSING + "\n", "warn")
         _hint(ctx, "this is expected now: those modules need libraries that come in chapter 8")
     ctx.write(f"(simulated build time: {sbu:g} SBU / {jobs_n} job{'s' if jobs_n > 1 else ''} "
@@ -604,6 +683,9 @@ def _install(ctx, here, meta, destdir, make_vars=None):
     if comp == "glibc":
         top, topnode = bd.src_top(m, meta["srcdir"])
         meta["patched"] = "fhs" in (topnode or {}).get("patches", [])
+    if meta.get("ch8") and comp == "glibc" and not m.exists("/etc/ld.so.conf"):
+        ctx.write("Warning: ignoring configuration file that cannot be opened: "
+                  "/etc/ld.so.conf: No such file or directory\n", "warn")
     try:
         files = bd.install_files(m, meta, destdir, make_vars)
     except bd.BuildError as exc:
@@ -662,6 +744,11 @@ def _install(ctx, here, meta, destdir, make_vars=None):
     m.clock += 10 * bd.SBU.get(comp, 1)
     if comp == "glibc" and meta.get("patched"):
         m.flag("glibc_fhs")
+    if meta.get("ch8"):
+        top, topnode = bd.src_top(m, meta["srcdir"]) if meta["srcdir"] else (None, None)
+        for name in (topnode or {}).get("patches", []):
+            m.flag(f"patched:{comp}:{name}")
+        m.flag(f"installed8:{comp}")
     if comp == "binutils" and meta.get("pass") == 2 and meta.get("ltmain_ok"):
         m.flag("binutils2_ltmain")
     return 0
@@ -770,3 +857,78 @@ def _file_cmd(ctx, args):
     for f in files:
         ctx.write(f"{f}: {describe(m, f)}\n")
     return 0
+
+
+# ------------------------------------------------------------------ chapter 8 make
+CHECK_TARGETS = ("check", "test", "tests", "test_harness")
+
+
+def _make8(ctx, here, meta, targets, vars_, jflags, mkfile=None):
+    m = ctx.machine
+    spec = ch8.BY_KEY[meta["component"]]
+    n = bd.jobs(m, jflags)
+    if meta.get("sub"):  # make -C libelf install
+        for t in targets or ["all"]:
+            if t == "install":
+                st = yield from _install(ctx, here, meta, vars_.get("DESTDIR", ""), vars_)
+                if st:
+                    return st
+        return 0
+    for target in targets or ["all"]:
+        if target == "all":
+            st = yield from _build(ctx, meta, n, vars_,
+                                   products_key=f"-f {mkfile}" if mkfile else "all")
+        elif target == "install":
+            st = 0
+            if meta["state"] == "configured":
+                st = yield from _build(ctx, meta, n, vars_)
+            if st == 0:
+                st = yield from _install(ctx, here, meta, vars_.get("DESTDIR", ""), vars_)
+        elif target in CHECK_TARGETS:
+            st = yield from _tests8(ctx, here, meta, spec, n, vars_)
+        elif target in ("clean", "distclean"):
+            meta["state"] = "configured"
+            ctx.write(f"rm -f *.o *.a *.so (simulated {target})\n")
+            st = 0
+        elif target in spec.extra_targets:
+            ctx.write(f"(make {target}: simulated, nothing to check)\n", "dim")
+            st = 0
+        else:
+            ctx.write(f"make: *** No rule to make target '{target}'.  Stop.\n", "err")
+            st = 2
+        if st:
+            return st
+    return 0
+
+
+def _tests8(ctx, here, meta, spec, jobs_n, vars_):
+    m = ctx.machine
+    if meta["state"] == "configured":
+        st = yield from _build(ctx, meta, jobs_n, vars_)
+        if st:
+            return st
+    if not m.can_write(here):
+        ctx.write("make[2]: Entering directory 'tests'\ntouch: cannot touch "
+                  "'tests/test-suite.log': Permission denied\n"
+                  "make[2]: *** [Makefile:1847: check-TESTS] Error 1\n", "err")
+        _hint(ctx, f"the tests run as {m.user}, who cannot write here: chown -R {m.user} .")
+        return 2
+    ctx.write(f"make[1]: Entering directory '{m.cwd}'\n", "dim")
+    tsbu = spec.tsbu or max(0.1, spec.sbu * 0.3)
+    total = min(9000, tsbu * bd.SBU_REAL_MS / bd.speedup(jobs_n))
+    names = ["basic", "errors", "options", "regress", "unicode", "large-file", "misc", "io"]
+    for i, name in enumerate(names):
+        ctx.write(f"PASS: tests/{name}-{i + 1}\n")
+        yield Sleep(int(total / len(names)))
+    ctx.write((spec.tests or "============\n# TOTAL: 8\n# PASS:  8\n# FAIL:  0\n"
+               "============") + "\n", "warn" if spec.test_status else None)
+    for rel in spec.products.get("check", []):
+        path = m.cwd.rstrip("/") + "/" + rel
+        m.mkdir(path.rsplit("/", 1)[0], parents=True)
+        m.write_file(path, f"Test run of {rel.rsplit('/', 1)[-1]}\nPASS: all\n")
+    m.clock += tsbu * bd.SBU_SECONDS / bd.speedup(jobs_n)
+    m.flag(f"tested:{spec.key}")
+    if spec.test_status:
+        ctx.write("make: *** [Makefile:...: check] Error 2\n", "err")
+        _hint(ctx, "a few failures are expected for this package (see the book)")
+    return spec.test_status

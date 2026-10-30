@@ -81,11 +81,13 @@ def _install(ctx, args):
         if node["t"] == "d":
             raise FsError(f"omitting directory '{src}'")
         target = dest.rstrip("/") + "/" + src.rsplit("/", 1)[-1] if m.isdir(dest) else dest
+        if "D" in o:
+            m.mkdir(m.abspath(target).rsplit("/", 1)[0] or "/", parents=True)
         new = m.write_file(target, node.get("data", ""))
-        for k in ("prog", "tool", "cross", "native", "size", "md5", "target"):
+        for k in ("prog", "tool", "cross", "native", "size", "md5", "target", "ch8"):
             if k in node:
                 new[k] = node[k]
-        new["m"] = 0o755
+        new["m"] = 0o755 if mode is None else mode
         finish(new)
         if "v" in o:
             ctx.write(f"'{src}' -> '{target}'\n")

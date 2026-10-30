@@ -9,21 +9,23 @@ This shell imitates bash, but only a part of it.
 - Command substitution: $(command) and `command`.
 - Brace expansion {a,b} (also nested), sequences {1..8}, and globs * ? [abc].
 - Several commands: a ; b, a && b (b only if a succeeded), a || b (b only if a failed), pipes a | b.
-- Redirection: > file, >> file, < file, and here-documents (cat > file << "EOF" ... EOF).
+- Redirection: > file, >> file, < file, 2> file, 2>> file, 2>&1, &> file, and here-documents (cat > file << "EOF" ... EOF).
 - if ...; then ...; elif ...; then ...; else ...; fi and for NAME in WORDS; do ...; done.
 - Unfinished input (open quote, missing fi, a here-document) gives a "> " prompt for more lines.
 
 ## Not supported
-- case, while, functions, subshells ( ), background jobs (&), 2> redirections.
+- case, while, functions, subshells ( ), background jobs (&).
 
 ## Useful commands
 - Files: ls -l, cat, mkdir -p, touch, rm -r, ln -s, chmod, chown, cp -r, mv, pushd/popd, find, du, file.
-- Text: grep, sed, wc, head, tail, echo.
+- Text: grep (-A -B -o), sed (s, d, c, a, i), wc, head, tail, echo, tee, xargs.
 - Disks: lsblk -f, blkid, fdisk -l, fdisk DEVICE, mkfs, mkswap, swapon, mount (also --bind and proc/sysfs/devpts/tmpfs), umount, mountpoint, df -h, free -h.
 - Network: wget, md5sum -c.
 - Building: tar -xf, patch, make, readelf, time, nproc.
 - Users and shells: groupadd, useradd, passwd, su, chroot, whoami, id, env, source, exit.
 - Files, chapter 7: install -d -m -o, chgrp, chown --from, realpath.
+- Chapter 8: ulimit, useradd -D, pwconv, grpconv, localedef, zic, tzselect, python3/pip3 (wheel, install), meson setup, ninja, perl Makefile.PL, autoreconf, udevadm, strip, ln -r, install -D.
+- Make targets: make check / make test / make -k check; as the tester user: su tester -c "...".
 - Inside a chroot only programs that are installed in it can be run (plus bash builtins and the game commands).
 - Game: tasks, hint, book, save, menu.
 

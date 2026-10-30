@@ -1,11 +1,11 @@
 """Tokenize, parse and expand shell input. Pure, no tkinter.
 
 Supported: 'single' "double" \\escapes and \\<newline> continuation, # comments,
-; && || | newlines, > >> < redirections, here-documents (<< and <<-, quoted or not),
+; && || | newlines, > >> < 2> 2>> 2>&1 &> redirections, here-documents (<< and <<-, quoted or not),
 $VAR ${VAR} $? $$, $(...) and `...` command substitution, ~ and ~user,
 brace expansion {a,b} (nested) and {1..8}, globs * ? [..], word splitting of unquoted expansions,
 compound commands: if/elif/else/fi, for NAME in WORDS; do ...; done, ! pipeline.
-Not supported: case, while/until, functions, subshells ( ), background &, 2>.
+Not supported: case, while/until, functions, subshells ( ), background &.
 
 Incomplete input (open quote, trailing backslash or |/&&, missing fi/done, here-doc
 without its terminator) raises ``Incomplete`` so an interactive shell can ask for more
@@ -98,6 +98,12 @@ class _Lexer:
             elif c == "#":
                 while self.i < n and s[self.i] != "\n":
                     self.i += 1
+            elif c == "2" and s[self.i + 1:self.i + 2] == ">" and \
+                    (self.i == 0 or s[self.i - 1] in " \t\n;&|"):
+                op = "2>&1" if s.startswith("2>&1", self.i) else \
+                    "2>>" if s.startswith("2>>", self.i) else "2>"
+                self.toks.append(("op", op))
+                self.i += len(op)
             elif c in OPCHARS:
                 self._operator()
             else:
@@ -108,7 +114,7 @@ class _Lexer:
 
     def _operator(self):
         s = self.s
-        for op in ("<<-", "&&", "||", ">>", "<<", ";;", ";", "|", ">", "<", "&"):
+        for op in ("<<-", "&>", "&&", "||", ">>", "<<", ";;", ";", "|", ">", "<", "&"):
             if s.startswith(op, self.i):
                 break
         self.i += len(op)
@@ -273,7 +279,7 @@ class _Parser:
                 if not items:
                     raise ParseError(f"syntax error near unexpected token `{kw}'")
                 return items, kw
-            if tok[0] == "op" and tok[1] not in (">", ">>", "<", "<<"):
+            if tok[0] == "op" and tok[1] not in (">", ">>", "<", "<<", "2>", "2>>", "&>"):
                 raise ParseError(f"syntax error near unexpected token `{_tok_text(tok)}'")
             items.append((conn, self.parse_command()))
             conn = None
@@ -327,7 +333,10 @@ class _Parser:
             if tok[0] == "word":
                 sc.words.append(tok[1])
                 self.k += 1
-            elif tok[1] in (">", ">>", "<"):
+            elif tok[1] == "2>&1":
+                sc.redirs.append(("2>&1", []))
+                self.k += 1
+            elif tok[1] in (">", ">>", "<", "2>", "2>>", "&>"):
                 self.k += 1
                 nxt = self.peek()
                 if nxt is None or nxt[0] != "word":

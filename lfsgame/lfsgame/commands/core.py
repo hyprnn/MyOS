@@ -201,9 +201,9 @@ def _umask(ctx, args):
 def _whoami(ctx, args):
     m = ctx.machine
     if m.croot:
-        name = m.db_name_of_uid(m.users.get(m.user, {}).get("uid", 0))
+        name = m.db_name_of_uid(m.uid())
         if not name:
-            ctx.write(f"whoami: cannot find name for user ID {m.users[m.user]['uid']}\n", "err")
+            ctx.write(f"whoami: cannot find name for user ID {m.uid()}\n", "err")
             return 1
         ctx.write(name + "\n")
         return 0
@@ -214,7 +214,7 @@ def _whoami(ctx, args):
 def _id(ctx, args):
     m = ctx.machine
     if m.croot and not args:
-        uid = m.users.get(m.user, {}).get("uid", 0)
+        uid = m.uid()
         name = m.db_name_of_uid(uid)
         ctx.write(f"uid={uid}({name}) gid={uid}({name}) groups={uid}({name})\n" if name
                   else f"uid={uid} gid={uid} groups={uid}\n")
@@ -428,6 +428,13 @@ def _test_cmd(ctx, args):
     if args and args[-1] == "]":
         args = args[:-1]
     return 0 if _test(ctx.machine, args) else 1
+
+
+@command("ulimit", "resource limits (accepted, not simulated)", G, hidden=True)
+def _ulimit(ctx, args):
+    if not args:
+        ctx.write("unlimited\n")
+    return 0
 
 
 @command("nproc", "number of CPU cores", G)

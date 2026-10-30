@@ -338,11 +338,3 @@ $ tar -cJpf $HOME/lfs-temp-tools-12.2.tar.xz .
 
 To continue afterwards, mount the virtual file systems again (7.3) and enter the chroot (7.4).
 
-@chapter 8. Coming Next
-@section 8.0 | To Be Continued
-
-The temporary system is finished. In the real book chapter 8 builds the final system inside the chroot: about 80 packages, starting with the man pages, Iana-Etc and Glibc, each one installed for good, with test suites.
-
-That is planned for a later version of the game. Save now!
-
-$ tasks

@@ -1,3 +1,3 @@
 """LFS Game — a Linux From Scratch build simulator (terminal-style GUI)."""
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

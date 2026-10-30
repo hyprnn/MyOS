@@ -5,7 +5,7 @@ import fnmatch
 import re
 
 from ..shell.opts import Opts
-from ..shell.runner import UsageError, command
+from ..shell.runner import UsageError, command, run_argv
 from ..sim.vfs import FsError
 
 G = "text"
@@ -53,7 +53,7 @@ def _bre(pattern: str, extended: bool) -> str:
 
 @command("grep", "print matching lines (-i -v -c -n -E -q)", G)
 def _grep(ctx, args):
-    o = Opts(args, "ivcnEqFl")
+    o = Opts(args, "ivcnEqFlo", "AB")
     if not o.args:
         raise UsageError("usage: grep [OPTION]... PATTERNS [FILE]...")
     pat, files = o.args[0], o.args[1:]
@@ -63,9 +63,12 @@ def _grep(ctx, args):
     except re.error as exc:
         raise UsageError(f"invalid regular expression: {exc}")
     found = False
+    after, before = int(o.vals.get("A", 0)), int(o.vals.get("B", 0))
     for label, text in _inputs(ctx, files, "grep"):
         count = 0
-        for n, line in enumerate(text.splitlines(), 1):
+        lines = text.splitlines()
+        shown = set()
+        for n, line in enumerate(lines, 1):
             if bool(rx.search(line)) != ("v" in o):
                 count += 1
                 found = True
@@ -73,7 +76,16 @@ def _grep(ctx, args):
                     continue
                 prefix = f"{label}:" if len(files) > 1 else ""
                 prefix += f"{n}:" if "n" in o else ""
-                ctx.write(prefix + line + "\n")
+                if "o" in o:
+                    for mo in rx.finditer(line):
+                        ctx.write(prefix + mo.group(0) + "\n")
+                    continue
+                for k in range(max(1, n - before), min(len(lines), n + after) + 1):
+                    if k not in shown:
+                        if shown and k > max(shown) + 1 and (after or before):
+                            ctx.write("--\n")
+                        shown.add(k)
+                        ctx.write(prefix + lines[k - 1] + "\n")
         if "c" in o:
             ctx.write((f"{label}:" if len(files) > 1 else "") + f"{count}\n")
         elif "l" in o and count:
@@ -180,9 +192,18 @@ def _sed_parse(script: str):
         elif c in "dp":
             cmds.append((addr, c, None, None, ""))
             i += 1
+        elif c in "cai":
+            j = i + 1
+            if script[j:j + 1] == "\\":
+                j += 1
+            k = j
+            while k < n and script[k] != "\n":
+                k += 1
+            cmds.append((addr, c, script[j:k].strip(), None, ""))
+            i = k
         else:
             raise UsageError(f"-e expression #1: unknown command: `{c}' "
-                             f"(the simulated sed knows s, d and p)")
+                             f"(the simulated sed knows s, d, p, c, a and i)")
     return cmds
 
 
@@ -191,7 +212,9 @@ def _sed_repl(rep: str) -> str:
     while i < len(rep):
         c = rep[i]
         if c == "\\" and i + 1 < len(rep):
-            out.append("\\" + rep[i + 1] if rep[i + 1].isdigit() else rep[i + 1].replace("\\", "\\\\"))
+            nxt = rep[i + 1]
+            out.append("\\" + nxt if nxt.isdigit() else "\n" if nxt == "n" else
+                       nxt.replace("\\", "\\\\"))
             i += 2
         elif c == "&":
             out.append("\\g<0>")
@@ -217,6 +240,15 @@ def sed_apply(script_cmds, text: str, extended=False, quiet=False) -> str:
             if c == "d":
                 deleted = True
                 break
+            if c == "c":
+                line, deleted = a, False
+                out.append(a)
+                deleted = True
+                break
+            if c == "i":
+                out.append(a)
+            if c == "a":
+                line = line + "\n" + a
             if c == "p":
                 out.append(line)
             elif c == "s":
@@ -299,6 +331,8 @@ def _find(ctx, args):
             i += 1
         elif a in ("-delete", "-print"):
             action = a[1:]
+        elif a in ("-depth", "-xdev"):
+            pass  # accepted: the simulated find always lists children first for -delete
         else:
             raise UsageError(f"unknown predicate `{a}' (the simulated find knows "
                              f"-name -type -maxdepth ! -delete -print)")
@@ -351,3 +385,21 @@ def _find(ctx, args):
                 if match(path.rsplit("/", 1)[-1], node):
                     ctx.write(path + "\n")
     return status
+
+
+@command("xargs", "run a command with arguments read from input: ... | xargs rm -rf", G)
+def _xargs(ctx, args):
+    words = (getattr(ctx, "stdin", None) or "").split()
+    if not words:
+        return 0
+    return (yield from run_argv(ctx, (args or ["echo"]) + words))
+
+
+@command("tee", "copy input to files and to the output: ... | tee FILE", G)
+def _tee(ctx, args):
+    m = ctx.machine
+    o = Opts(args, "a")
+    data = getattr(ctx, "stdin", None) or ""
+    for f in o.args:
+        m.write_file(f, data, append="a" in o)
+    ctx.write(data)

@@ -58,8 +58,8 @@ class CommandTests(unittest.TestCase):
 
     def test_tasks_and_hint(self):
         self.c.run("tasks")
-        self.assertIn("0/50", self.c.text())
-        self.assertIn("Chapter 7: chroot and additional temporary tools: 13 objectives", self.c.text())
+        self.assertIn("0/132", self.c.text())
+        self.assertIn("Chapter 8: installing basic system software: 83 objectives", self.c.text())
         self.c.run("hint")
         self.assertIn("lsblk", self.c.text())
 

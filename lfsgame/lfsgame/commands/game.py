@@ -11,7 +11,8 @@ G = "game"
 CHAPTERS = {"2": "Chapter 2: partition, filesystem, mount", "3": "Chapter 3: packages",
             "4": "Chapter 4: final preparations", "5": "Chapter 5: cross-toolchain",
             "6": "Chapter 6: cross compiling temporary tools",
-            "7": "Chapter 7: chroot and additional temporary tools"}
+            "7": "Chapter 7: chroot and additional temporary tools",
+            "8": "Chapter 8: installing basic system software"}
 
 
 @command("tasks", "show your LFS objectives and progress (-a: list finished ones too)", G,
@@ -45,7 +46,7 @@ def _tasks(ctx, args):
                 ctx.write(o.title)
                 ctx.write(f"   (book {o.section}{', optional' if o.optional else ''})\n", "dim")
     if cur is None:
-        ctx.write("\nAll objectives done! Chapter 8 (the final system) is not in the game yet.\n",
+        ctx.write("\nAll objectives done! Chapter 9 (system configuration) is not in the game yet.\n",
                   "ok")
     else:
         ctx.write("\nStuck? Type 'hint' or open the book with F2 / 'book'.\n", "dim")

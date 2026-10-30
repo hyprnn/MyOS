@@ -6,7 +6,7 @@ from lfsgame.sim import packages
 from lfsgame.sim.game import Game
 from lfsgame.sim.machine import Machine
 from lfsgame.sim.objectives import OBJECTIVES
-from tests.helpers import CH4_4, CH5, CH6, CH7, FULL_WALKTHROUGH, FakeCtx
+from tests.helpers import CH4_4, CH5, CH6, CH7, FULL_WALKTHROUGH, FakeCtx, ch8_walkthrough
 
 
 class DiskTests(unittest.TestCase):
@@ -176,6 +176,10 @@ class ObjectiveTests(unittest.TestCase):
             c.run(line, inputs)  # the first wget fails on purpose (network glitch)
         for line, inputs in CH4_4 + CH5 + CH6 + CH7:
             self.assertEqual(c.run(line, inputs), 0, f"{line}\n{c.text()}")
+        for line, inputs, must in ch8_walkthrough():
+            status = c.run(line, inputs)
+            if must:
+                self.assertEqual(status, 0, f"{line}\n{c.text()}")
         missing = [o.id for o in OBJECTIVES if o.id not in c.game.done]
         self.assertEqual(missing, [])
         self.assertTrue(c.game.finished())

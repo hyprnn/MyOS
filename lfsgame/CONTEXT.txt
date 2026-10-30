@@ -1,7 +1,7 @@
 =====================================================================
 LFS GAME — CONTEXT HANDOFF FOR ANOTHER AI
 Keep this file updated with every change (together with reports/NNNN-*.md).
-Last updated: 2026-10-30, after report 0006 (version 0.6.0)
+Last updated: 2026-10-30, after report 0007 (version 0.7.0)
 =====================================================================
 
 1. WHO / WHAT
@@ -22,7 +22,10 @@ Last updated: 2026-10-30, after report 0006 (version 0.6.0)
  R4. "Continue, make chapter 5 and 4.4" (v0.4.0)
  R5. "Continue, make chapter 6" (v0.5.0)
  R6. "Continue, make chapter 7" (v0.6.0)
- NOT done yet: chapter 8+ (final system, configuration, kernel, boot).
+ R7. "Continue, make chapter 8" (v0.7.0)
+ NOT done yet: chapters 9-11 (system configuration, fstab/kernel/GRUB, the end).
+ NOTE: www.linuxfromscratch.org was unreachable from the cloud session; chapter 8
+ commands are from memory of LFS 12.2 (see report 0007). Verify when possible.
 
 3. WORKING RULES (must keep)
  - Every code change => new report reports/NNNN-slug.md (template in reports/README.md),
@@ -33,16 +36,16 @@ Last updated: 2026-10-30, after report 0006 (version 0.6.0)
  - Book text must be our own paraphrase, never copied from the real LFS book.
  - GUI can be tested headless: python3.12 + python3-tk + Xvfb (see report 0003).
 
-4. CURRENT STATE (v0.6.0)
+4. CURRENT STATE (v0.7.0)
  Menu: Resume / New game / Load saved game (date) / LFS Book / Quit; confirms when
    there is unsaved progress (also window X).
  Terminal: bash-like shell on a simulated host. Prompt from PS1 if set (lfs:~$ after 4.4),
-   else user@host:cwd#. ~85 commands (help lists them by group). Pipes, here-docs,
+   else user@host:cwd#. ~100 commands (help lists them by group). Pipes, 2>/2>&1/&>, here-docs,
    $(...), if/for, multi-line input with "> " prompts, typeahead while busy, Tab
    completion, history, Ctrl+C/D/L/S/U/A.
  Machine: sda (host, /, /boot/efi), sdb (empty 32G target), sdc (USB decoy). Host has
    /etc/bash.bashrc exporting CC="distcc gcc" (the 4.4 trap).
- Gameplay: 53 objectives (3 optional), chapters 2.4 -> 7.13. Builds are simulated
+ Gameplay: 136 objectives (4 optional), chapters 2.4 -> 8.85. Builds are simulated
    (sim/build.py): tar -> configure (validated options) -> make (SBU timing, realistic
    failures) -> make install (files in $LFS/tools or DESTDIR). Chapter 5 = cross
    toolchain + sanity check; chapter 6 = 15 cross-compiled packages (native tic/file
@@ -52,14 +55,19 @@ Last updated: 2026-10-30, after report 0006 (version 0.6.0)
    "I have no name!" until exec bash --login; only installed programs exist inside),
    FHS directories, essential files, native builds of Gettext, Bison, Perl, Python,
    Texinfo, Util-linux inside the chroot, cleanup, optional tar backup.
-   After 7.13: "to be continued" (book 8.0).
- Book: sections 0, 1.1, 2.2-2.7, 3.1, 3.2, 4.2-4.4, 5.1-5.6, 6.1-6.18, 7.1-7.13, 8.0, A. Multi-line command
+   Chapter 8 = 80 packages of the final system (8.3 Man-pages ... 8.82 Sysvinit),
+   data-driven (sim/ch8.py table -> book text, objectives, walkthrough): configure/
+   make/make check (simulated test summaries, tests as tester via su tester -c)/make
+   install; meson+ninja, pip3 wheel/install, perl Makefile.PL styles; Glibc config
+   (localedef, nsswitch, tzdata/zic/tzselect, ld.so.conf); GCC sanity checks; 8.84
+   optional strip; 8.85 cleanup. After 8.85: "to be continued" (book 9.0).
+ Book: sections 0, 1.1, 2.2-2.7, 3.1, 3.2, 4.2-4.4, 5.1-5.6, 6.1-6.18, 7.1-7.13, 8.1-8.85, 9.0, A. Multi-line command
    blocks ("+ " lines) paste whole on click.
  Save: JSON v2 (unchanged format; Machine.upgrade() patches old machines).
 
 5. FILE MAP
  main.py                        entry (python main.py)
- lfsgame/__init__.py            __version__ = 0.3.0
+ lfsgame/__init__.py            __version__ = 0.7.0
  lfsgame/app.py                 window 1100x680, screens, panel wiring, F2/F3/F4, confirms
  lfsgame/menu.py                MenuScreen (+ ask() yes/no line)
  lfsgame/terminal.py            TerminalScreen: drives processes, ctx API for commands
@@ -72,16 +80,21 @@ Last updated: 2026-10-30, after report 0006 (version 0.6.0)
  lfsgame/sim/packages.py        package list, wget-list/md5sums text, fake md5
  lfsgame/sim/objectives.py      OBJECTIVES (predicates + book section + hint)
  lfsgame/sim/game.py            Game = Machine + done + book_section
- lfsgame/sim/build.py           build model (ch. 5-7): source trees, configure checks,
+ lfsgame/sim/build.py           build model (ch. 5-8): source trees, configure checks,
                                 build failures, installed files, SBU timing
+ lfsgame/sim/ch8.py             chapter 8 package table (Pkg), book text generator,
+                                walkthrough, INTRO/OUTRO, tz data
  lfsgame/shell/parser.py        lexer + parser (AST: Simple/Pipeline/If/For, HereDoc) + expansions
  lfsgame/shell/runner.py        interpreter: REGISTRY, PROGRAMS, Sub ctx, PATH lookup, scripts
  lfsgame/shell/opts.py          getopt helper; shell/complete.py Tab completion
  lfsgame/commands/*.py          core, files, text, disk, fdisk (session), net, users, build,
-                                chroot (chroot/install/chgrp/realpath), game
+                                chroot (chroot/install/chgrp/realpath), game,
+                                ch8tools (python3/pip3/meson/ninja/perl/localedef/zic/
+                                tzselect/udevadm/strip/autoreconf in the new system)
+ tools/gen_ch8_book.py          regenerates book/content/09-final-system.txt from ch8.py
  lfsgame/book/__init__.py       markup parser + Book; book/content/*.txt the text
- tests/                         123 headless tests: python -m unittest -v
- reports/                       0001 .. 0006
+ tests/                         136 headless tests: python -m unittest -v
+ reports/                       0001 .. 0007
 
 6. KEY CONVENTIONS / APIs
  - Chroot: Machine.croot != "" means a chroot session. resolve() returns .path (inside
@@ -102,18 +115,28 @@ Last updated: 2026-10-30, after report 0006 (version 0.6.0)
  - Book markup: @chapter, @section ID | Title, ##, $, >, !, -, blank line = paragraph.
    Every "$" line must parse and use a registered command (a test checks it).
  - Save: add fields => bump SAVE_VERSION + migrate in read_save.
+ - Chapter 8: edit the Pkg in sim/ch8.py, then run python tools/gen_ch8_book.py (a test
+   fails if the book file is stale). "?$" steps may fail in the walkthrough. A build is
+   chapter 8 when chrooted and flag obj:cleanup7 is set (Game.check sets obj:<id>).
+   Installed ch8 packages set flag installed8:<key>. Programs of the new system go in
+   commands/ch8tools.py (TOOL_HANDLERS in commands/build.py for others).
  - Tk traps: handlers returning "break" stop propagation; F-keys must return None.
    Text tag bindings depend on the "current" mark (updated on Motion).
 
 7. KNOWN ISSUES / OPEN POINTS
  - Not tested on real Wayland/Hyprland; mouse wheel, HiDPI, clipboard paste untested.
- - No case/while/functions/subshells/2>; simplified permissions; small sed/find/grep.
+ - No case/while/functions/subshells; simplified permissions; small sed/find/grep.
+ - Ch8 simplifications (report 0007): tcl/shadow seds shortened, bash/coreutils/vim/
+   util-linux/acl tests skipped, udev via ninja install, simplified 8.84 strip.
+ - Old saves need the new ch8 archives downloaded again (book 8.1 explains).
+ - Long configure blocks wrap in the book panel (cosmetic).
  - Fixed pixel sizes (panel 440 px).
 
 8. LIKELY NEXT STEPS
- - Chapter 8: final system inside the chroot (~80 packages): needs a data-driven package
-   table, `make check` results, the special cases (Glibc, GCC, Binutils, ...).
-   Maybe `case`, Russian book.
+ - Chapter 9: bootscripts, network config, inittab, clock, console, locale (profile),
+   inputrc, shells. Chapter 10: fstab, kernel build (make menuconfig?), GRUB.
+   Chapter 11: the end / reboot. Maybe `case`, Russian book.
+ - Verify chapter 8 against the real LFS 12.2 book.
 
 9. HOW TO RUN
  sudo pacman -S tk && python main.py

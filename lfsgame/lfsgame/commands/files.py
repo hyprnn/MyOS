@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import posixpath
 import re
 import time
 
@@ -226,12 +227,18 @@ def _rmdir(ctx, args):
 @command("ln", "make links: ln -s TARGET LINK (-v verbose)", G)
 def _ln(ctx, args):
     m = ctx.machine
-    o = Opts(args, "svfn", "", {"symbolic": "s", "verbose": "v", "force": "f"})
+    o = Opts(args, "svfnr", "", {"symbolic": "s", "verbose": "v", "force": "f",
+                                 "relative": "r"})
     if "s" not in o:
         raise UsageError("hard links are not supported in this simulation (use ln -s)")
     if len(o.args) != 2:
         raise UsageError("usage: ln -s TARGET LINK_NAME")
     target, link = o.args
+    if "r" in o:  # make the target relative to the directory of the link
+        dest = m.abspath(link)
+        if m.isdir(link):
+            dest = dest.rstrip("/") + "/" + target.rstrip("/").rsplit("/", 1)[-1]
+        target = posixpath.relpath(m.abspath(target), posixpath.dirname(dest))
     if "f" in o:
         r = m.resolve(link, follow=False)
         if r.node is not None and r.node["t"] == "d":  # ln -sf x dir/ => dir/x

@@ -401,3 +401,12 @@ CH7 = (
        ("cd $LFS", None),
        ("tar -cJpf $HOME/lfs-temp-tools-12.2.tar.xz .", None)]
 )
+
+
+def ch8_walkthrough():
+    """Re-mount, enter the chroot again, then every chapter 8 command:
+    [(line, inputs, must_succeed)]."""
+    from lfsgame.sim import ch8
+    out = [(line, inputs, True) for line, inputs in CH7_HOST[3:]]
+    out += [(line, ch8.WALK_INPUTS.get(line), must) for line, must in ch8.walkthrough()]
+    return out

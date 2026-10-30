@@ -734,10 +734,16 @@ class Machine:
         self.env = dict(self.env)
         self.refresh_name()
 
+    def uid(self) -> int:
+        """Numeric id of the current user (inside a chroot: from its /etc/passwd)."""
+        if self.croot and self.user not in self.users:
+            return self.db_users().get(self.user, 65534)
+        return self.users.get(self.user, {}).get("uid", 0)
+
     def refresh_name(self):
         """What bash does at start: find the name of our uid in /etc/passwd."""
         if self.croot:
-            self.chroot_name = self.db_name_of_uid(self.users.get(self.user, {}).get("uid", 0))
+            self.chroot_name = self.db_name_of_uid(self.uid())
             if self.chroot_name:
                 self.flag("chroot_named")
 

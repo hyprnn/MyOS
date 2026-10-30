@@ -14,7 +14,7 @@ import posixpath
 import re
 from typing import Dict, List, Optional, Tuple
 
-from . import packages
+from . import ch8, packages
 from .vfs import FsError, file_node, link_node, mkdir_node
 
 TARGET = "x86_64-lfs-linux-gnu"
@@ -194,7 +194,49 @@ def source_tree(file: str) -> Tuple[str, dict]:
                                       "SUBDIRS = support . extras doc awklib po test\n")
     tree = _d(c)
     tree["srcpkg"] = name
+    spec = ch8.BY_KEY.get(name)
+    if name == "tzdata":  # the tzdata tarball has no top directory
+        tree["c"] = {f: _f(f"# tzdata: {f}\n") for f in ch8.TZ_FILES}
+        tree["flat"] = True
+        return top, tree
+    if spec is not None:
+        top = spec.topdir or top
+        _apply_ch8_tree(tree, spec)
     return top, tree
+
+
+def _put(tree: dict, rel: str, node: dict):
+    parts = rel.split("/")
+    cur = tree
+    for part in parts[:-1]:
+        cur = cur["c"].setdefault(part, _d({}))
+    cur["c"][parts[-1]] = node
+
+
+def _apply_ch8_tree(tree: dict, spec) -> None:
+    """Add what the chapter 8 commands of this package touch to its source tree."""
+    for rel, text in spec.srcfiles.items():
+        mode = 0o755 if rel.startswith("contrib/") or rel.endswith((".py", ".sh")) else 0o644
+        node = _f(text, mode)
+        if rel == "contrib/test_summary":
+            node["prog"] = "test_summary"
+        _put(tree, rel, node)
+    c = tree["c"]
+    if spec.confdir:
+        conf = c.pop("configure", None) or _configure(spec.key)
+        _put(tree, f"{spec.confdir}/configure", conf)
+    if spec.style in ("make", "none", "pip", "perl", "meson", "ninja"):
+        c.pop("configure", None)
+    if spec.style == "make":
+        mk = _f(spec.makefile or f"# Makefile of {spec.key}\n")
+        mk["prog"] = "makefile"
+        c["Makefile"] = mk
+        tree["build"] = {"component": spec.key, "opts": {}, "srcdir": "", "state": "configured",
+                         "ch8": True}
+    elif spec.style == "config":
+        c.pop("configure", None)
+        c["config"] = _f("#!/bin/sh\n# OpenSSL config\n", 0o755, prog="configure",
+                         component=spec.key)
 
 
 # ---------------------------------------------------------------- helpers
@@ -280,6 +322,44 @@ def _target_check(lines, opts, key="--target"):
 
 
 # ---------------------------------------------------------------- configure
+def _configure8(m, spec, srcdir, builddir, args, opts, lines, in_tree):
+    """Chapter 8: native build inside the chroot, installed straight into /usr."""
+    if spec.style == "Configure":  # perl: sh Configure -des -D name=value ...
+        for a in args:
+            if "=" in a and not a.startswith("-"):
+                k, _, v = a.partition("=")
+                opts[k] = v
+        opts["--prefix"] = opts.get("prefix", "/usr/local")
+    if spec.builddir and in_tree:
+        msg = ("you must configure in a separate build directory" if spec.key == "glibc"
+               else f"building {spec.key} inside its source directory is not supported")
+        raise BuildError(msg, lines, hint="mkdir -v build; cd build; ../configure ...")
+    _compiler_env_check(m, lines)
+    if find_tool(m, "gcc") is None or not m.exists("/usr/lib/libc.so.6"):
+        raise BuildError("no acceptable C compiler found in $PATH", lines)
+    checking(lines, ("for gcc", "gcc"), ("whether the C compiler works", "yes"),
+             ("whether we are cross compiling", "no"))
+    if spec.key in ("coreutils", "tar") and m.is_root and \
+            m.env.get("FORCE_UNSAFE_CONFIGURE") != "1":
+        raise BuildError("you should not run configure as root (set FORCE_UNSAFE_CONFIGURE=1 "
+                         "in environment to bypass this check)", lines)
+    for req in spec.requires:
+        if not m.exists(req):
+            if spec.key == "gcc":
+                raise BuildError("Building GCC requires GMP 4.2+, MPFR 3.1.0+ and MPC 0.8.0+.",
+                                 lines, hint="build GMP, MPFR and MPC first (8.21-8.23)")
+            raise BuildError(f"required file {req} not found", lines,
+                             hint="an earlier package of chapter 8 is missing")
+    if "--prefix" not in opts and spec.prefix == "/usr/local" and spec.style != "Configure":
+        checking(lines, ("installation prefix", "/usr/local (no --prefix given!)"))
+    lines += ["configure: creating ./config.status", "config.status: creating Makefile"]
+    meta = {"component": spec.key, "opts": opts, "srcdir": m.resolve(srcdir).path,
+            "state": "configured", "ch8": True}
+    if spec.subdirs:
+        meta["subdirs"] = list(spec.subdirs)
+    return lines, meta
+
+
 def _cross_ready(m, lines: List[str], host: str, lfs: str):
     """Cross compiling needs the cross gcc in PATH and glibc in $LFS (link tests)."""
     gcc = find_tool(m, f"{host}-gcc")
@@ -302,6 +382,9 @@ def configure(m, component: str, srcdir: str, builddir: str, args: List[str]) ->
     in_tree = m.resolve(srcdir).path == m.resolve(builddir).path
     checking(lines, ("build system type", HOST_TRIPLET), ("host system type",
              opts.get("--host") or HOST_TRIPLET))
+    if ch8.is_ch8(m, component):
+        return _configure8(m, ch8.BY_KEY[component], srcdir, builddir, args, opts, lines,
+                           in_tree)
     if component not in CH5 + CH6 + CH7:
         raise BuildError(f"{component} is built in a later chapter of LFS", lines,
                          hint="the simulation builds the chapter 5, 6 and 7 packages so far")
@@ -545,7 +628,7 @@ def build_failure(m, meta: dict, make_vars: Optional[Dict[str, str]] = None) -> 
     """Problems that only show up during 'make' (like in real life)."""
     c, opts = meta["component"], meta["opts"]
     make_vars = make_vars or {}
-    if c == "file" and not meta.get("native"):
+    if c == "file" and not meta.get("native") and not meta.get("ch8"):
         if not _native_tool(m, make_vars.get("FILE_COMPILE"), "file"):
             return BuildError("make[2]: *** [Makefile:1036: magic.mgc] Error 1",
                               [f"Cannot use the installed version of file ({HOST_FILE_VERSION}) to",
@@ -693,6 +776,8 @@ def install_files(m, meta: dict, destdir: str,
     c, o = meta["component"], meta["opts"]
     out: List[Tuple[str, dict]] = []
     D = destdir.rstrip("/")
+    if meta.get("ch8"):
+        return ch8_files(m, meta, D, make_vars or {})
     if c in CH6:
         return _ch6_files(m, meta, D, o.get("--prefix", "/usr/local").rstrip("/"),
                           make_vars or {})
@@ -829,3 +914,72 @@ def kernel_headers_tree(user: str, group: str) -> dict:
         inc["c"][d] = sub
     inc["c"]["Makefile"] = file_node("# usr/include/Makefile\n", 0o644, user, group)
     return inc
+
+
+# ---------------------------------------------------------------- chapter 8 install
+def _ch8_bin(name: str) -> dict:
+    node = _bin(name, prog="binary", cross=True, target=ch8.TRIPLET)
+    node["ch8"] = True
+    return node
+
+
+def _ch8_content(path: str, meta_P: str) -> dict:
+    name = path.rsplit("/", 1)[-1]
+    if name == "curses.h":
+        node = file_node(f"/* curses.h, ncurses 6.5 */\n{CURSES_XOPEN}\n#define NCURSES_WIDECHAR 1\n"
+                         f"#endif\n")
+    elif name in ch8.CONTENT:
+        node = file_node(ch8.CONTENT[name])
+    elif name.endswith((".h", ".pc", ".py", ".pm", ".txt", ".md", ".html", ".exp", ".sh")) \
+            or "/locales/" in path:
+        node = file_node(f"/* {name} (simulated) */\n")
+    else:
+        node = file_node(size=180_000 if ".so" in name else 40_000)
+    node["ch8"] = True
+    return node
+
+
+def ch8_files(m, meta: dict, D: str, make_vars: Dict[str, str]) -> List[Tuple[str, dict]]:
+    spec = ch8.BY_KEY[meta["component"]]
+    o = meta["opts"]
+    P, bindir, sbindir, libdir = ch8.install_paths(spec, o, make_vars)
+    skip = set(o.get("--enable-no-install-program", "").split(","))
+    out: List[Tuple[str, dict]] = []
+    for name in spec.bins:
+        if name not in skip:
+            out.append((f"{D}{bindir}/{name}", _ch8_bin(name)))
+    for name in spec.sbins:
+        out.append((f"{D}{sbindir}/{name}", _ch8_bin(name)))
+    for name in spec.libs:
+        out.append((f"{D}{libdir}/{name}", _ch8_content(f"{libdir}/{name}", P)))
+    for f in spec.files:
+        path = f.replace("{P}", P)
+        out.append((f"{D}{path}", _ch8_content(path, P)))
+    for f, target in spec.links.items():
+        out.append((f"{D}{f.replace('{P}', P)}", link_node(target)))
+    srcdir = meta["srcdir"]
+    for rel, dest in spec.from_src.items():
+        try:
+            node = m.resolve(f"{srcdir}/{rel}").node
+        except FsError:
+            node = None
+        if node is not None and node["t"] == "f":
+            new = file_node(node.get("data", ""))
+            new["ch8"] = True
+            out.append((f"{D}{dest.replace('{P}', P)}", new))
+    for rel, text, paths in spec.cond:
+        base = srcdir if rel.startswith("@topdir/") else m.cwd
+        rel = rel.replace("@topdir/", "")
+        try:
+            node = m.resolve(f"{base}/{rel}").node
+        except FsError:
+            node = None
+        if node is not None and text in node.get("data", ""):
+            out += [(f"{D}{p.replace('{P}', P)}", _ch8_content(p, P)) for p in paths]
+    if spec.key == "glibc":
+        out.append((f"{D}{bindir}/ldd", file_node(
+            "#!/bin/bash\n# ldd: print shared object dependencies (simulated)\n"
+            f'RTLDLIST="{P}/lib/ld-linux.so.2 {P}/lib64/ld-linux-x86-64.so.2 '
+            f'{P}/libx32/ld-linux-x32.so.2"\necho "ldd is simulated"\n', 0o755)))
+        out[-1][1]["ch8"] = True
+    return out

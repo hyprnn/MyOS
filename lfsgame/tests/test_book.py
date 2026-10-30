@@ -39,6 +39,11 @@ class BookTests(unittest.TestCase):
 
     def test_every_book_command_exists_and_parses(self):
         """Every '$ command' in the book must parse and name a simulated command."""
+        from lfsgame.commands.build import TOOL_HANDLERS
+        from lfsgame.sim import ch8
+        known = set(REGISTRY) | set(TOOL_HANDLERS) | {"cc"}
+        for p in ch8.PKGS:
+            known |= set(p.bins) | set(p.sbins)
         book = Book.load()
         for s in book.sections:
             for kind, body in s.blocks:
@@ -49,10 +54,23 @@ class BookTests(unittest.TestCase):
                     for simple in simples:
                         if not isinstance(simple, shparser.Simple) or not simple.words:
                             continue
-                        name = shparser.word_text(simple.words[0])
+                        words = [w for w in simple.words]
+                        while words and shparser.is_assignment(words[0]):
+                            words.pop(0)  # CC=gcc ./configure
+                        if not words:
+                            continue
+                        name = shparser.word_text(words[0])
                         if name in ("[", "") or "/" in name or "$" in name or "`" in name:
                             continue  # ../configure, $LFS_TGT-gcc: programs in the fs
-                        self.assertIn(name, REGISTRY, f"{s.id}: {body}")
+                        self.assertIn(name, known, f"{s.id}: {body}")
+
+    def test_generated_chapter8_is_up_to_date(self):
+        from pathlib import Path
+
+        from lfsgame.sim import ch8
+        path = Path(__file__).parent.parent / "lfsgame/book/content/09-final-system.txt"
+        self.assertEqual(path.read_text(encoding="utf-8"), ch8.book_text(),
+                         "run: python tools/gen_ch8_book.py")
 
 
 if __name__ == "__main__":

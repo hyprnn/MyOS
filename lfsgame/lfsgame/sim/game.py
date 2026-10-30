@@ -33,6 +33,8 @@ class Game:
                 if o.id not in self.done and o.check(m):
                     self.done.append(o.id)
                     new.append(o)
+            for oid in self.done:  # builds look at these (chapter 7 vs chapter 8 version)
+                m.flag(f"obj:{oid}")
         finally:
             m.croot = saved
         return new

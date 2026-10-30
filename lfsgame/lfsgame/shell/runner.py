@@ -31,7 +31,7 @@ from . import parser
 CHROOT_BUILTINS = {"help", "cd", "pwd", "echo", "export", "unset", "set", "source", ".", "exec",
                    "exit", "logout", "umask", "history", "test", "[", "true", "false", "pushd",
                    "popd", "type", "time", "tasks", "status", "quest", "hint", "book", "save",
-                   "menu", "version", "clear", "sleep"}
+                   "menu", "version", "clear", "sleep", "ulimit"}
 COMPILER_TOOLS = {"gcc", "g++", "cc", "c++", "cpp", "x86_64-lfs-linux-gnu-gcc",
                   "x86_64-lfs-linux-gnu-g++"}
 
@@ -92,9 +92,11 @@ class Sub:
     """Wraps ctx: optional output capture (pipes, >, $(...)) and stdin override."""
 
     def __init__(self, ctx, capture: bool = False, stdin: Optional[str] = None,
-                 in_script: Optional[bool] = None):
+                 in_script: Optional[bool] = None, err: str = ""):
         self._ctx = ctx
         self.capture = capture
+        self.err = err            # "" = errors go up, "out" = like stdout (2>&1), "buf" = errbuf
+        self.errbuf: List[str] = []
         self.buf: List[str] = []
         self.stdin = stdin if stdin is not None else getattr(ctx, "stdin", None)
         self.in_script = in_script if in_script is not None else getattr(ctx, "in_script", False)
@@ -103,6 +105,12 @@ class Sub:
         return getattr(self._ctx, name)
 
     def write(self, text, tag=None):
+        if tag == "err":
+            if self.err == "out":
+                tag = None
+            elif self.err == "buf":
+                self.errbuf.append(text)
+                return
         if self.capture and tag != "err":
             self.buf.append(text)
         else:
@@ -296,15 +304,32 @@ def _exec(ctx, sc: parser.Simple):
         argv += expand(w)
 
     out_redir = None
+    err_redir = None
+    err_mode = ""
     stdin = None
     for op, target in sc.redirs:
         if op == "<<":
             stdin = expand.heredoc(target)
             continue
+        if op == "2>&1":
+            err_mode = "out"
+            continue
         paths = expand(target)
         if len(paths) != 1:
             ctx.write(f"bash: {parser.word_text(target)}: ambiguous redirect\n", "err")
             return 1
+        if op in ("2>", "2>>"):
+            err_redir = (op[1:], paths[0])
+            err_mode = "buf"
+            if op == "2>":
+                try:
+                    m.write_file(paths[0], "")
+                except FsError as exc:
+                    ctx.write(f"bash: {paths[0]}: {exc}\n", "err")
+                    return 1
+            continue
+        if op == "&>":
+            op, err_mode = ">", "out"
         if op == "<":
             try:
                 node = m.lookup(paths[0])
@@ -329,8 +354,8 @@ def _exec(ctx, sc: parser.Simple):
         return 0
 
     run_ctx = ctx
-    if out_redir or stdin is not None:
-        run_ctx = Sub(ctx, capture=out_redir is not None, stdin=stdin)
+    if out_redir or stdin is not None or err_mode:
+        run_ctx = Sub(ctx, capture=out_redir is not None, stdin=stdin, err=err_mode)
     saved = {}
     for name, value in assigns:  # VAR=value command: only for this command
         saved[name] = m.env.get(name)
@@ -343,13 +368,14 @@ def _exec(ctx, sc: parser.Simple):
                 m.env.pop(name, None)
             else:
                 m.env[name] = old
-    if out_redir is not None:
-        op, path = out_redir
-        try:
-            m.write_file(path, run_ctx.output(), append=True)
-        except FsError as exc:
-            ctx.write(f"bash: {path}: {exc}\n", "err")
-            return 1
+    for redir, data in ((out_redir, lambda: run_ctx.output()),
+                        (err_redir, lambda: "".join(run_ctx.errbuf))):
+        if redir is not None:
+            try:
+                m.write_file(redir[1], data(), append=True)
+            except FsError as exc:
+                ctx.write(f"bash: {redir[1]}: {exc}\n", "err")
+                return 1
     return status
 
 

@@ -285,6 +285,115 @@ def _backup_ok(m: Machine) -> bool:
     return False
 
 
+# ---------------------------------------------------------------- chapter 8
+def _p(path: str) -> str:
+    return path.replace("{P}", "/usr")
+
+
+def _need_ok(m: Machine, cond) -> bool:
+    kind, path = cond[0], cond[1] if len(cond) > 1 else ""
+    if kind == "flag":
+        return m.has_flag(path)
+    if kind == "absent":
+        return _node(m, f"{LFS}{path}", follow=False) is None
+    if kind == "file":
+        return _exists(m, f"{LFS}{path}", "f")
+    if kind == "dir":
+        return _exists(m, f"{LFS}{path}", "d")
+    if kind == "link":
+        return _link_to(m, f"{LFS}{path}", cond[2])
+    if kind == "contains":
+        return cond[2] in _text(m, f"{LFS}{path}")
+    return False
+
+
+def _ch8_ok(spec):
+    def check(m: Machine) -> bool:
+        if spec.style not in ("none", "ninja") and not m.has_flag(f"installed8:{spec.key}"):
+            return False
+        rep = None
+        for name in spec.bins:
+            rep = f"/usr/bin/{name}"
+            break
+        else:
+            libs = [x for x in spec.libs if not x.endswith(".a")]
+            if libs:
+                rep = f"/usr/lib/{libs[0]}"
+            elif spec.sbins:
+                rep = f"/usr/sbin/{spec.sbins[0]}"
+            elif spec.files:
+                rep = _p(spec.files[0])
+        if spec.key == "inetutils":
+            rep = "/usr/bin/ping"
+        if spec.key == "coreutils":
+            rep = "/usr/bin/ls"
+        if rep is not None:
+            n = _node(m, f"{LFS}{rep}")
+            if n is None or not n.get("ch8"):
+                return False
+        if spec.critical and not m.has_flag(f"tested:{spec.key}"):
+            return False
+        if spec.patch and not m.has_flag(f"patched:{spec.key}:{spec.patch}"):
+            return False
+        return all(_need_ok(m, c) for c in spec.need)
+    return check
+
+
+def _glibc_cfg_ok(m: Machine) -> bool:
+    arch = _text(m, f"{LFS}/usr/lib/locale/locale-archive")
+    lt = _node(m, f"{LFS}/etc/localtime", follow=False)
+    return ("C.UTF-8" in arch and "en_US.UTF-8" in arch
+            and "passwd: files" in _text(m, f"{LFS}/etc/nsswitch.conf")
+            and _exists(m, f"{LFS}/usr/share/zoneinfo/Europe", "d")
+            and _exists(m, f"{LFS}/usr/share/zoneinfo/posixrules")
+            and lt is not None and lt["t"] == "l" and lt["to"].startswith("/usr/share/zoneinfo/")
+            and _exists(m, f"{LFS}{lt['to']}", "f")
+            and "include /etc/ld.so.conf.d/*.conf" in _text(m, f"{LFS}/etc/ld.so.conf")
+            and _exists(m, f"{LFS}/etc/ld.so.conf.d", "d"))
+
+
+def _cleanup8_ok(m: Machine) -> bool:
+    def walk(node, pred):
+        for name, ch in node.get("c", {}).items():
+            if pred(name, ch) or (ch["t"] == "d" and walk(ch, pred)):
+                return True
+        return False
+    for d in ("lib", "libexec"):
+        n = _node(m, f"{USR}/{d}")
+        if n is not None and walk(n, lambda name, ch: ch["t"] == "f" and name.endswith(".la")):
+            return False
+    usr = _node(m, USR)
+    if usr is None or walk(usr, lambda name, ch: name.startswith(f"{TGT}")):
+        return False
+    return ("tester:" not in _text(m, f"{LFS}/etc/passwd")
+            and _node(m, f"{LFS}/home/tester") is None and m.has_flag("installed8:sysvinit"))
+
+
+def _ch8_objectives() -> List[Objective]:
+    from . import ch8
+    out = []
+    for spec in ch8.PKGS:
+        title = spec.title if not spec.critical else f"{spec.title} (with its test suite)"
+        out.append(Objective(f"{spec.key}8", title, spec.sec,
+                             f"book {spec.sec}: " + "; ".join(
+                                 s[2:].split("\n")[0] for s in spec.steps
+                                 if s.startswith("$ "))[:200],
+                             _ch8_ok(spec)))
+        if spec.key == "glibc":
+            out.append(Objective("glibc8cfg", "Configure Glibc: locales, nsswitch.conf, time "
+                                              "zone, ld.so.conf", "8.5",
+                                 "localedef ..., cat > /etc/nsswitch.conf, tzdata + zic, "
+                                 "tzselect, ln -sfv .../zoneinfo/... /etc/localtime, "
+                                 "/etc/ld.so.conf", _glibc_cfg_ok))
+    out.append(Objective("strip8", "Optional: strip some libraries and programs", "8.84",
+                         "strip --strip-unneeded /usr/lib/lib{z,bz2,lzma,zstd,lz4}.so.*",
+                         lambda m: m.has_flag("stripped"), optional=True))
+    out.append(Objective("cleanup8", "Clean up: /tmp, .la files, cross-compiler leftovers, "
+                                     "the tester user", "8.85",
+                         "the four commands of book 8.85", _cleanup8_ok))
+    return out
+
+
 OBJECTIVES: List[Objective] = [
     Objective("explore", "Find the empty disk meant for LFS (lsblk or fdisk -l)", "2.4",
               "Type 'lsblk'. Which disk has no partitions at all?",
@@ -453,5 +562,6 @@ OBJECTIVES: List[Objective] = [
               "tar -cJpf $HOME/lfs-temp-tools-12.2.tar.xz .",
               _backup_ok, optional=True),
 ]
+OBJECTIVES += _ch8_objectives()
 
 BY_ID = {o.id: o for o in OBJECTIVES}
