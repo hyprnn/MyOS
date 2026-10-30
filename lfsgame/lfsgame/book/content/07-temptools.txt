@@ -456,12 +456,3 @@ $ ln -sv gcc $LFS/usr/bin/cc
 $ cd $LFS/sources
 $ rm -rf gcc-14.2.0
 
-@chapter 7. Coming Next
-@section 7.0 | To Be Continued
-
-All temporary tools are in place. The real book now changes the owner of $LFS back to root, mounts the virtual kernel filesystems (/dev, /proc, /sys) and enters the new system with chroot. Inside, the remaining temporary tools are built and then the final system in chapter 8.
-
-That is planned for a later version of the game. Save now!
-
-$ tasks
-$ du -sh $LFS/usr

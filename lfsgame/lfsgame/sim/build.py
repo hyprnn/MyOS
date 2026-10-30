@@ -28,6 +28,30 @@ SBU = {"binutils": 1.0, "gcc": 3.8, "glibc": 1.4, "libstdc++": 0.2, "linux": 0.1
        "file": 0.1, "findutils": 0.2, "gawk": 0.1, "grep": 0.1, "gzip": 0.1, "make": 0.1,
        "patch": 0.1, "sed": 0.1, "tar": 0.1, "xz": 0.1}
 SBU_PASS2 = {"binutils": 0.4, "gcc": 4.1}
+SBU.update({"gettext": 1.4, "bison": 0.2, "perl": 1.0, "python": 0.5, "texinfo": 0.2,
+            "util-linux": 0.2})
+# chapter 7: built natively INSIDE the chroot (no --host, no DESTDIR)
+CH7 = ("gettext", "bison", "perl", "python", "texinfo", "util-linux")
+CH7_DEFAULT_PREFIX = {"util-linux": "/usr", "perl": "/usr/local"}
+CH7_BINS = {
+    "gettext": ["gettext", "msgfmt", "msgmerge", "xgettext", "envsubst"],
+    "bison": ["bison", "yacc"],
+    "perl": ["perl", "perl5.40.0", "cpan", "perldoc", "pod2man"],
+    "python": ["python3.12", "python3->python3.12", "pydoc3.12", "python3-config"],
+    "texinfo": ["makeinfo", "texi2any", "info", "install-info", "texindex"],
+    "util-linux": ["mount", "umount", "lsblk", "findmnt", "mountpoint", "blkid", "dmesg",
+                   "more", "uuidgen", "lscpu", "fdisk", "mkswap", "swapon", "swapoff",
+                   "hwclock", "losetup"],
+}
+# files 'make' leaves in the build tree (used by LFS commands like cp in 7.7)
+PRODUCTS = {"gettext": ["gettext-tools/src/msgfmt", "gettext-tools/src/msgmerge",
+                        "gettext-tools/src/xgettext"]}
+PYTHON_MISSING = ("The necessary bits to build these optional modules were not found:\n"
+                  "_bz2                  _ctypes               _ctypes_test\n"
+                  "_dbm                  _gdbm                 _hashlib\n"
+                  "_lzma                 _ssl                  _tkinter\n"
+                  "_uuid                 readline              zlib\n"
+                  "To find the necessary bits, look in configure.ac and config.log.")
 
 CH5 = ("binutils", "gcc", "glibc", "libstdc++")
 # chapter 6: cross compiled with --host=$LFS_TGT, installed with DESTDIR=$LFS
@@ -148,9 +172,16 @@ def source_tree(file: str) -> Tuple[str, dict]:
             for d in ("elf", "nss", "nscd", "stdio-common", "sysdeps", "sunrpc"):
                 c[d] = _d({})
             c["Makeconfig"] = _f("# Makeconfig\nvardbdir = $(localstatedir)/db\n")
+        elif name == "perl":
+            del c["configure"]
+            c["Configure"] = _f("#! /bin/sh\n# Configure: perl's own configuration script\n",
+                                0o755, prog="configure", component="perl")
+            c["lib"] = _d({"strict.pm": _f("package strict;\n1;\n")})
         else:
             c["src"] = _d({})
             c["build-aux"] = _d({"config.guess": _guess(), "install-sh": _f("", 0o755)})
+            if name == "gettext":
+                c["gettext-tools"] = _d({"src": _d({})})
             c["config.guess"] = _guess()
             if name == "bash":
                 c["support"] = _d({"config.guess": _guess()})
@@ -271,9 +302,9 @@ def configure(m, component: str, srcdir: str, builddir: str, args: List[str]) ->
     in_tree = m.resolve(srcdir).path == m.resolve(builddir).path
     checking(lines, ("build system type", HOST_TRIPLET), ("host system type",
              opts.get("--host") or HOST_TRIPLET))
-    if component not in CH5 + CH6:
+    if component not in CH5 + CH6 + CH7:
         raise BuildError(f"{component} is built in a later chapter of LFS", lines,
-                         hint="the simulation builds the chapter 5 and 6 packages so far")
+                         hint="the simulation builds the chapter 5, 6 and 7 packages so far")
     if opts.get("--build") == "":
         raise BuildError("missing argument to --build", lines,
                          hint="the $(.../config.guess) part printed nothing: is the path to "
@@ -282,6 +313,36 @@ def configure(m, component: str, srcdir: str, builddir: str, args: List[str]) ->
     meta = {"component": component, "opts": opts, "srcdir": m.resolve(srcdir).path,
             "state": "configured"}
 
+    if component in CH7:
+        if not m.croot:
+            raise BuildError("(simulation) chapter 7 packages are built INSIDE the chroot", lines,
+                             hint="enter it first (book 7.4), then cd /sources")
+        _compiler_env_check(m, lines)
+        gcc = find_tool(m, "gcc")
+        checking(lines, ("for gcc", "gcc" if gcc else "no"))
+        if gcc is None:
+            raise BuildError("no acceptable C compiler found in $PATH", lines,
+                             hint="GCC pass 2 (book 6.18) installs /usr/bin/gcc; is PATH "
+                                  "/usr/bin:/usr/sbin?")
+        if not m.exists("/usr/lib/libc.so.6"):
+            raise BuildError("C compiler cannot create executables", lines)
+        checking(lines, ("whether the C compiler works", "yes"),
+                 ("whether we are cross compiling", "no"))
+        if component == "perl":
+            meta["opts"]["--prefix"] = opts.get("prefix", "/usr/local")
+            lines[:] = ["Beginning of configuration questions for perl5.",
+                        "Checking echo to see how to suppress newlines...",
+                        "...using -n.", "First let's make sure your kit is complete.  "
+                        "Checking...", "Looks good...",
+                        f"Installation prefix to use? [{meta['opts']['--prefix']}]",
+                        "Run make depend now? [y]", "Now you must run 'make'."]
+            return lines, meta
+        if component == "python":
+            checking(lines, ("for --enable-shared", "yes" if "--enable-shared" in opts else "no"),
+                     ("for ensurepip", "no" if "--without-ensurepip" in opts else "upgrade"))
+        lines.append("configure: creating ./config.status")
+        lines.append("config.status: creating Makefile")
+        return lines, meta
     if component in ("binutils", "gcc") and "--host" in opts:
         meta["pass"] = 2
         if component == "gcc" and in_tree:
@@ -594,6 +655,38 @@ def _ch6_files(m, meta, D, P, make_vars) -> List[Tuple[str, dict]]:
     return out
 
 
+def _ch7_files(m, meta, D) -> List[Tuple[str, dict]]:
+    c, o = meta["component"], meta["opts"]
+    P = o.get("--prefix", CH7_DEFAULT_PREFIX.get(c, "/usr/local")).rstrip("/")
+    out: List[Tuple[str, dict]] = []
+    sbin = {"fdisk", "mkswap", "swapon", "swapoff", "hwclock", "losetup"}
+    for name in CH7_BINS[c]:
+        if "->" in name:
+            name, target = name.split("->")
+            out.append((f"{D}{P}/bin/{name}", link_node(target)))
+            continue
+        where = "sbin" if name in sbin else "bin"
+        out.append((f"{D}{P}/{where}/{name}", _bin(name, prog="binary", cross=True,
+                                                   target=TARGET)))
+    lib = f"{D}{o.get('--libdir', P + '/lib')}"
+    if c == "perl":
+        priv = o.get("privlib", f"{P}/lib/perl5/5.40.0")
+        arch = o.get("archlib", f"{P}/lib/perl5/5.40.0/x86_64-linux")
+        out += [(f"{D}{priv}/strict.pm", file_node("package strict;\n1;\n")),
+                (f"{D}{priv}/warnings.pm", file_node("package warnings;\n1;\n")),
+                (f"{D}{arch}/Config.pm", file_node("package Config;\n1;\n")),
+                (f"{D}{arch}/CORE/libperl.so", _lib(4_100_000))]
+    elif c == "python":
+        out += [(f"{lib}/libpython3.12.so.1.0", _lib(25_000_000)),
+                (f"{lib}/python3.12/os.py", file_node("# os.py\n"))]
+    elif c == "util-linux":
+        for name in ("mount", "blkid", "uuid", "fdisk", "smartcols"):
+            out.append((f"{lib}/lib{name}.so.1", _lib(400_000)))
+    if "--docdir" in o:
+        out.append((f"{D}{o['--docdir']}/README", file_node(f"{c} documentation\n")))
+    return out
+
+
 def install_files(m, meta: dict, destdir: str,
                   make_vars: Optional[Dict[str, str]] = None) -> List[Tuple[str, dict]]:
     """List of (absolute path, node) the install step creates. May raise BuildError."""
@@ -603,6 +696,8 @@ def install_files(m, meta: dict, destdir: str,
     if c in CH6:
         return _ch6_files(m, meta, D, o.get("--prefix", "/usr/local").rstrip("/"),
                           make_vars or {})
+    if c in CH7:
+        return _ch7_files(m, meta, D)
     if meta.get("pass") == 2:
         P = o.get("--prefix", "/usr/local").rstrip("/")
         t = o.get("--target") or o["--host"]

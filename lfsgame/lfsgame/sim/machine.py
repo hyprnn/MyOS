@@ -74,15 +74,20 @@ TOOL_ALIASES = {"sort": "coreutils", "ld": "binutils", "diff": "diffutils", "fin
 
 
 class Res(NamedTuple):
-    path: str               # absolute path after resolving symlinks in the middle
+    path: str               # absolute path after resolving symlinks (as seen in a chroot)
     node: Optional[dict]    # None if the final component does not exist
     parent: Optional[dict]
     name: str
+    real: str = ""          # the same path seen from the real root (differs in a chroot)
+
+
+VIRTUAL_FS = ("proc", "sysfs", "devpts", "tmpfs", "devtmpfs")
 
 
 class Machine:
     FIELDS = ("disks", "fs", "mounts", "swaps", "users", "groups", "user", "env", "cwd",
-              "umask", "su_stack", "dirstack", "flags", "glitch_file", "clock")
+              "umask", "su_stack", "dirstack", "flags", "glitch_file", "clock", "croot",
+              "chroot_name")
 
     def __init__(self):
         self.disks: Dict[str, dict] = {}
@@ -100,6 +105,8 @@ class Machine:
         self.flags: List[str] = []
         self.glitch_file = ""
         self.clock = 0.0                       # simulated seconds spent (make, tar, ...)
+        self.croot = ""                        # real path of the chroot ("" = not chrooted)
+        self.chroot_name = ""                  # user name bash found at start (in a chroot)
         self.last_status = 0
         self.rng = random.Random()
 
@@ -220,6 +227,9 @@ class Machine:
         etc = self.fs["/dev/sda2"]["root"]["c"].get("etc", {}).get("c")
         if etc is not None and "bash.bashrc" not in etc and "bash.bashrc.NOUSE" not in etc:
             etc["bash.bashrc"] = file_node(BASH_BASHRC)
+        dev = self.fs["/dev/sda2"]["root"]["c"].get("dev", {}).get("c", {})
+        if "pts" not in dev:
+            self.sync_dev()
 
     # ------------------------------------------------------------ session
     @property
@@ -236,14 +246,17 @@ class Machine:
             cwd = "~" + cwd[len(h):]
         sign = "#" if self.is_root else "$"
         ps1 = self.env.get("PS1")
+        uname = self.user
+        if self.croot:  # bash looked the name up in the chroot's /etc/passwd when it started
+            uname = self.chroot_name or "I have no name!"
         if not ps1:
-            return f"{self.user}@{HOSTNAME}:{cwd}{sign} "
+            return f"{uname}@{HOSTNAME}:{cwd}{sign} "
         out, i = [], 0
         while i < len(ps1):
             c = ps1[i]
             if c == "\\" and i + 1 < len(ps1):
                 e = ps1[i + 1]
-                out.append({"u": self.user, "h": HOSTNAME, "H": HOSTNAME, "w": cwd,
+                out.append({"u": uname, "h": HOSTNAME, "H": HOSTNAME, "w": cwd,
                             "W": cwd.rstrip("/").rsplit("/", 1)[-1] or "/", "$": sign,
                             "\\": "\\", "[": "", "]": "", "n": " "}.get(e, "\\" + e))
                 i += 2
@@ -268,21 +281,45 @@ class Machine:
     def _mount_root(self, path: str) -> Optional[dict]:
         for m in reversed(self.mounts):
             if m["path"] == path:
-                return self.fs[m["dev"]]["root"]
+                if m.get("bind"):
+                    return self._resolve_real(m["bind"]).node
+                return self.fs[m.get("fs", m["dev"])]["root"]
         return None
+
+    def _resolve_real(self, path: str) -> Res:
+        saved, self.croot = self.croot, ""
+        try:
+            return self.resolve(path)
+        finally:
+            self.croot = saved
+
+    def real_path(self, path: str) -> str:
+        """Path as seen from the real root (for mount tables etc.)."""
+        p = self.abspath(path)
+        return normpath(self.croot + p) if self.croot else p
 
     def resolve(self, path: str, follow: bool = True) -> Res:
         queue = split(self.abspath(path))
         root = self._mount_root("/")
         names: List[str] = []
         nodes: List[dict] = [root]
+        if self.croot:  # walk down to the chroot directory first; '..' cannot leave it
+            base = self._resolve_real(self.croot)
+            if base.node is None or base.node["t"] != "d":
+                raise FsError("No such file or directory")
+            names = split(base.path)
+            nodes = [root]
+            for i in range(len(names)):
+                nodes.append(self._resolve_real("/" + "/".join(names[:i + 1])).node)
+        floor = len(names)
+        floor_names, floor_nodes = list(names), list(nodes)
         hops = 0
         while queue:
             comp = queue.pop(0)
             if comp == ".":
                 continue
             if comp == "..":
-                if names:
+                if len(names) > floor:
                     names.pop()
                     nodes.pop()
                 continue
@@ -294,20 +331,22 @@ class Machine:
             if child is None:
                 if queue:
                     raise FsError("No such file or directory")
-                return Res(p, None, cur, comp)
+                return Res("/" + "/".join(names[floor:] + [comp]), None, cur, comp, p)
             if child["t"] == "l" and (queue or follow):
                 hops += 1
                 if hops > 40:
                     raise FsError("Too many levels of symbolic links")
                 target = child["to"]
                 if target.startswith("/"):
-                    names, nodes = [], [root]
+                    names, nodes = list(floor_names), list(floor_nodes)
                 queue = split(target) + queue
                 continue
             names.append(comp)
             nodes.append(child)
-        return Res("/" + "/".join(names), nodes[-1],
-                   nodes[-2] if len(nodes) > 1 else None, names[-1] if names else "")
+        real = "/" + "/".join(names)
+        return Res("/" + "/".join(names[floor:]), nodes[-1],
+                   nodes[-2] if len(nodes) > 1 else None, names[-1] if len(names) > floor else "",
+                   real)
 
     def lookup(self, path: str, follow: bool = True) -> dict:
         r = self.resolve(path, follow)
@@ -329,14 +368,22 @@ class Machine:
 
     def fs_of(self, path: str) -> Tuple[str, dict]:
         """Device and filesystem that hold a path (the deepest mount that is a prefix)."""
-        p = self.resolve(path).path
+        p = self.resolve(path).real
         best = None
         for m in self.mounts:
             mp = m["path"]
             if p == mp or mp == "/" or p.startswith(mp + "/"):
                 if best is None or len(mp) >= len(best["path"]):
                     best = m
-        return best["dev"], self.fs[best["dev"]]
+        if best.get("bind"):
+            rest = p[len(best["path"]):]
+            saved, self.croot = self.croot, ""
+            try:
+                return self.fs_of(best["bind"] + rest)
+            finally:
+                self.croot = saved
+        key = best.get("fs", best["dev"])
+        return key, self.fs[key]
 
     # ------------------------------------------------------------ permissions
     def can_write(self, node: dict) -> bool:
@@ -428,12 +475,12 @@ class Machine:
         r = self.resolve(path, follow=False)
         if r.node is None:
             raise FsError("No such file or directory")
-        if r.parent is None or self.is_mountpoint(r.path):
+        if r.parent is None or self.is_mountpoint(r.real):
             raise FsError("Device or resource busy")
         if r.node["t"] == "d":
             if not recursive:
                 raise FsError("Is a directory")
-            if self._has_mount_below(r.path):
+            if self._has_mount_below(r.real):
                 raise FsError("Device or resource busy")
         if not self.can_write(r.parent):
             raise FsError("Permission denied")
@@ -516,6 +563,8 @@ class Machine:
         for path in self.devices():
             dev["c"][path[5:]] = {"t": "b", "m": 0o660, "u": "root", "g": "disk", "mt": now(),
                                   "size": 0, "data": ""}
+        dev["c"]["pts"] = mkdir_node()
+        dev["c"]["shm"] = mkdir_node(0o1777)
         self.fs["/dev/sda2"]["root"]["c"]["dev"] = dev
 
     def apply_table(self, name: str, new_disk: dict):
@@ -544,12 +593,56 @@ class Machine:
         self.fs[dev] = fs
         return fs
 
-    def mount(self, dev: str, path: str, fstype: Optional[str] = None):
+    def _virtual_tree(self, fstype: str) -> dict:
+        root = mkdir_node(0o555 if fstype in ("proc", "sysfs") else 0o755)
+        if fstype == "proc":
+            for name, data in (("version", f"Linux version {HOST_TOOLS['kernel']}-host (gcc "
+                                           f"14.2.1) #1 SMP PREEMPT_DYNAMIC\n"),
+                               ("cpuinfo", "processor\t: 0\nmodel name\t: Simulated x86-64 "
+                                           "CPU\n" * 1),
+                               ("meminfo", "MemTotal:       16384000 kB\n"),
+                               ("filesystems", "nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\n"
+                                               "nodev\tdevpts\n\text4\n\tvfat\n")):
+                root["c"][name] = file_node(data, 0o444)
+            root["c"]["self"] = mkdir_node(0o555)
+            root["c"]["self"]["c"]["mounts"] = file_node("", 0o444)
+        elif fstype == "sysfs":
+            for name in ("block", "bus", "class", "devices", "firmware", "fs", "kernel"):
+                root["c"][name] = mkdir_node()
+        elif fstype == "devpts":
+            root["c"]["ptmx"] = {"t": "b", "m": 0o666, "u": "root", "g": "tty", "mt": now(),
+                                 "size": 0, "data": ""}
+        return root
+
+    def refresh_proc(self):
+        """Keep /proc/self/mounts of every mounted proc in sync with the mount table."""
+        text = "".join(f"{mt['dev']} {mt['path']} {mt['type']} rw,relatime 0 0\n"
+                       for mt in self.mounts)
+        for mt in self.mounts:
+            if mt["type"] == "proc":
+                self.fs[mt["fs"]]["root"]["c"]["self"]["c"]["mounts"]["data"] = text
+
+    def mount(self, dev: str, path: str, fstype: Optional[str] = None, bind: bool = False):
         target = self.resolve(path)
         if target.node is None:
             raise FsError(f"{path}: mount point does not exist.")
         if target.node["t"] != "d":
             raise FsError(f"{path}: mount point is not a directory.")
+        if bind:
+            src = self.resolve(dev)
+            if src.node is None:
+                raise FsError(f"{path}: special device {dev} does not exist.")
+            self.mounts.append({"dev": src.real, "path": target.real, "type": "none",
+                                "bind": src.real})
+            self.refresh_proc()
+            return
+        if fstype in VIRTUAL_FS:
+            key = f"{fstype}@{target.real}"
+            self.fs[key] = {"type": fstype, "uuid": "", "label": "", "virtual": True,
+                            "root": self._virtual_tree(fstype)}
+            self.mounts.append({"dev": dev, "path": target.real, "type": fstype, "fs": key})
+            self.refresh_proc()
+            return
         disk, part = self.find_dev(dev)
         if disk is None:
             raise FsError(f"{path}: special device {dev} does not exist.")
@@ -564,25 +657,36 @@ class Machine:
         where = self.mount_of(dev)
         if where is not None:
             raise FsError(f"{path}: {dev} already mounted on {where}.")
-        self.mounts.append({"dev": dev, "path": target.path, "type": fs["type"]})
+        self.mounts.append({"dev": dev, "path": target.real, "type": fs["type"]})
+        self.refresh_proc()
 
     def umount(self, what: str) -> str:
-        p = self.abspath(what) if not what.startswith("/dev/") else what
+        p = self.real_path(what) if not what.startswith("/dev/") else what
+        try:  # umount resolves symlinks in the mount point path
+            p = self.resolve(what).real if not what.startswith("/dev/") else p
+        except FsError:
+            pass
+        cwd = self.real_path(self.cwd)
         for m in reversed(self.mounts):
-            if m["path"] == p or m["dev"] == p:
+            if m["path"] == p or (m["dev"] == p and not m.get("bind")):
                 if m["path"] == "/":
                     raise FsError("/: target is busy.")
-                if self.cwd == m["path"] or self.cwd.startswith(m["path"].rstrip("/") + "/"):
-                    raise FsError(f"{m['path']}: target is busy.")
+                if cwd == m["path"] or cwd.startswith(m["path"].rstrip("/") + "/"):
+                    raise FsError(f"{what}: target is busy.")
                 if self._has_mount_below(m["path"]):
-                    raise FsError(f"{m['path']}: target is busy.")
+                    raise FsError(f"{what}: target is busy.")
                 self.mounts.remove(m)
-                return m["path"]
+                if m.get("fs"):
+                    self.fs.pop(m["fs"], None)
+                self.refresh_proc()
+                return what
         raise FsError(f"{what}: not mounted.")
 
     def fs_usage(self, dev: str) -> Tuple[int, int]:
         """(size, used) in bytes for df."""
         fs = self.fs[dev]
+        if fs.get("virtual"):
+            return 8 * dk.GiB, tree_size(fs["root"]) if fs["type"] == "tmpfs" else 0
         size = self.dev_bytes(dev)
         overhead = int(size * 0.016) if fs["type"].startswith("ext") else 4096
         used = overhead + fs.get("base_used", 0) + tree_size(fs["root"])
@@ -616,9 +720,73 @@ class Machine:
                 r.parent["c"][r.name] = mkdir_node(0o700, name, group)
         self.sync_etc()
 
-    def su(self, name: str):
+    def _push_session(self):
         self.su_stack.append({"user": self.user, "env": self.env, "cwd": self.cwd,
-                              "umask": self.umask, "dirstack": self.dirstack})
+                              "umask": self.umask, "dirstack": self.dirstack,
+                              "croot": self.croot, "chroot_name": self.chroot_name})
+
+    def chroot(self, newroot: str):
+        """Start a session whose '/' is newroot (a real path). Root only."""
+        self._push_session()
+        self.croot = newroot.rstrip("/")
+        self.cwd = "/"
+        self.dirstack = []
+        self.env = dict(self.env)
+        self.refresh_name()
+
+    def refresh_name(self):
+        """What bash does at start: find the name of our uid in /etc/passwd."""
+        if self.croot:
+            self.chroot_name = self.db_name_of_uid(self.users.get(self.user, {}).get("uid", 0))
+            if self.chroot_name:
+                self.flag("chroot_named")
+
+    # inside a chroot the user database is the chroot's /etc/passwd and /etc/group
+    def _db_file(self, name: str) -> str:
+        try:
+            node = self.resolve(f"/etc/{name}").node
+        except FsError:
+            return ""
+        return (node or {}).get("data", "") if node and node["t"] == "f" else ""
+
+    def db_users(self) -> Dict[str, int]:
+        if not self.croot:
+            return {n: u["uid"] for n, u in self.users.items()}
+        out = {}
+        for line in self._db_file("passwd").splitlines():
+            parts = line.split(":")
+            if len(parts) >= 3 and parts[2].isdigit():
+                out[parts[0]] = int(parts[2])
+        return out
+
+    def db_groups(self) -> Dict[str, int]:
+        if not self.croot:
+            return dict(self.groups)
+        out = {}
+        for line in self._db_file("group").splitlines():
+            parts = line.split(":")
+            if len(parts) >= 3 and parts[2].isdigit():
+                out[parts[0]] = int(parts[2])
+        return out
+
+    def db_name_of_uid(self, uid: int) -> str:
+        for name, u in self.db_users().items():
+            if u == uid:
+                return name
+        return ""
+
+    def display_owner(self, name: str, group: bool = False) -> str:
+        """Owner name as 'ls -l' shows it: a number if the name is unknown (chroot)."""
+        if not self.croot:
+            return name
+        db = self.db_groups() if group else self.db_users()
+        if name in db:
+            return name
+        host = self.groups.get(name) if group else self.users.get(name, {}).get("uid")
+        return str(host if host is not None else name)
+
+    def su(self, name: str):
+        self._push_session()
         u = self.users[name]
         self.user = name
         self.env = {"HOME": u["home"], "USER": name, "LOGNAME": name, "SHELL": u["shell"],
@@ -635,4 +803,5 @@ class Machine:
         s = self.su_stack.pop()
         self.user, self.env, self.cwd = s["user"], s["env"], s["cwd"]
         self.umask, self.dirstack = s["umask"], s["dirstack"]
+        self.croot, self.chroot_name = s.get("croot", ""), s.get("chroot_name", "")
         return True

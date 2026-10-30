@@ -341,3 +341,117 @@ class BeforeGlibcTests(unittest.TestCase):
         c.run("cd $LFS/sources && tar -xf m4-1.4.19.tar.xz && cd m4-1.4.19")
         self.assertEqual(c.run(M4_CONF), 1)
         self.assertIn("C compiler cannot create executables", c.text())
+
+
+_CH7_BASE = None
+
+
+def ready7(enter=True):
+    """A fresh copy of a game after chapter 6; with enter=True also 7.2-7.4 (in the chroot)."""
+    global _CH7_BASE
+    from lfsgame.sim.game import Game
+    from tests.helpers import CH4_4, CH5, CH6, FULL_WALKTHROUGH
+    if _CH7_BASE is None:
+        c = FakeCtx(seed=13)
+        for line, inputs in FULL_WALKTHROUGH + CH4_4 + CH5 + CH6:
+            c.run(line, inputs)
+        _CH7_BASE = c.game.to_dict()
+    c = FakeCtx()
+    c.game = Game.from_dict(_CH7_BASE)
+    if enter:
+        from tests.helpers import CH7_HOST
+        for line, inputs in CH7_HOST:
+            assert c.run(line, inputs) == 0, (line, c.text())
+    return c
+
+
+class Ch7Tests(unittest.TestCase):
+    def test_chroot_needs_root(self):
+        c = ready7(enter=False)  # still lfs
+        self.assertEqual(c.run("chroot $LFS /bin/bash"), 125)
+        self.assertIn("Operation not permitted", c.text())
+
+    def test_chroot_without_program(self):
+        c = ready7(enter=False)
+        c.run("exit")
+        c.run("mkdir -p /tmp/empty")
+        self.assertEqual(c.run("chroot /tmp/empty /usr/bin/env -i /bin/bash --login"), 127)
+        self.assertIn("failed to run command '/usr/bin/env'", c.text())
+        self.assertEqual(c.machine.croot, "")
+
+    def test_inside_the_chroot(self):
+        c = ready7()
+        m = c.machine
+        self.assertEqual(m.croot, "/mnt/lfs")
+        self.assertIn("chroot", c.game.done)
+        self.assertIn("vkfs", c.game.done)
+        self.assertIn("rootowner", c.game.done)
+        self.assertEqual(m.prompt(), "(lfs chroot) I have no name!:/# ")
+        self.assertEqual(c.run("whoami"), 1)
+        self.assertIn("cannot find name for user ID 0", c.text())
+        c.run("cd /..; pwd")
+        self.assertEqual(c.text(), "/\n")
+        self.assertEqual(c.run("cat /etc/os-release"), 1)        # host files are invisible
+        self.assertEqual(c.run("wget --version"), 127)          # host programs too
+        self.assertIn("command not found", c.text())
+        self.assertEqual(c.run("lsblk"), 127)                   # util-linux not built yet
+        c.run("ls /")
+        self.assertIn("sources", c.text())
+        self.assertEqual(c.run("echo hi > /dev/null"), 0)        # /dev is bound
+        c.run("cat /proc/self/mounts")
+        self.assertIn("/mnt/lfs/proc proc", c.text())
+
+    def test_name_needs_new_shell(self):
+        c = ready7()
+        from tests.helpers import PASSWD
+        c.run(PASSWD)
+        self.assertEqual(c.machine.prompt(), "(lfs chroot) I have no name!:/# ")
+        c.run("whoami")
+        self.assertEqual(c.text(), "root\n")
+        c.run("exec /usr/bin/bash --login")
+        self.assertEqual(c.machine.prompt(), "(lfs chroot) root:/# ")
+
+    def test_ch7_package_outside_chroot(self):
+        c = ready7()
+        c.run("exit")
+        c.run("cd $LFS/sources && tar -xf bison-3.8.2.tar.xz && cd bison-3.8.2")
+        self.assertEqual(c.run("./configure --prefix=/usr"), 1)
+        self.assertIn("INSIDE the chroot", c.text())
+
+    def test_compiler_inside_chroot(self):
+        c = ready7()
+        self.assertEqual(c.run("echo 'int main(){}' | gcc -xc - && ./a.out"), 0, c.text())
+        self.assertEqual(c.run("cc --version"), 0)
+
+    def test_unmount_order_and_backup(self):
+        c = ready7()
+        c.run("exit")
+        self.assertEqual(c.run("umount $LFS/dev"), 32)
+        self.assertIn("target is busy", c.text())
+        self.assertEqual(c.run("cd $LFS && tar -cJpf $HOME/backup.tar.xz ."), 2)
+        self.assertIn("unmount them first", c.text())
+        c.run("cd /")
+        c.run("umount $LFS/dev/shm $LFS/dev/pts")
+        self.assertEqual(c.run("umount $LFS/{sys,proc,run,dev}"), 0, c.text())
+        self.assertEqual(c.run("cd $LFS && tar -cJpf $HOME/lfs-temp-tools-12.2.tar.xz ."), 0)
+        self.assertIn("backup7", c.game.done)
+
+    def test_save_inside_chroot(self):
+        import json
+        from lfsgame.sim.game import Game
+        c = ready7()
+        g = Game.from_dict(json.loads(json.dumps(c.game.to_dict())))
+        self.assertEqual(g.machine.croot, "/mnt/lfs")
+        self.assertEqual(g.machine.prompt(), c.machine.prompt())
+        g.machine.logout()
+        self.assertEqual(g.machine.croot, "")
+
+    def test_ls_shows_numbers_for_unknown_owners(self):
+        c = ready7(enter=False)
+        c.run("exit")
+        from tests.helpers import CH7_HOST
+        for line, inputs in CH7_HOST[3:]:   # skip the chown of 7.2
+            c.run(line, inputs)
+        c.run("ls -ld /usr")
+        self.assertIn(" 1000 ", c.text())   # lfs's uid: there is no name for it inside
+        self.assertNotIn("rootowner", c.game.done)

@@ -4,6 +4,7 @@ from __future__ import annotations
 from ..shell.opts import Opts
 from ..shell.runner import Input, Sleep, UsageError, command
 from ..sim import disks as dk
+from ..sim.machine import VIRTUAL_FS
 from ..sim.vfs import FsError, human
 from . import fdisk as fdisk_mod
 
@@ -272,25 +273,37 @@ def _swapoff(ctx, args):
 @command("mount", "mount -v -t ext4 /dev/sdXN DIR  (no args: list mounts)", G)
 def _mount(ctx, args):
     m = ctx.machine
-    o = Opts(args, "vr", "to", {"verbose": "v"}, {"types": "t", "options": "o"})
+    o = Opts(args, "vrB", "to", {"verbose": "v", "bind": "B"}, {"types": "t", "options": "o"})
     if not o.args:
         for mt in m.mounts:
-            ctx.write(f"{mt['dev']} on {mt['path']} type {mt['type']} (rw,relatime)\n")
-        ctx.write("proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n"
-                  "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n", "dim")
+            path = mt["path"]
+            if m.croot:
+                if not (path == m.croot or path.startswith(m.croot + "/")):
+                    continue
+                path = path[len(m.croot):] or "/"
+            opts = "rw,bind" if mt.get("bind") else "rw,relatime"
+            ctx.write(f"{mt['dev']} on {path} type {mt['type']} ({opts})\n")
+        if not m.croot:
+            ctx.write("proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n"
+                      "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)\n", "dim")
         return 0
     if not m.is_root:
         raise FsError("only root can do that")
     if len(o.args) == 1:
         raise FsError(f"{o.args[0]}: can't find in /etc/fstab.")
     dev, path = o.args[0], o.args[1]
+    fstype = o.vals.get("t")
+    if fstype and fstype not in EXT + ("vfat",) + VIRTUAL_FS:
+        ctx.write(f"mount: {path}: unknown filesystem type '{fstype}'.\n", "err")
+        return 32
     try:
-        m.mount(dev, path, o.vals.get("t"))
+        m.mount(dev, path, fstype, bind="B" in o)
     except FsError as exc:
         ctx.write(f"mount: {exc}\n", "err")
         return 32
     if "v" in o:
-        ctx.write(f"mount: {dev} mounted on {m.abspath(path)}.\n")
+        how = "bound on" if "B" in o else "mounted on"
+        ctx.write(f"mount: {dev} {how} {m.abspath(path)}.\n")
 
 
 @command("umount", "unmount a filesystem: umount DIR", G)
@@ -311,6 +324,25 @@ def _umount(ctx, args):
             ctx.write(f"umount: {p} unmounted\n")
 
 
+@command("mountpoint", "is a directory a mount point? (-q quiet)", G)
+def _mountpoint(ctx, args):
+    m = ctx.machine
+    o = Opts(args, "qd")
+    if not o.args:
+        raise UsageError("usage: mountpoint [-q] DIR")
+    try:
+        real = m.resolve(o.args[0]).real
+    except FsError as exc:
+        raise FsError(f"{o.args[0]}: {exc}")
+    if m.is_mountpoint(real):
+        if "q" not in o:
+            ctx.write(f"{o.args[0]} is a mountpoint\n")
+        return 0
+    if "q" not in o:
+        ctx.write(f"{o.args[0]} is not a mountpoint\n")
+    return 32
+
+
 @command("df", "show free disk space (-h human-readable)", G)
 def _df(ctx, args):
     m = ctx.machine
@@ -323,9 +355,11 @@ def _df(ctx, args):
         mounts = []
         for a in o.args:
             dev, _ = m.fs_of(a)
-            mounts += [mt for mt in m.mounts if mt["dev"] == dev][:1]
+            mounts += [mt for mt in m.mounts if mt.get("fs", mt["dev"]) == dev][:1]
     for mt in mounts:
-        size, used = m.fs_usage(mt["dev"])
+        if mt.get("bind"):
+            continue
+        size, used = m.fs_usage(mt.get("fs", mt["dev"]))
         avail = max(size - used, 0)
         fmt = (lambda n: human(n)) if h else (lambda n: str(n // 1024))
         pct = f"{-(-used * 100 // size)}%" if size else "-"

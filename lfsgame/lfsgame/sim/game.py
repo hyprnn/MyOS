@@ -26,10 +26,15 @@ class Game:
     def check(self) -> List[Objective]:
         """Evaluate objectives; return the ones completed just now (in list order)."""
         new = []
-        for o in OBJECTIVES:
-            if o.id not in self.done and o.check(self.machine):
-                self.done.append(o.id)
-                new.append(o)
+        m = self.machine
+        saved, m.croot = m.croot, ""  # objectives look at the real filesystem
+        try:
+            for o in OBJECTIVES:
+                if o.id not in self.done and o.check(m):
+                    self.done.append(o.id)
+                    new.append(o)
+        finally:
+            m.croot = saved
         return new
 
     def current(self) -> Optional[Objective]:

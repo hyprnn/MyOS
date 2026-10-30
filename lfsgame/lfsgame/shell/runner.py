@@ -27,6 +27,15 @@ from ..sim.vfs import FsError
 from . import parser
 
 
+# commands that are part of bash itself (or of the game): available even inside a chroot
+CHROOT_BUILTINS = {"help", "cd", "pwd", "echo", "export", "unset", "set", "source", ".", "exec",
+                   "exit", "logout", "umask", "history", "test", "[", "true", "false", "pushd",
+                   "popd", "type", "time", "tasks", "status", "quest", "hint", "book", "save",
+                   "menu", "version", "clear", "sleep"}
+COMPILER_TOOLS = {"gcc", "g++", "cc", "c++", "cpp", "x86_64-lfs-linux-gnu-gcc",
+                  "x86_64-lfs-linux-gnu-g++"}
+
+
 class Cmd(NamedTuple):
     fn: Callable
     help: str
@@ -151,7 +160,7 @@ class Expander:
         if node["t"] != "d":
             return None
         names = set(node["c"])
-        ap = m.resolve(path).path.rstrip("/")
+        ap = m.resolve(path).real.rstrip("/")
         for mt in m.mounts:  # mountpoints show up even if missing in the parent fs
             head, _, tail = mt["path"].rpartition("/")
             if (head or "/").rstrip("/") == ap and tail:
@@ -257,7 +266,10 @@ def run_node(ctx, node):
 def find_program(m, name: str):
     """-> (path, node) of an executable in the simulated fs, or None."""
     if "/" in name:
-        r = m.resolve(name)
+        try:
+            r = m.resolve(name)
+        except FsError:
+            return None
         return (r.path, r.node) if r.node is not None else None
     for d in m.env.get("PATH", "").split(":"):
         path = (d or ".").rstrip("/") + "/" + name
@@ -346,7 +358,24 @@ def run_argv(ctx, argv: List[str]):
     m = ctx.machine
     name, args = argv[0], argv[1:]
     cmd = REGISTRY.get(name)
-    if cmd is None and "/" in name:
+    found = None
+    if m.croot and name not in CHROOT_BUILTINS:
+        # inside a chroot only what is installed there exists
+        found = find_program(m, name)
+        if found is None:
+            if "/" in name:
+                ctx.write(f"bash: {name}: No such file or directory\n", "err")
+            else:
+                ctx.write(f"bash: {name}: command not found\n", "err")
+            return 127
+        node = found[1]
+        base = name.rsplit("/", 1)[-1]
+        if node.get("prog") in (None, "binary") and node.get("tool") not in COMPILER_TOOLS \
+                and base in REGISTRY:
+            cmd, found = REGISTRY[base], None   # e.g. /usr/bin/ls built in chapter 6
+        else:
+            cmd = None
+    elif cmd is None and "/" in name:
         head, _, base = name.rpartition("/")
         if head in ("/bin", "/usr/bin", "/sbin", "/usr/sbin") and base in REGISTRY:
             cmd = REGISTRY[base]  # /bin/bash etc. are the built-in commands
@@ -354,7 +383,7 @@ def run_argv(ctx, argv: List[str]):
         if cmd is not None:
             res = cmd.fn(ctx, args)
         else:
-            found = find_program(m, name)
+            found = found or find_program(m, name)
             if found is None:
                 if "/" in name:
                     ctx.write(f"bash: {name}: No such file or directory\n", "err")

@@ -9,7 +9,9 @@ G = "game"
 
 
 CHAPTERS = {"2": "Chapter 2: partition, filesystem, mount", "3": "Chapter 3: packages",
-            "4": "Chapter 4: final preparations", "5": "Chapter 5: cross-toolchain"}
+            "4": "Chapter 4: final preparations", "5": "Chapter 5: cross-toolchain",
+            "6": "Chapter 6: cross compiling temporary tools",
+            "7": "Chapter 7: chroot and additional temporary tools"}
 
 
 @command("tasks", "show your LFS objectives and progress (-a: list finished ones too)", G,
@@ -22,11 +24,16 @@ def _tasks(ctx, args):
     groups = {}
     for o in OBJECTIVES:
         groups.setdefault(o.section.split(".")[0], []).append(o)
+    cur_chapter = cur.section.split(".")[0] if cur else None
     for chapter, objs in groups.items():
+        title = CHAPTERS.get(chapter, "Chapter " + chapter)
         if all(o.id in game.done or o.optional for o in objs) and "-a" not in args:
             ctx.write("  [x] ", "ok")
-            ctx.write(f"{CHAPTERS.get(chapter, 'Chapter ' + chapter)}: "
-                      f"all done  (tasks -a shows them)\n", "dim")
+            ctx.write(f"{title}: all done  (tasks -a shows them)\n", "dim")
+            continue
+        if chapter != cur_chapter and not any(o.id in game.done for o in objs) \
+                and "-a" not in args:
+            ctx.write(f"  [ ] {title}: {len(objs)} objectives\n", "dim")
             continue
         for o in objs:
             if o.id in game.done:
@@ -38,7 +45,7 @@ def _tasks(ctx, args):
                 ctx.write(o.title)
                 ctx.write(f"   (book {o.section}{', optional' if o.optional else ''})\n", "dim")
     if cur is None:
-        ctx.write("\nAll objectives done! Chapter 6 (temporary tools) is not in the game yet.\n",
+        ctx.write("\nAll objectives done! Chapter 8 (the final system) is not in the game yet.\n",
                   "ok")
     else:
         ctx.write("\nStuck? Type 'hint' or open the book with F2 / 'book'.\n", "dim")

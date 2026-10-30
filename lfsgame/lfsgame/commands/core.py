@@ -160,10 +160,18 @@ def _env(ctx, args):
         for k in sorted(new_env):
             ctx.write(f"{k}={new_env[k]}\n")
         return 0
-    if rest[0].rsplit("/", 1)[-1] in ("bash", "sh") and len(rest) == 1:
-        # a new interactive shell with exactly this environment (LFS 4.4 .bash_profile)
+    if rest[0].rsplit("/", 1)[-1] in ("bash", "sh") and \
+            all(a in ("--login", "-l", "-i") for a in rest[1:]):
+        # a new shell with exactly this environment (LFS 4.4 .bash_profile, 7.4 chroot)
+        if m.croot and m.resolve(rest[0]).node is None:
+            ctx.write(f"env: '{rest[0]}': No such file or directory\n", "err")
+            return 127
         m.env = new_env
-        yield from interactive_startup(ctx)
+        m.refresh_name()
+        if "--login" in rest or "-l" in rest:
+            yield from login_startup(ctx)
+        else:
+            yield from interactive_startup(ctx)
         return 0
     old = m.env
     m.env = new_env
@@ -191,12 +199,26 @@ def _umask(ctx, args):
 
 @command("whoami", "print current user", G)
 def _whoami(ctx, args):
-    ctx.write(ctx.machine.user + "\n")
+    m = ctx.machine
+    if m.croot:
+        name = m.db_name_of_uid(m.users.get(m.user, {}).get("uid", 0))
+        if not name:
+            ctx.write(f"whoami: cannot find name for user ID {m.users[m.user]['uid']}\n", "err")
+            return 1
+        ctx.write(name + "\n")
+        return 0
+    ctx.write(m.user + "\n")
 
 
 @command("id", "print user and group ids", G)
 def _id(ctx, args):
     m = ctx.machine
+    if m.croot and not args:
+        uid = m.users.get(m.user, {}).get("uid", 0)
+        name = m.db_name_of_uid(uid)
+        ctx.write(f"uid={uid}({name}) gid={uid}({name}) groups={uid}({name})\n" if name
+                  else f"uid={uid} gid={uid} groups={uid}\n")
+        return 0
     name = args[0] if args else m.user
     u = m.users.get(name)
     if u is None:
@@ -305,6 +327,7 @@ def _bash(ctx, args):
         return (yield from run_script(ctx, args[1], subshell=True))
     if not args or args[0] in ("-i", "-l", "--login"):
         ctx.write("(a new interactive shell: reading the startup files)\n", "dim")
+        m.refresh_name()
         if args and args[0] in ("-l", "--login"):
             yield from login_startup(ctx)
         else:

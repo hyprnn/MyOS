@@ -48,7 +48,7 @@ def complete(machine, line: str) -> Tuple[str, List[str]]:
     if node["t"] != "d":
         return "", []
     names = set(node["c"])
-    abs_dir = machine.resolve(lookup_dir).path.rstrip("/")
+    abs_dir = machine.resolve(lookup_dir).real.rstrip("/")
     for mt in machine.mounts:
         head, _, tail = mt["path"].rpartition("/")
         if (head or "/").rstrip("/") == abs_dir and tail:

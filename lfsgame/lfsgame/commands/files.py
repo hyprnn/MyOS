@@ -19,7 +19,7 @@ def _say(arg: str) -> str:
 # ------------------------------------------------------------------ ls
 def _entries(m, path, node):
     names = set(node["c"])
-    r = m.resolve(path).path.rstrip("/")
+    r = m.resolve(path).real.rstrip("/")
     for mt in m.mounts:
         head, _, tail = mt["path"].rpartition("/")
         if (head or "/").rstrip("/") == r and tail:
@@ -53,7 +53,8 @@ def _long(ctx, m, name, node, human_sizes):
         size = human(n) if human_sizes else str(n)
     stamp = time.strftime("%b %d %H:%M", time.localtime(node.get("mt", now())))
     nlink = 2 + sum(1 for c in node["c"].values() if c["t"] == "d") if node["t"] == "d" else 1
-    ctx.write(f"{mode_string(node)} {nlink:>2} {node['u']:<5} {node['g']:<5} {size:>8} {stamp} ")
+    u, g = m.display_owner(node["u"]), m.display_owner(node["g"], group=True)
+    ctx.write(f"{mode_string(node)} {nlink:>2} {u:<5} {g:<5} {size:>8} {stamp} ")
     ctx.write(name, _tag(node))
     if node["t"] == "l":
         ctx.write(f" -> {node['to']}")
@@ -297,7 +298,8 @@ def _walk(m, path, recursive):
         if node["t"] == "d":
             for name in sorted(node["c"]):
                 child = path.rstrip("/") + "/" + name
-                yield from _walk(m, child, True) if node["c"][name]["t"] == "d" else [child]
+                kind = m.lookup(child, follow=False)["t"]  # mount points show the mounted fs
+                yield from _walk(m, child, True) if kind == "d" else [child]
 
 
 def _fmt_mode(mode):
@@ -340,22 +342,26 @@ def _chmod(ctx, args):
 @command("chown", "change owner: chown USER[:GROUP] FILE... (-v -R)", G)
 def _chown(ctx, args):
     m = ctx.machine
-    o = Opts(args, "vRch", "", {"verbose": "v", "recursive": "R"})
+    o = Opts(args, "vRch", "", {"verbose": "v", "recursive": "R"}, {"from": "F"})
     if len(o.args) < 2:
-        raise UsageError("usage: chown USER[:GROUP] FILE...")
+        raise UsageError("usage: chown [--from=OWNER] USER[:GROUP] FILE...")
     spec, paths = o.args[0], o.args[1:]
     user, _, group = spec.partition(":")
-    if user and user not in m.users:
+    if user and user not in m.db_users():
         raise FsError(f"invalid user: {_say(spec)}")
-    if group and group not in m.groups:
+    if group and group not in m.db_groups():
         raise FsError(f"invalid group: {_say(spec)}")
+    from_user, _, from_group = o.vals.get("F", "").partition(":")
     if not m.is_root:
         raise FsError(f"changing ownership of {_say(paths[0])}: Operation not permitted")
     status = 0
     for p in paths:
         try:
             for q in _walk(m, p, "R" in o):
-                node = m.lookup(q)
+                node = m.lookup(q, follow=q == p)  # -R does not follow links it meets
+                if (from_user and node["u"] != from_user) or \
+                        (from_group and node["g"] != from_group):
+                    continue  # --from: only files owned by that user/group
                 old = f"{node['u']}:{node['g']}" if group else node["u"]
                 if user:
                     node["u"] = user

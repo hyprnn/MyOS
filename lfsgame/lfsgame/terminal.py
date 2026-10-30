@@ -227,7 +227,7 @@ class TerminalScreen(tk.Frame):
         if new:
             if self.game.finished():
                 self.write("\n All objectives of this version are done! ", "banner")
-                self.write("\nChapter 6 (cross compiling the temporary tools) comes in a future version. "
+                self.write("\nChapter 8 (building the final system) comes in a future version. "
                            "Don't forget to save.\n", "ok")
             else:
                 nxt = self.game.current()

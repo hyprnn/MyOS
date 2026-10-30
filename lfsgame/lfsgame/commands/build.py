@@ -5,10 +5,10 @@ from __future__ import annotations
 import re
 
 from ..shell.opts import Opts
-from ..shell.runner import Input, Sleep, UsageError, command, program
+from ..shell.runner import Input, Sleep, UsageError, command, find_program, program
 from ..sim import build as bd
 from ..sim import packages as pk
-from ..sim.vfs import FsError, mkdir_node, node_md5
+from ..sim.vfs import FsError, mkdir_node, node_md5, tree_size
 
 G = "build"
 
@@ -46,9 +46,9 @@ def _tar(ctx, args):
             continue
         if a.startswith("--directory="):
             dest = a.split("=", 1)[1]
-        elif a.startswith("-") or (first and re.fullmatch(r"[xtcvfzjJ]+", a)):
+        elif a.startswith("-") or (first and re.fullmatch(r"[xtcvfzjJp]+", a)):
             for ch in a.lstrip("-"):
-                if ch not in "xtcvfzjJ":
+                if ch not in "xtcvfzjJp":
                     raise UsageError(f"invalid option -- '{ch}'")
                 flags.add(ch)
         else:
@@ -56,7 +56,7 @@ def _tar(ctx, args):
         first = False
         i += 1
     if "c" in flags:
-        raise UsageError("creating archives is not simulated")
+        return (yield from _tar_create(ctx, files, dest))
     if not ({"x", "t"} & flags) or "f" not in flags or not files:
         raise UsageError("usage: tar -xf ARCHIVE [-C DIR]   or   tar -tf ARCHIVE")
     path = files[0]
@@ -74,6 +74,12 @@ def _tar(ctx, args):
                   "tar: Error is not recoverable: exiting now\n", "err")
         _hint(ctx, "the download is broken: check it with md5sum and get it again")
         return 2
+    if m.croot:  # tar runs xz/gzip to decompress: they must exist in the chroot
+        tool = "xz" if base.endswith(".xz") else "gzip" if base.endswith(".gz") else "bzip2"
+        if find_program(m, tool) is None:
+            ctx.write(f"tar (child): {tool}: Cannot exec: No such file or directory\n"
+                      "tar (child): Error is not recoverable: exiting now\n", "err")
+            return 2
     top, tree = bd.source_tree(base)
     yield Sleep(int(min(1500, 120 + pkg.size / (90 * 1024 * 1024) * 1000)))
     m.clock += pkg.size / (40 * 1024 * 1024)
@@ -93,6 +99,39 @@ def _tar(ctx, args):
     u, g = m._owner()
     _chown_tree(tree, u, g)
     target_dir.node["c"][top] = tree
+    return 0
+
+
+def _tar_create(ctx, files, dest):
+    """tar -cJpf ARCHIVE PATHS: only the size and the 'backup' marker are simulated."""
+    m = ctx.machine
+    if len(files) < 2:
+        raise UsageError("Cowardly refusing to create an empty archive")
+    archive, paths = files[0], files[1:]
+    old_cwd = m.cwd
+    if dest:
+        m.cwd = m.abspath(dest)
+    try:
+        total = 0
+        for p in paths:
+            r = m.resolve(p)
+            if r.node is None:
+                raise FsError(f"{p}: Cannot stat: No such file or directory")
+            below = [mt["path"] for mt in m.mounts
+                     if mt["path"].startswith(r.real.rstrip("/") + "/")]
+            if below:
+                ctx.write(f"tar: .{below[0][len(r.real.rstrip('/')):]}/kcore: file changed as "
+                          f"we read it\n", "err")
+                _hint(ctx, "the virtual kernel file systems are still mounted below "
+                           f"{r.path}: unmount them first (book 7.13)")
+                return 2
+            total += tree_size(r.node)
+        yield Sleep(int(min(4000, 300 + total / (200 * 1024 * 1024) * 1000)))
+        m.clock += total / (30 * 1024 * 1024)
+    finally:
+        m.cwd = old_cwd
+    node = m.put_blob(archive, int(total * 0.3), "%032x" % m.rng.getrandbits(128))
+    node["backup"] = [m.real_path(p) for p in paths]
     return 0
 
 
@@ -202,10 +241,28 @@ def _config_guess(ctx, args, path, node):
     ctx.write(bd.HOST_TRIPLET + "\n")
 
 
+VERSIONS = {"perl": "This is perl 5, version 40, subversion 0 (v5.40.0) built for "
+                    "x86_64-linux", "python3.12": "Python 3.12.5", "bison": "bison (GNU Bison) 3.8.2",
+            "makeinfo": "texi2any (GNU texinfo) 7.1", "msgfmt": "msgfmt (GNU gettext-tools) 0.22.5",
+            "m4": "m4 (GNU M4) 1.4.19", "gawk": "GNU Awk 5.3.0", "bash": "GNU bash, version 5.2.32"}
+
+
 @program("binary")
 def _binary(ctx, args, path, node):
     if node.get("native") and node.get("tool") == "file":
         return _file_cmd(ctx, args)
+    m = ctx.machine
+    if m.croot and node.get("cross"):  # inside the chroot the new system's programs run
+        if node.get("tool") in ("gcc", "g++", "cc", "c++", "cpp") or \
+                node.get("tool", "").endswith("-gcc"):
+            return (yield from _gcc_compile(ctx, args, path, dict(node, prefix="/usr",
+                                                                  sysroot="/")))
+        tool = node.get("tool", path.rsplit("/", 1)[-1])
+        if "--version" in args or "-v" in args or "-V" in args:
+            ctx.write(VERSIONS.get(tool, f"{tool} (simulated)") + "\n")
+            return 0
+        ctx.write(f"{tool}: (simulated program: only --version does something)\n", "dim")
+        return 0
     if "--version" in args or "-V" in args:
         ctx.write(f"{path.rsplit('/', 1)[-1]} (simulated)\n")
         return 0
@@ -296,7 +353,8 @@ def _gcc_compile(ctx, args, path, node):
         return 0
     ld = f"{prefix}/{t}/bin/ld"
     ldpath = f"{gcclib}/../../../../{t}/bin/ld"
-    if not m.exists(ld) and bd.find_tool(m, f"{t}-ld") is None:
+    if not m.exists(ld) and bd.find_tool(m, f"{t}-ld") is None and \
+            (not m.croot or bd.find_tool(m, "ld") is None):
         ctx.write("collect2: fatal error: cannot find 'ld'\ncompilation terminated.\n", "err")
         return 1
     lib = f"{sysroot.rstrip('/')}/usr/lib"
@@ -528,6 +586,13 @@ def _build(ctx, meta, jobs_n, make_vars=None):
     meta["state"] = "built"
     if meta.get("native") and comp == "file":
         _native_bin(m, m.cwd.rstrip("/") + "/src/file", "file")
+    for rel in bd.PRODUCTS.get(comp, []):
+        node = m.write_file(m.cwd.rstrip("/") + "/" + rel, "")
+        node.update({"prog": "binary", "tool": rel.rsplit("/", 1)[-1], "cross": True,
+                     "target": bd.TARGET, "m": 0o755, "size": 1_200_000})
+    if comp == "python":
+        ctx.write(bd.PYTHON_MISSING + "\n", "warn")
+        _hint(ctx, "this is expected now: those modules need libraries that come in chapter 8")
     ctx.write(f"(simulated build time: {sbu:g} SBU / {jobs_n} job{'s' if jobs_n > 1 else ''} "
               f"= {int(secs // 60)}m {int(secs % 60)}s)\n", "dim")
     return 0
@@ -548,7 +613,7 @@ def _install(ctx, here, meta, destdir, make_vars=None):
         _hint(ctx, exc.hint)
         return 2
     lfs = "/mnt/lfs"
-    host_lib = [p for p, _ in files if not p.startswith(lfs + "/")]
+    host_lib = [] if m.croot else [p for p, _ in files if not p.startswith(lfs + "/")]
     if host_lib and m.is_root and comp not in ("glibc", "libstdc++") and \
             not host_lib[0].startswith(("/home/", "/tmp/", "/root/")):
         ctx.write(f"(simulation) refusing to install {comp} into the HOST "

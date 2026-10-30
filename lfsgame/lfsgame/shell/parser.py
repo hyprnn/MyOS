@@ -3,7 +3,7 @@
 Supported: 'single' "double" \\escapes and \\<newline> continuation, # comments,
 ; && || | newlines, > >> < redirections, here-documents (<< and <<-, quoted or not),
 $VAR ${VAR} $? $$, $(...) and `...` command substitution, ~ and ~user,
-brace expansion {a,b} (nested), globs * ? [..], word splitting of unquoted expansions,
+brace expansion {a,b} (nested) and {1..8}, globs * ? [..], word splitting of unquoted expansions,
 compound commands: if/elif/else/fi, for NAME in WORDS; do ...; done, ! pipeline.
 Not supported: case, while/until, functions, subshells ( ), background &, 2>.
 
@@ -446,6 +446,21 @@ def _brace(chars: Chars) -> List[Chars]:
                 for a, b in zip(bounds, bounds[1:]):
                     out += _brace(pre + chars[a + 1:b] + post)
                 return out
+            if j < n and all(q is None for _, q in chars[i + 1:j]):
+                inner = "".join(c for c, _ in chars[i + 1:j])
+                seq = re.fullmatch(r"(-?\d+)\.\.(-?\d+)|([a-zA-Z])\.\.([a-zA-Z])", inner)
+                if seq:
+                    if seq.group(1) is not None:
+                        a, b = int(seq.group(1)), int(seq.group(2))
+                        items = [str(k) for k in (range(a, b + 1) if a <= b else range(a, b - 1, -1))]
+                    else:
+                        a, b = ord(seq.group(3)), ord(seq.group(4))
+                        items = [chr(k) for k in (range(a, b + 1) if a <= b else range(a, b - 1, -1))]
+                    pre, post = chars[:i], chars[j + 1:]
+                    out = []
+                    for item in items:
+                        out += _brace(pre + [(c, None) for c in item] + post)
+                    return out
         i += 1
     return [chars]
 

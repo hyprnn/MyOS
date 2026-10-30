@@ -199,6 +199,92 @@ def _ch6(id_, section, name, check, hint=""):
                      check)
 
 
+def _root_owned(m: Machine) -> bool:
+    for d in ("usr", "usr/lib", "usr/bin", "usr/bin/bash", "var", "etc", "lib64", "tools",
+              f"tools/bin/{TGT}-gcc"):
+        n = _node(m, f"{LFS}/{d}")
+        if d.startswith("tools") and n is None:
+            continue  # removed in 7.13 (objective is sticky anyway)
+        if n is None or n["u"] != "root":
+            return False
+    return True
+
+
+def _vkfs_ok(m: Machine) -> bool:
+    want = {f"{LFS}/dev": "none", f"{LFS}/dev/pts": "devpts", f"{LFS}/proc": "proc",
+            f"{LFS}/sys": "sysfs", f"{LFS}/run": "tmpfs", f"{LFS}/dev/shm": "tmpfs"}
+    have = {mt["path"]: mt["type"] for mt in m.mounts}
+    bind_ok = any(mt["path"] == f"{LFS}/dev" and mt.get("bind") == "/dev" for mt in m.mounts)
+    return bind_ok and all(have.get(p) == t for p, t in want.items())
+
+
+DIRS7 = ("boot", "home", "mnt", "opt", "srv", "etc/opt", "etc/sysconfig", "usr/lib/firmware",
+         "media/floppy", "media/cdrom", "usr/include", "usr/local/include", "usr/src",
+         "usr/lib/locale", "usr/local/bin", "usr/local/sbin", "usr/share/zoneinfo",
+         "usr/share/man/man1", "usr/share/man/man8", "usr/local/share/man/man8",
+         "var/cache", "var/log", "var/spool", "var/lib/color", "var/lib/misc", "var/lib/locate")
+
+
+def _dirs7_ok(m: Machine) -> bool:
+    for d in DIRS7:
+        if not _exists(m, f"{LFS}/{d}", "d"):
+            return False
+    root, tmp, vtmp = (_node(m, f"{LFS}/{d}") for d in ("root", "tmp", "var/tmp"))
+    return (_link_to(m, f"{LFS}/var/run", "/run") and _link_to(m, f"{LFS}/var/lock", "/run/lock")
+            and root is not None and root["m"] & 0o7777 == 0o750
+            and tmp is not None and tmp["m"] & 0o7777 == 0o1777
+            and vtmp is not None and vtmp["m"] & 0o7777 == 0o1777)
+
+
+def _text(m: Machine, path: str) -> str:
+    n = _node(m, path)
+    return (n or {}).get("data", "") if n and n["t"] == "f" else ""
+
+
+def _files7_ok(m: Machine) -> bool:
+    passwd, group = _text(m, f"{LFS}/etc/passwd"), _text(m, f"{LFS}/etc/group")
+    lastlog, btmp = _node(m, f"{LFS}/var/log/lastlog"), _node(m, f"{LFS}/var/log/btmp")
+    home = _node(m, f"{LFS}/home/tester")
+    return (_link_to(m, f"{LFS}/etc/mtab", "/proc/self/mounts")
+            and "localhost" in _text(m, f"{LFS}/etc/hosts")
+            and "root:x:0:0:" in passwd and "tester:x:101:101:" in passwd
+            and "utmp:x:13:" in group and "tester:x:101:" in group
+            and home is not None and home["u"] == "tester"
+            and m.has_flag("chroot_named")
+            and lastlog is not None and lastlog["g"] == "utmp" and lastlog["m"] & 0o777 == 0o664
+            and btmp is not None and btmp["m"] & 0o777 == 0o600
+            and all(_exists(m, f"{LFS}/var/log/{f}") for f in ("faillog", "wtmp")))
+
+
+def _cleanup7_ok(m: Machine) -> bool:
+    for d in ("info", "man", "doc"):
+        n = _node(m, f"{USR}/share/{d}")
+        if n is not None and n["t"] == "d" and n["c"]:
+            return False
+
+    def has_la(node):
+        for name, ch in node.get("c", {}).items():
+            if ch["t"] == "f" and name.endswith(".la"):
+                return True
+            if ch["t"] == "d" and has_la(ch):
+                return True
+        return False
+    for d in ("lib", "libexec"):
+        n = _node(m, f"{USR}/{d}")
+        if n is not None and has_la(n):
+            return False
+    return _node(m, f"{LFS}/tools", follow=False) is None and m.has_flag("chroot_ok")
+
+
+def _backup_ok(m: Machine) -> bool:
+    for home in ("/root", "/home/lfs"):
+        n = _node(m, home)
+        for name, ch in ((n or {}).get("c") or {}).items():
+            if ch.get("backup") and LFS in ch["backup"] and name.endswith((".tar.xz", ".tar.gz")):
+                return True
+    return False
+
+
 OBJECTIVES: List[Objective] = [
     Objective("explore", "Find the empty disk meant for LFS (lsblk or fdisk -l)", "2.4",
               "Type 'lsblk'. Which disk has no partitions at all?",
@@ -316,6 +402,56 @@ OBJECTIVES: List[Objective] = [
               "book 6.18: math libs, t-linux64 and thread_header seds, build dir, configure, "
               "make DESTDIR=$LFS install, ln -sv gcc $LFS/usr/bin/cc",
               lambda m: _cross_bin(m, f"{USR}/bin/gcc") and _link_to(m, f"{USR}/bin/cc", "gcc")),
+    Objective("rootowner", "As root, give $LFS back to root (chown --from lfs -R root:root)",
+              "7.2", "exit to root, then: chown --from lfs -R root:root "
+                     "$LFS/{usr,lib,var,etc,bin,sbin,tools}   and the same for $LFS/lib64",
+              _root_owned),
+    Objective("vkfs", "Mount the virtual kernel file systems (dev, dev/pts, proc, sys, run, "
+                      "dev/shm)", "7.3",
+              "mkdir -pv $LFS/{dev,proc,sys,run}, mount -v --bind /dev $LFS/dev, then the "
+              "devpts, proc, sysfs and tmpfs mounts from book 7.3",
+              _vkfs_ok),
+    Objective("chroot", "Enter the chroot environment", "7.4",
+              "chroot \"$LFS\" /usr/bin/env -i HOME=/root TERM=\"$TERM\" PS1='(lfs chroot) "
+              "\\u:\\w\\$ ' PATH=/usr/bin:/usr/sbin ... /bin/bash --login (book 7.4)",
+              lambda m: m.has_flag("chroot_ok")),
+    Objective("dirs7", "Create the full directory tree (inside the chroot)", "7.5",
+              "the mkdir -pv lines, ln -sfv /run /var/run, ln -sfv /run/lock /var/lock, "
+              "install -dv -m 0750 /root, install -dv -m 1777 /tmp /var/tmp",
+              _dirs7_ok),
+    Objective("files7", "Create the essential files: mtab, hosts, passwd, group, log files",
+              "7.6", "the cat > /etc/... << \"EOF\" blocks of book 7.6, the tester user, "
+                     "exec /usr/bin/bash --login, touch/chgrp/chmod the log files",
+              _files7_ok),
+    Objective("gettext7", "Gettext (only msgfmt, msgmerge, xgettext)", "7.7",
+              "cd /sources, unpack, ./configure --disable-shared, make, "
+              "cp -v gettext-tools/src/{msgfmt,msgmerge,xgettext} /usr/bin",
+              lambda m: all(_cross_bin(m, f"{USR}/bin/{p}")
+                            for p in ("msgfmt", "msgmerge", "xgettext"))),
+    Objective("bison7", "Bison", "7.8", "./configure --prefix=/usr --docdir=..., make, make install",
+              _simple("bison")),
+    Objective("perl7", "Perl", "7.9", "sh Configure -des -D prefix=/usr ... (book 7.9), make, "
+                                      "make install",
+              lambda m: _cross_bin(m, f"{USR}/bin/perl")
+              and _exists(m, f"{USR}/lib/perl5/5.40/core_perl/strict.pm", "f")),
+    Objective("python7", "Python", "7.10", "./configure --prefix=/usr --enable-shared "
+                                           "--without-ensurepip, make, make install",
+              lambda m: _cross_bin(m, f"{USR}/bin/python3.12")
+              and _exists(m, f"{USR}/lib/libpython3.12.so.1.0", "f")),
+    Objective("texinfo7", "Texinfo", "7.11", "./configure --prefix=/usr, make, make install",
+              _simple("makeinfo")),
+    Objective("utillinux7", "Util-linux", "7.12",
+              "mkdir -pv /var/lib/hwclock, ./configure --libdir=/usr/lib ... (book 7.12), make, "
+              "make install",
+              lambda m: _cross_bin(m, f"{USR}/bin/mount") and _exists(m, f"{LFS}/var/lib/hwclock", "d")),
+    Objective("cleanup7", "Clean up the temporary system (docs, .la files, /tools)", "7.13",
+              "inside the chroot: rm -rf /usr/share/{info,man,doc}/*; "
+              "find /usr/{lib,libexec} -name \\*.la -delete; rm -rf /tools",
+              _cleanup7_ok),
+    Objective("backup7", "Optional: back up the temporary system", "7.13",
+              "exit the chroot, unmount the virtual file systems, cd $LFS, "
+              "tar -cJpf $HOME/lfs-temp-tools-12.2.tar.xz .",
+              _backup_ok, optional=True),
 ]
 
 BY_ID = {o.id: o for o in OBJECTIVES}
