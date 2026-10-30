@@ -59,7 +59,7 @@ Sed, Tar, Xz, Binutils pass 2, GCC pass 2 — playable with the book's real comm
   given as plain x86_64 commands.
 - Tests: `tests/helpers.py` `CH6` walkthrough (exact book commands); `test_build.py`
   `Ch6Tests` (9) + `BeforeGlibcTests`; walkthrough test covers chapters 2–6.
-  115 tests.
+  114 tests.
 
 ## Design decisions
 - Same model as chapter 5: validate options, fail where real builds fail, install the
@@ -71,7 +71,7 @@ Sed, Tar, Xz, Binutils pass 2, GCC pass 2 — playable with the book's real comm
 - Objectives check final file state, so the player may do steps in any order.
 
 ## Tested vs NOT tested
-- 115 headless tests pass (Python 3.12/3.13), pyflakes clean; full walkthrough 2.4 → 6.18
+- 114 headless tests pass (Python 3.12/3.13), pyflakes clean; full walkthrough 2.4 → 6.18
   (all 40 objectives) with every chapter 4.4–6 command returning 0; save of the whole
   machine after chapter 6 is ~70 KB.
 - GUI (Xvfb, python3.12 + tk): loaded a save after chapter 5, did all of 6.3 Ncurses by

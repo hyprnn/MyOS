@@ -73,7 +73,7 @@ Last updated: 2026-10-30, after report 0005 (version 0.5.0)
  lfsgame/shell/opts.py          getopt helper; shell/complete.py Tab completion
  lfsgame/commands/*.py          core, files, text, disk, fdisk (session), net, users, build, game
  lfsgame/book/__init__.py       markup parser + Book; book/content/*.txt the text
- tests/                         115 headless tests: python -m unittest -v
+ tests/                         114 headless tests: python -m unittest -v
  reports/                       0001 .. 0005
 
 6. KEY CONVENTIONS / APIs
