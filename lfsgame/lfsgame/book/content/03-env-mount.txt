@@ -1,0 +1,36 @@
+@chapter 2. Preparing the Host System
+@section 2.6 | Setting the $LFS Variable and the Umask
+
+Throughout the book the path where the new system is mounted is written as $LFS. The shell replaces $LFS with the value of the environment variable LFS, so set it once:
+
+$ export LFS=/mnt/lfs
+
+Check it. If this prints nothing, the variable is not set, and commands like "rm -rf $LFS/something" become dangerous, because they would act on /something instead.
+
+$ echo $LFS
+
+The umask decides the default permissions of new files. LFS wants 022 (new directories are readable by everybody but writable only by their owner):
+
+$ umask 022
+$ umask
+
+! The variable lives in the current shell only. After switching users or logging in again it has to be set again. On a real host you would add the export line to ~/.bash_profile of root.
+
+@section 2.7 | Mounting the New Partition
+
+A filesystem is used by mounting it on a directory, the mount point. Create the mount point, then mount the LFS partition on it:
+
+$ mkdir -pv $LFS
+$ mount -v -t ext4 /dev/sdb1 $LFS
+
+Use your own partition name. After mounting, everything written below /mnt/lfs actually lands on the new partition. Check it:
+
+$ df -h
+$ mount
+
+## Unmounting
+To unmount, use umount. It refuses with "target is busy" while your shell's current directory is inside the mount point, so cd out first.
+
+> umount /mnt/lfs
+
+! A real reboot unmounts everything. Then you must set LFS and mount the partition again before you continue.

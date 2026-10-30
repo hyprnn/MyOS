@@ -1,0 +1,61 @@
+@chapter 4. Final Preparations
+@section 4.2 | Creating a Limited Directory Layout
+
+The temporary tools built in the next chapters will be installed into the LFS partition. Create the directories they need. Brace expansion saves typing: $LFS/usr/{bin,lib,sbin} becomes three paths.
+
+$ mkdir -pv $LFS/{etc,var} $LFS/usr/{bin,lib,sbin}
+
+Modern distributions keep programs only in /usr/bin, /usr/lib and /usr/sbin; /bin, /lib and /sbin are symbolic links to them. Do the same in LFS:
+
+$ ln -sv usr/bin $LFS/bin
+$ ln -sv usr/lib $LFS/lib
+$ ln -sv usr/sbin $LFS/sbin
+
+The real book does this with a short for-loop; this simulated shell does not support loops, so type the three commands.
+
+On a 64-bit (x86_64) machine some programs also expect /lib64:
+
+$ mkdir -pv $LFS/lib64
+
+Finally, the cross compiler of chapter 5 goes into a separate directory, so it can be thrown away later:
+
+$ mkdir -pv $LFS/tools
+
+$ ls -l $LFS
+
+@section 4.3 | Adding the LFS User
+
+Building as root is risky: one wrong command can damage the host. LFS therefore builds the temporary tools as an ordinary user called lfs. Create a group and a user:
+
+$ groupadd lfs
+$ useradd -s /bin/bash -g lfs -m -k /dev/null lfs
+
+The options: -s sets the login shell, -g the primary group, -m creates the home directory /home/lfs and -k /dev/null keeps it empty instead of copying template files into it.
+
+To log in as lfs with a password later, give the account one:
+
+$ passwd lfs
+
+## Ownership
+The lfs user must be able to write into the new directories. Make it their owner. The nested braces expand to usr, all directories inside usr, and the other top-level directories:
+
+$ chown -v lfs $LFS/{usr{,/*},lib,var,etc,bin,sbin,tools}
+$ chown -v lfs $LFS/lib64
+
+## Switching to lfs
+Now start a login shell as the new user. The minus sign makes it a full login with a clean environment:
+
+$ su - lfs
+
+Your prompt changes and ends in $ instead of #: you are no longer root. 'exit' returns to the root shell.
+
+! Notice that the LFS variable is empty for the lfs user. In the real book, section 4.4 writes .bash_profile and .bashrc files for lfs that set it up.
+
+@chapter 5. Coming Next
+@section 5.0 | To Be Continued
+
+Here the game ends for now. In the real book the lfs user sets up a clean environment (section 4.4) and then builds a cross toolchain: Binutils and GCC that produce programs for the new system, the Linux API headers, Glibc and Libstdc++.
+
+That part, compiling packages with all their configure options, is planned for a later version of the game.
+
+$ tasks

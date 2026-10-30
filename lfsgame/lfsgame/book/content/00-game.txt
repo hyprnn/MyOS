@@ -1,0 +1,24 @@
+@chapter How to Play
+@section 0 | Welcome, builder
+
+You are root on a working Linux machine, the HOST. Somewhere in it there is an empty disk. Your job is to prepare it for a brand new Linux system that you will build from source code, step by step, the way the Linux From Scratch (LFS) book teaches.
+
+Nothing here is real: the disks, files and downloads are simulated, so you cannot break your own computer. The commands and their output, however, try to look and behave like the real ones, so what you learn here works on a real machine too.
+
+## The basics
+- Type commands into the terminal and press Enter.
+- 'tasks' shows your objectives, 'hint' gives a hint for the current one.
+- 'help' lists every command the simulation knows; 'help NAME' describes one.
+- Tab completes command names and file paths. Up/Down walk the history.
+- Ctrl+C interrupts a running program (for example an fdisk session).
+- Ctrl+S or 'save' saves the game; Esc or 'menu' goes back to the menu.
+
+## Using this book
+F2 opens and closes this panel. F3 / F4 go to the previous / next section, and the links at the top lead to the table of contents.
+
+Lines that start with a dollar sign are commands. Click one and it is copied into the terminal's input line, ready to be checked and run with Enter. Read before you press Enter: some commands destroy data, exactly like on a real machine.
+
+$ tasks
+$ lsblk
+
+! Real LFS is long and demanding. This game covers chapters 2 to 4 for now: partitioning, filesystems, downloading sources and preparing the build user.

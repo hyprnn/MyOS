@@ -1,0 +1,46 @@
+@chapter 3. Packages and Patches
+@section 3.1 | Introduction
+
+All source code is downloaded into one directory on the LFS partition, so it is available later inside the chroot. Create it and make it writable for everyone, with the sticky bit set:
+
+$ mkdir -v $LFS/sources
+$ chmod -v a+wt $LFS/sources
+
+"a+wt" means: add write permission for all users and set the sticky bit. With the sticky bit, anyone may create files there, but only the owner of a file may delete it. /tmp works the same way.
+
+## The download list
+The LFS website publishes the URL of every package in a file called wget-list-sysv. Fetch it into the current directory:
+
+$ wget https://www.linuxfromscratch.org/lfs/view/stable/wget-list-sysv
+
+Then let wget fetch everything in that list into $LFS/sources. --continue resumes a download that broke off, instead of starting a second copy:
+
+$ wget --input-file=wget-list-sysv --continue --directory-prefix=$LFS/sources
+
+## Checking the downloads
+Downloads can be broken or tampered with. LFS publishes an MD5 checksum for every file. Get the list straight into the sources directory and check each file against it:
+
+$ wget https://www.linuxfromscratch.org/lfs/view/stable/md5sums --directory-prefix=$LFS/sources
+$ pushd $LFS/sources
+$ md5sum -c md5sums
+$ popd
+
+Every line must say OK. A line with FAILED means that file is broken: download it again (with --continue, or delete it first) and re-check.
+
+! pushd changes into a directory and remembers where you came from; popd takes you back.
+
+@section 3.2 | All Packages
+
+The game uses a shortened package list: the core of the LFS toolchain and base system, with version numbers roughly from LFS 12.2. Some of them:
+
+- Binutils: the assembler, linker and other tools for object files.
+- GCC: the GNU Compiler Collection, with GMP, MPFR and MPC as helper libraries.
+- Glibc: the main C library. Almost every program depends on it.
+- Linux: the kernel. In chapter 5 only its API headers are needed.
+- Coreutils, Bash, Grep, Sed, Gawk, Tar, Xz, Make, Patch and friends: the everyday tools.
+- Perl, Python and Texinfo: needed by the build systems of other packages.
+
+Look at what you downloaded:
+
+$ ls -lh $LFS/sources
+$ df -h $LFS

@@ -1,0 +1,81 @@
+@chapter 2. Preparing the Host System
+@section 2.2 | Host System Requirements
+
+The host is the system you build from. It must already contain a working compiler and the usual development tools, in versions that are new enough. LFS ships a small script that checks them.
+
+Your home directory contains a simplified version of that script. Look at it, then run it:
+
+$ cat version-check.sh
+$ bash version-check.sh
+
+Every line should start with OK. On a real host a missing or too old tool has to be installed or updated with the host distribution's package manager before you continue.
+
+@section 2.3 | Building LFS in Stages
+
+LFS is not built in one sitting. What matters is knowing what must be redone after a break or a reboot:
+
+- The LFS partition has to be mounted again (section 2.7).
+- The LFS variable has to be set again for root (section 2.6).
+- Later, inside the chroot, the virtual kernel filesystems must be mounted again.
+
+In this game a save remembers the whole simulated machine, mounts and variables included, so you can stop at any time.
+
+@section 2.4 | Creating a New Partition
+
+The new system needs its own partition. Do not use the partition the host itself runs from: you would overwrite the running system.
+
+## Find the right disk
+First find out which disks exist and what is on them:
+
+$ lsblk
+$ fdisk -l
+
+The host system lives on one disk (look at the MOUNTPOINTS column). One disk is completely empty: no partitions at all. That one is meant for LFS. There may be other disks too. Check sizes and models, and never partition a disk you are not sure about.
+
+## How big?
+A minimal LFS system fits in about 10 GiB, but sources, build directories and later extra packages need room, so 20 to 30 GiB is comfortable. A swap partition of a couple of GiB is optional.
+
+## Partitioning with fdisk
+fdisk is interactive: it keeps every change in memory and only writes the new table when you press w. Until then you can quit with q and nothing happens.
+
+$ fdisk /dev/sdb
+
+Inside fdisk, type one letter per line:
+- m shows the help.
+- g creates a new, empty GPT partition table (o would create an old-style DOS/MBR one).
+- n adds a partition. Press Enter to accept the default number and first sector, then give the size as the last sector, for example +20G.
+- t changes a partition's type. Type L to list types; the alias swap marks a swap partition.
+- p prints the table as it would be written.
+- w writes the table to the disk and quits.
+
+A typical session for a 20 GiB root partition plus 2 GiB of swap:
+
+> Command (m for help): g
+> Command (m for help): n      (Enter, Enter, +20G)
+> Command (m for help): n      (Enter, Enter, +2G)
+> Command (m for help): t      (2, then swap)
+> Command (m for help): p
+> Command (m for help): w
+
+! Remember the names of the new partitions (for example /dev/sdb1 for the LFS root and /dev/sdb2 for swap). You will need them in the next sections.
+
+## GPT, BIOS and UEFI
+On a real machine that boots in legacy BIOS mode from a GPT disk, GRUB needs a tiny extra "BIOS boot" partition (about 1 MiB); a UEFI machine needs an EFI system partition instead. LFS discusses this when it makes the system bootable. The game does not boot anything yet, so you can skip it.
+
+@section 2.5 | Creating a File System on the Partition
+
+A partition is just a range of sectors. Before it can hold files it needs a filesystem. LFS uses ext4, the most common Linux filesystem:
+
+$ mkfs -v -t ext4 /dev/sdb1
+
+Use the partition you created for the LFS root, never the whole disk (/dev/sdb) and never a partition that is in use. mkfs refuses to touch a mounted filesystem, but it happily wipes anything else after a single question, so read that question.
+
+## Swap
+If you made a swap partition, initialize it and switch it on:
+
+$ mkswap /dev/sdb2
+$ swapon -v /dev/sdb2
+
+Swap is optional. 'lsblk -f' or 'blkid' show which filesystem is where.
+
+$ lsblk -f

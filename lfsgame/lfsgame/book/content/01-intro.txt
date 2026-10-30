@@ -1,0 +1,15 @@
+@chapter 1. Introduction
+@section 1.1 | What is Linux From Scratch?
+
+Linux From Scratch is a book, written by a community of volunteers, that explains how to build a complete Linux system entirely from source code. No installer, no binary packages: every program on the finished system is compiled by you.
+
+Why would anyone do that? Mostly to learn. When you build every piece yourself you see how a Linux system is put together: what the kernel does, what the C library is, why a compiler needs to be built twice, and where all those files in /usr come from.
+
+## The general plan
+- Prepare a partition and a place for the new system (chapters 2 to 4).
+- Build a temporary cross toolchain that does not depend on the host (chapter 5).
+- Use it to build temporary tools, then enter a chroot (chapters 6 and 7).
+- Build the final system, configure it and make it bootable (chapters 8 to 10).
+
+## Where the real book lives
+The real LFS book is free to read at linuxfromscratch.org. This in-game book only retells the parts the game simulates, in its own words, and simplifies things here and there.

@@ -1,0 +1,24 @@
+@chapter Appendix
+@section A | Simulated Shell Cheat Sheet
+
+This shell imitates bash, but only a part of it.
+
+## Supported
+- Quotes 'single' and "double", backslash escapes, # comments.
+- Variables: $NAME, ${NAME}, $? (status of the last command), ~ for the home directory.
+- Brace expansion {a,b} (also nested) and globs * ? [abc].
+- Several commands on one line: a ; b, a && b (b only if a succeeded), a || b (b only if a failed).
+- Output redirection: > file and >> file.
+
+## Not supported
+- Pipes (|), input redirection (<), background jobs (&).
+- Command substitution $(...), loops, if, functions.
+
+## Useful commands
+- Files: ls -l, cat, mkdir -p, touch, rm -r, ln -s, chmod, chown, cp, mv, pushd/popd.
+- Disks: lsblk -f, blkid, fdisk -l, fdisk DEVICE, mkfs, mkswap, swapon, mount, umount, df -h, free -h.
+- Network: wget, md5sum -c.
+- Users: groupadd, useradd, passwd, su, whoami, id, exit.
+- Game: tasks, hint, book, save, menu.
+
+$ help
