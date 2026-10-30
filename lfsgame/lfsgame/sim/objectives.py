@@ -153,6 +153,52 @@ def _libstdcxx_ok(m: Machine) -> bool:
                         ("libstdc++.la", "libstdc++exp.la", "libstdc++fs.la", "libsupc++.la")))
 
 
+USR = f"{LFS}/usr"
+
+
+def _cross_bin(m: Machine, path: str) -> bool:
+    n = _node(m, path)
+    return n is not None and n["t"] == "f" and bool(n.get("cross"))
+
+
+def _absent(m: Machine, *paths: str) -> bool:
+    return not any(_node(m, p, follow=False) is not None for p in paths)
+
+
+def _link_to(m: Machine, path: str, target: str) -> bool:
+    n = _node(m, path, follow=False)
+    return n is not None and n["t"] == "l" and n["to"] == target
+
+
+def _ncurses_ok(m: Machine) -> bool:
+    h = _node(m, f"{USR}/include/curses.h")
+    lines = (h or {}).get("data", "").splitlines()
+    return (_exists(m, f"{USR}/lib/libncursesw.so.6.5", "f")
+            and _link_to(m, f"{USR}/lib/libncurses.so", "libncursesw.so")
+            and _exists(m, f"{USR}/share/terminfo/x/xterm", "f")
+            and "#if 1" in lines
+            and not any(ln.startswith("#if") and "XOPEN" in ln for ln in lines))
+
+
+def _coreutils_ok(m: Machine) -> bool:
+    man = _node(m, f"{USR}/share/man/man8/chroot.8")
+    return (_cross_bin(m, f"{USR}/sbin/chroot") and _absent(m, f"{USR}/bin/chroot")
+            and _cross_bin(m, f"{USR}/bin/hostname")
+            and _absent(m, f"{USR}/bin/kill", f"{USR}/bin/uptime")
+            and man is not None and '"8"' in man.get("data", ""))
+
+
+def _simple(pkg_bin: str):
+    return lambda m: _cross_bin(m, f"{USR}/bin/{pkg_bin}")
+
+
+def _ch6(id_, section, name, check, hint=""):
+    return Objective(id_, f"Cross compile {name}", section,
+                     hint or f"book {section}: tar -xf, ./configure --prefix=/usr "
+                             f"--host=$LFS_TGT --build=..., make, make DESTDIR=$LFS install",
+                     check)
+
+
 OBJECTIVES: List[Objective] = [
     Objective("explore", "Find the empty disk meant for LFS (lsblk or fdisk -l)", "2.4",
               "Type 'lsblk'. Which disk has no partitions at all?",
@@ -234,6 +280,42 @@ OBJECTIVES: List[Objective] = [
               "fresh gcc tree, build dir, ../libstdc++-v3/configure ..., make, "
               "make DESTDIR=$LFS install, rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la",
               _libstdcxx_ok),
+    _ch6("m4", "6.2", "M4", _simple("m4")),
+    _ch6("ncurses", "6.3", "Ncurses (with a native tic, plus the libncurses.so link and curses.h fix)",
+         _ncurses_ok, "book 6.3: native tic in build/, cross ./configure, make, "
+                      "make DESTDIR=$LFS TIC_PATH=$(pwd)/build/progs/tic install, ln, sed"),
+    _ch6("bash", "6.4", "Bash (and the sh link)",
+         lambda m: _cross_bin(m, f"{USR}/bin/bash") and _link_to(m, f"{USR}/bin/sh", "bash")),
+    _ch6("coreutils", "6.5", "Coreutils (chroot moved to /usr/sbin, man page to man8)",
+         _coreutils_ok, "book 6.5: configure with --enable-install-program=hostname "
+                        "--enable-no-install-program=kill,uptime, then the mv/mkdir/sed steps"),
+    _ch6("diffutils", "6.6", "Diffutils", _simple("diff")),
+    _ch6("file", "6.7", "File (with a native file first)",
+         lambda m: _cross_bin(m, f"{USR}/bin/file") and _absent(m, f"{USR}/lib/libmagic.la"),
+         "book 6.7: native build in build/, then make FILE_COMPILE=$(pwd)/build/src/file, "
+         "install, rm libmagic.la"),
+    _ch6("findutils", "6.8", "Findutils",
+         lambda m: _cross_bin(m, f"{USR}/bin/find") and _exists(m, f"{LFS}/var/lib/locate", "d")),
+    _ch6("gawk", "6.9", "Gawk", _simple("gawk")),
+    _ch6("grep", "6.10", "Grep", _simple("grep")),
+    _ch6("gzip", "6.11", "Gzip", _simple("gzip")),
+    _ch6("make", "6.12", "Make", _simple("make")),
+    _ch6("patch", "6.13", "Patch", _simple("patch")),
+    _ch6("sed", "6.14", "Sed", _simple("sed")),
+    _ch6("tar", "6.15", "Tar", _simple("tar")),
+    _ch6("xz", "6.16", "Xz (and remove liblzma.la)",
+         lambda m: _cross_bin(m, f"{USR}/bin/xz") and _absent(m, f"{USR}/lib/liblzma.la")),
+    Objective("binutils2", "Build Binutils pass 2 (ltmain.sh fix, remove static libs)", "6.17",
+              "book 6.17: sed on ltmain.sh, build dir, ../configure --host=$LFS_TGT ..., "
+              "make DESTDIR=$LFS install, rm the .a/.la files",
+              lambda m: _cross_bin(m, f"{USR}/bin/ld") and m.has_flag("binutils2_ltmain")
+              and _absent(m, *[f"{USR}/lib/lib{n}.{e}" for n in
+                               ("bfd", "ctf", "ctf-nobfd", "opcodes", "sframe")
+                               for e in ("a", "la")])),
+    Objective("gcc2", "Build GCC pass 2 (and the cc link)", "6.18",
+              "book 6.18: math libs, t-linux64 and thread_header seds, build dir, configure, "
+              "make DESTDIR=$LFS install, ln -sv gcc $LFS/usr/bin/cc",
+              lambda m: _cross_bin(m, f"{USR}/bin/gcc") and _link_to(m, f"{USR}/bin/cc", "gcc")),
 ]
 
 BY_ID = {o.id: o for o in OBJECTIVES}

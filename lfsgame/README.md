@@ -4,12 +4,14 @@ Simulation game about building Linux From Scratch (NOT a real build — nothing 
 system). Terminal-style GUI in a game window: main menu, a bash-like shell on a simulated
 host computer, and an in-game LFS book in a slide-out panel.
 
-Current content (v0.4.0): LFS chapters 2–5 — partition the empty disk with an interactive
+Current content (v0.5.0): LFS chapters 2–6 — partition the empty disk with an interactive
 `fdisk`, `mkfs`, `mount`, download and verify the sources, prepare the `lfs` user and its
 clean environment (`.bash_profile`/`.bashrc` via here-docs), then build the
 cross-toolchain: Binutils pass 1, GCC pass 1, Linux API headers, Glibc (+ sanity check),
-Libstdc++ — with `tar`, `patch`, `../configure`, `make`, `make DESTDIR=$LFS install`.
-Builds are simulated but fail for the same reasons real ones do. 23 objectives
+Libstdc++ — with `tar`, `patch`, `../configure`, `make`, `make DESTDIR=$LFS install`;
+then chapter 6: cross compile M4, Ncurses, Bash, Coreutils, Diffutils, File, Findutils,
+Gawk, Grep, Gzip, Make, Patch, Sed, Tar, Xz and Binutils/GCC pass 2.
+Builds are simulated but fail for the same reasons real ones do. 40 objectives
 (`tasks`, `hint`).
 
 ## Run

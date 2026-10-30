@@ -58,7 +58,7 @@ class CommandTests(unittest.TestCase):
 
     def test_tasks_and_hint(self):
         self.c.run("tasks")
-        self.assertIn("0/21", self.c.text())
+        self.assertIn("0/38", self.c.text())
         self.c.run("hint")
         self.assertIn("lsblk", self.c.text())
 

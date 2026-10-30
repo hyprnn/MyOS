@@ -7,7 +7,7 @@ import time
 
 from ..shell.opts import Opts
 from ..shell.runner import UsageError, command
-from ..sim.vfs import FsError, human, mode_string, node_size, now
+from ..sim.vfs import FsError, human, mode_string, node_size, now, tree_size
 
 G = "files"
 
@@ -443,3 +443,19 @@ def _mv(ctx, args):
 @command("cp", "copy files (-r for directories)", G)
 def _cp(ctx, args):
     _copy_or_move(ctx, args, False)
+
+
+@command("du", "disk usage: du -sh DIR", G)
+def _du(ctx, args):
+    m = ctx.machine
+    o = Opts(args, "shc")
+    status = 0
+    for p in o.args or ["."]:
+        try:
+            size = tree_size(m.lookup(p))
+        except FsError as exc:
+            ctx.write(f"du: cannot access {_say(p)}: {exc}\n", "err")
+            status = 1
+            continue
+        ctx.write(f"{human(size) if 'h' in o else size // 1024}\t{p}\n")
+    return status

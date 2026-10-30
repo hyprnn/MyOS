@@ -1,10 +1,11 @@
 """Shell builtins and general commands."""
 from __future__ import annotations
 
+import inspect
 import time
 
 from ..shell.opts import Opts
-from ..shell.runner import (REGISTRY, ScriptExit, Sleep, UsageError, command, find_program,
+from ..shell.runner import (PROGRAMS, REGISTRY, ScriptExit, Sleep, UsageError, command, find_program,
                             run_argv, run_script, source_file)
 from ..sim import machine as mach
 from ..sim.vfs import FsError
@@ -312,7 +313,16 @@ def _bash(ctx, args):
     node = m.lookup(args[0])
     if node["t"] != "f":
         raise FsError(f"{args[0]}: Is a directory")
+    if node.get("prog") in PROGRAMS:  # e.g. sh support/config.guess
+        return (yield from _as_gen(PROGRAMS[node["prog"]](ctx, args[1:], m.abspath(args[0]),
+                                                          node)))
     return (yield from run_script(ctx, node.get("data", ""), subshell=True))
+
+
+def _as_gen(res):
+    if inspect.isgenerator(res):
+        res = yield from res
+    return res
 
 
 @command("source", "run a file in the CURRENT shell: source FILE  (also: . FILE)", G,

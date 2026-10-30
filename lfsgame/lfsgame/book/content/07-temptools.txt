@@ -1,0 +1,467 @@
+@chapter 6. Cross Compiling Temporary Tools
+@section 6.1 | Introduction
+
+With the cross-toolchain from chapter 5 you now build the basic utilities of the new system: a shell, the core file tools, compressors, make, and finally a second Binutils and GCC that run ON the new system instead of on the host.
+
+These programs are cross compiled: they are built on the host but for x86_64-lfs-linux-gnu, and linked against the new Glibc in $LFS. They cannot be used yet. Their purpose is the next chapter: once you change root into $LFS (chroot), they are all you have.
+
+## The pattern
+Almost every package in this chapter is built the same way, still as the lfs user:
+
+$ cd $LFS/sources
+
+- tar -xf the package and cd into it.
+- ./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)
+- make
+- make DESTDIR=$LFS install
+- cd $LFS/sources and rm -rf the package directory.
+
+What the options mean:
+- --host=$LFS_TGT: the programs will run on the new system, so they are compiled with the cross compiler $LFS_TGT-gcc.
+- --build=...: the machine doing the build (the host). config.guess prints its name; in different packages it lives in different places (build-aux/, support/ or the top directory), so copy the path from the section.
+- --prefix=/usr and DESTDIR=$LFS: the programs believe they live in /usr, but are installed into $LFS/usr for now.
+
+Check a result with the file command: a cross compiled program says "for GNU/Linux 4.19.0", which is the minimum kernel Glibc was configured for in 5.5.
+
+$ file $LFS/usr/bin/m4
+
+@section 6.2 | M4-1.4.19
+
+M4 is a macro processor, needed by Bison and Autoconf later. Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf m4-1.4.19.tar.xz
+$ cd m4-1.4.19
+
+$ ./configure --prefix=/usr   \
++             --host=$LFS_TGT \
++             --build=$(build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf m4-1.4.19
+
+@section 6.3 | Ncurses-6.5
+
+Ncurses handles terminal screens (it is what makes menus and full-screen programs possible). Build time: 0.4 SBU.
+
+$ cd $LFS/sources
+$ tar -xf ncurses-6.5.tar.gz
+$ cd ncurses-6.5
+
+Make sure configure prefers gawk:
+
+$ sed -i s/mawk// configure
+
+## A native helper first
+Installing ncurses runs tic, the terminfo compiler. The tic we are about to cross compile cannot run on the host, so first build a small tic for the host itself, in a separate directory. Without --host, this configure builds for the host:
+
+$ mkdir build
++ pushd build
++   ../configure
++   make -C include
++   make -C progs tic
++ popd
+
+make -C DIR runs make inside DIR. The headers in include/ must exist before tic can be compiled.
+
+## The real build
+$ ./configure --prefix=/usr                \
++             --host=$LFS_TGT              \
++             --build=$(./config.guess)    \
++             --mandir=/usr/share/man      \
++             --with-manpage-format=normal \
++             --with-shared                \
++             --without-normal             \
++             --with-cxx-shared            \
++             --without-debug              \
++             --without-ada                \
++             --disable-stripping
+$ make
+
+TIC_PATH tells the installation to use the native tic:
+
+$ make DESTDIR=$LFS TIC_PATH=$(pwd)/build/progs/tic install
+
+Some programs look for libncurses instead of the wide-character libncursesw; a link satisfies them. And curses.h is edited so it always uses the wide-character definitions:
+
+$ ln -sv libncursesw.so $LFS/usr/lib/libncurses.so
+$ sed -e 's/^#if.*XOPEN.*$/#if 1/' \
++     -i $LFS/usr/include/curses.h
+
+$ cd $LFS/sources
+$ rm -rf ncurses-6.5
+
+@section 6.4 | Bash-5.2.32
+
+The Bourne-Again SHell. Build time: 0.2 SBU.
+
+$ cd $LFS/sources
+$ tar -xf bash-5.2.32.tar.gz
+$ cd bash-5.2.32
+
+Here config.guess is in support/, and it is run with sh:
+
+$ ./configure --prefix=/usr                      \
++             --build=$(sh support/config.guess) \
++             --host=$LFS_TGT                    \
++             --without-bash-malloc
+$ make
+$ make DESTDIR=$LFS install
+
+--without-bash-malloc uses Glibc's malloc instead of Bash's own, which is known to cause crashes.
+
+Many scripts start with #!/bin/sh. Make sh a link to bash ($LFS/bin is a link to usr/bin, so this lands in $LFS/usr/bin):
+
+$ ln -sv bash $LFS/bin/sh
+
+$ cd $LFS/sources
+$ rm -rf bash-5.2.32
+
+@section 6.5 | Coreutils-9.5
+
+ls, cp, mv, cat, chmod, sort, ... the core of every Linux system. Build time: 0.3 SBU.
+
+$ cd $LFS/sources
+$ tar -xf coreutils-9.5.tar.xz
+$ cd coreutils-9.5
+
+$ ./configure --prefix=/usr                     \
++             --host=$LFS_TGT                   \
++             --build=$(build-aux/config.guess) \
++             --enable-install-program=hostname \
++             --enable-no-install-program=kill,uptime
+$ make
+$ make DESTDIR=$LFS install
+
+hostname is not installed by default but needed later; kill and uptime come from another package later, so they are left out.
+
+Programs get their final places. chroot belongs to /usr/sbin, and its manual page to section 8:
+
+$ mv -v $LFS/usr/bin/chroot              $LFS/usr/sbin
+$ mkdir -pv $LFS/usr/share/man/man8
+$ mv -v $LFS/usr/share/man/man1/chroot.1 $LFS/usr/share/man/man8/chroot.8
+$ sed -i 's/"1"/"8"/'                    $LFS/usr/share/man/man8/chroot.8
+
+$ cd $LFS/sources
+$ rm -rf coreutils-9.5
+
+@section 6.6 | Diffutils-3.10
+
+diff, cmp and friends compare files. Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf diffutils-3.10.tar.xz
+$ cd diffutils-3.10
+
+$ ./configure --prefix=/usr   \
++             --host=$LFS_TGT \
++             --build=$(./build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf diffutils-3.10
+
+@section 6.7 | File-5.45
+
+file tells what kind of data a file contains. Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf file-5.45.tar.gz
+$ cd file-5.45
+
+Building file needs a file program of exactly the same version to compile its database. The host's file is a different version, so, like tic for ncurses, build a native one first:
+
+$ mkdir build
++ pushd build
++   ../configure --disable-bzlib      \
++                --disable-libseccomp \
++                --disable-xzlib      \
++                --disable-zlib
++   make
++ popd
+
+$ ./configure --prefix=/usr --host=$LFS_TGT --build=$(./config.guess)
+
+Point the build at the native file:
+
+$ make FILE_COMPILE=$(pwd)/build/src/file
+$ make DESTDIR=$LFS install
+
+The libtool archive is harmful for cross compilation; remove it:
+
+$ rm -v $LFS/usr/lib/libmagic.la
+
+$ cd $LFS/sources
+$ rm -rf file-5.45
+
+@section 6.8 | Findutils-4.10.0
+
+find, xargs and locate. Build time: 0.2 SBU.
+
+$ cd $LFS/sources
+$ tar -xf findutils-4.10.0.tar.xz
+$ cd findutils-4.10.0
+
+$ ./configure --prefix=/usr                   \
++             --localstatedir=/var/lib/locate \
++             --host=$LFS_TGT                 \
++             --build=$(build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+--localstatedir puts the locate database in an FHS compliant place.
+
+$ cd $LFS/sources
+$ rm -rf findutils-4.10.0
+
+@section 6.9 | Gawk-5.3.0
+
+GNU awk, a text processing language used by many build scripts. Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf gawk-5.3.0.tar.xz
+$ cd gawk-5.3.0
+
+Skip the extra modules, which are not needed now:
+
+$ sed -i 's/extras//' Makefile.in
+
+$ ./configure --prefix=/usr   \
++             --host=$LFS_TGT \
++             --build=$(build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf gawk-5.3.0
+
+@section 6.10 | Grep-3.11
+
+Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf grep-3.11.tar.xz
+$ cd grep-3.11
+
+$ ./configure --prefix=/usr   \
++             --host=$LFS_TGT \
++             --build=$(./build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf grep-3.11
+
+@section 6.11 | Gzip-1.13
+
+Build time: 0.1 SBU. Gzip does not need --build:
+
+$ cd $LFS/sources
+$ tar -xf gzip-1.13.tar.xz
+$ cd gzip-1.13
+
+$ ./configure --prefix=/usr --host=$LFS_TGT
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf gzip-1.13
+
+@section 6.12 | Make-4.4.1
+
+Build time: less than 0.1 SBU. --without-guile avoids linking against the host's Guile library, if it has one.
+
+$ cd $LFS/sources
+$ tar -xf make-4.4.1.tar.gz
+$ cd make-4.4.1
+
+$ ./configure --prefix=/usr   \
++             --without-guile \
++             --host=$LFS_TGT \
++             --build=$(build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf make-4.4.1
+
+@section 6.13 | Patch-2.7.6
+
+Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf patch-2.7.6.tar.xz
+$ cd patch-2.7.6
+
+$ ./configure --prefix=/usr   \
++             --host=$LFS_TGT \
++             --build=$(build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf patch-2.7.6
+
+@section 6.14 | Sed-4.9
+
+Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf sed-4.9.tar.xz
+$ cd sed-4.9
+
+$ ./configure --prefix=/usr   \
++             --host=$LFS_TGT \
++             --build=$(./build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf sed-4.9
+
+@section 6.15 | Tar-1.35
+
+Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf tar-1.35.tar.xz
+$ cd tar-1.35
+
+$ ./configure --prefix=/usr   \
++             --host=$LFS_TGT \
++             --build=$(build-aux/config.guess)
+$ make
+$ make DESTDIR=$LFS install
+
+$ cd $LFS/sources
+$ rm -rf tar-1.35
+
+@section 6.16 | Xz-5.6.2
+
+The xz and lzma compressors. Build time: 0.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf xz-5.6.2.tar.xz
+$ cd xz-5.6.2
+
+$ ./configure --prefix=/usr                     \
++             --host=$LFS_TGT                   \
++             --build=$(build-aux/config.guess) \
++             --disable-static                  \
++             --docdir=/usr/share/doc/xz-5.6.2
+$ make
+$ make DESTDIR=$LFS install
+$ rm -v $LFS/usr/lib/liblzma.la
+
+$ cd $LFS/sources
+$ rm -rf xz-5.6.2
+
+@section 6.17 | Binutils-2.43.1 - Pass 2
+
+The second Binutils is built to run on the new system (--host=$LFS_TGT) and installed into $LFS/usr. Build time: 0.4 SBU.
+
+$ cd $LFS/sources
+$ tar -xf binutils-2.43.1.tar.xz
+$ cd binutils-2.43.1
+
+Binutils ships an old copy of libtool, which would add the host's library directory to the link command and make the new libraries depend on the host. Line 6009 of ltmain.sh is the culprit; remove the bad part:
+
+$ sed '6009s/$add_dir//' -i ltmain.sh
+
+The address 6009 in front of the s command limits it to that line.
+
+$ mkdir -v build
+$ cd build
+
+$ ../configure                   \
++     --prefix=/usr              \
++     --build=$(../config.guess) \
++     --host=$LFS_TGT            \
++     --disable-nls              \
++     --enable-shared            \
++     --enable-gprofng=no        \
++     --disable-werror           \
++     --enable-64-bit-bfd        \
++     --enable-new-dtags         \
++     --enable-default-hash-style=gnu
+$ make
+$ make DESTDIR=$LFS install
+
+The static libraries and libtool archives would cause trouble later; remove them:
+
+$ rm -v $LFS/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes,sframe}.{a,la}
+
+$ cd $LFS/sources
+$ rm -rf binutils-2.43.1
+
+@section 6.18 | GCC-14.2.0 - Pass 2
+
+The final temporary compiler. It runs on the new system and, unlike pass 1, includes the threads support and the shared libraries. Build time: 4.1 SBU.
+
+$ cd $LFS/sources
+$ tar -xf gcc-14.2.0.tar.xz
+$ cd gcc-14.2.0
+
+The math libraries again, and the lib64 fix (x86_64):
+
+$ tar -xf ../mpfr-4.2.1.tar.xz
+$ mv -v mpfr-4.2.1 mpfr
+$ tar -xf ../gmp-6.3.0.tar.xz
+$ mv -v gmp-6.3.0 gmp
+$ tar -xf ../mpc-1.3.1.tar.gz
+$ mv -v mpc-1.3.1 mpc
+$ sed -e '/m64=/s/lib64/lib/' -i.orig gcc/config/i386/t-linux64
+
+Tell libgcc and libstdc++ to use POSIX threads (pass 1 had no thread support):
+
+$ sed '/thread_header =/s/@.*@/gthr-posix.h/' \
++     -i libgcc/Makefile.in libstdc++-v3/include/Makefile.in
+
+$ mkdir -v build
+$ cd build
+
+$ ../configure                                       \
++     --build=$(../config.guess)                     \
++     --host=$LFS_TGT                                \
++     --target=$LFS_TGT                              \
++     LDFLAGS_FOR_TARGET=-L$PWD/$LFS_TGT/libgcc      \
++     --prefix=/usr                                  \
++     --with-build-sysroot=$LFS                      \
++     --enable-default-pie                           \
++     --enable-default-ssp                           \
++     --disable-nls                                  \
++     --disable-multilib                             \
++     --disable-libatomic                            \
++     --disable-libgomp                              \
++     --disable-libquadmath                          \
++     --disable-libsanitizer                         \
++     --disable-libssp                               \
++     --disable-libvtv                               \
++     --enable-languages=c,c++
+
+- --host and --target are both $LFS_TGT: a compiler that runs on the new system and produces programs for it.
+- --with-build-sysroot=$LFS: while building, find headers and libraries in $LFS.
+- LDFLAGS_FOR_TARGET: lets libstdc++ use the shared libgcc built in the same run.
+
+$ make
+$ make DESTDIR=$LFS install
+
+Many programs call the C compiler cc:
+
+$ ln -sv gcc $LFS/usr/bin/cc
+
+$ cd $LFS/sources
+$ rm -rf gcc-14.2.0
+
+@chapter 7. Coming Next
+@section 7.0 | To Be Continued
+
+All temporary tools are in place. The real book now changes the owner of $LFS back to root, mounts the virtual kernel filesystems (/dev, /proc, /sys) and enters the new system with chroot. Inside, the remaining temporary tools are built and then the final system in chapter 8.
+
+That is planned for a later version of the game. Save now!
+
+$ tasks
+$ du -sh $LFS/usr

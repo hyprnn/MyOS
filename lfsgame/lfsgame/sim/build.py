@@ -23,9 +23,45 @@ GCC_VER = "14.2.0"
 SBU_SECONDS = 133.0          # simulated seconds per SBU (one Binutils pass 1 build)
 SBU_REAL_MS = 7000           # real milliseconds per SBU at -j1 (shortened by -jN)
 
-SBU = {"binutils": 1.0, "gcc": 3.8, "glibc": 1.4, "libstdc++": 0.2, "linux": 0.1}
+SBU = {"binutils": 1.0, "gcc": 3.8, "glibc": 1.4, "libstdc++": 0.2, "linux": 0.1,
+       "m4": 0.1, "ncurses": 0.4, "bash": 0.2, "coreutils": 0.3, "diffutils": 0.1,
+       "file": 0.1, "findutils": 0.2, "gawk": 0.1, "grep": 0.1, "gzip": 0.1, "make": 0.1,
+       "patch": 0.1, "sed": 0.1, "tar": 0.1, "xz": 0.1}
+SBU_PASS2 = {"binutils": 0.4, "gcc": 4.1}
 
 CH5 = ("binutils", "gcc", "glibc", "libstdc++")
+# chapter 6: cross compiled with --host=$LFS_TGT, installed with DESTDIR=$LFS
+CH6 = ("m4", "ncurses", "bash", "coreutils", "diffutils", "file", "findutils", "gawk", "grep",
+       "gzip", "make", "patch", "sed", "tar", "xz")
+HOST_FILE_VERSION = "5.46"
+
+# programs each chapter-6 package installs into /usr/bin (links: name -> target)
+CH6_BINS = {
+    "m4": ["m4"],
+    "ncurses": ["tic", "infocmp", "tput", "clear", "tset", "reset->tset", "toe", "tabs",
+                "ncursesw6-config"],
+    "bash": ["bash", "bashbug"],
+    "coreutils": ["[", "basename", "cat", "chgrp", "chmod", "chown", "chroot", "cp", "cut",
+                  "date", "dd", "df", "dirname", "du", "echo", "env", "expr", "false", "head",
+                  "hostname", "id", "install", "kill", "ln", "ls", "mkdir", "mknod", "mv",
+                  "nproc", "pwd", "readlink", "rm", "rmdir", "sleep", "sort", "stat", "stty",
+                  "sync", "tail", "tee", "test", "touch", "tr", "true", "uname", "uniq",
+                  "uptime", "wc", "whoami", "yes"],
+    "diffutils": ["cmp", "diff", "diff3", "sdiff"],
+    "file": ["file"],
+    "findutils": ["find", "xargs", "locate", "updatedb"],
+    "gawk": ["gawk", "gawk-5.3.0", "awk->gawk"],
+    "grep": ["grep", "egrep", "fgrep"],
+    "gzip": ["gzip", "gunzip", "zcat", "gzexe", "zless"],
+    "make": ["make"],
+    "patch": ["patch"],
+    "sed": ["sed"],
+    "tar": ["tar"],
+    "xz": ["xz", "unxz->xz", "xzcat->xz", "lzma->xz", "xzdiff"],
+}
+CURSES_XOPEN = "#if defined(_XOPEN_SOURCE_EXTENDED) || (defined(_XOPEN_SOURCE) && (_XOPEN_SOURCE - 0 >= 500))"
+LTMAIN_LINE = '        add_dir="$add_dir -L$inst_prefix_dir$libdir"'
+THREAD_LINE = "thread_header = @thread_header@"
 
 
 class BuildError(Exception):
@@ -92,6 +128,9 @@ def source_tree(file: str) -> Tuple[str, dict]:
             for d in ("bfd", "binutils", "gas", "gprofng", "ld", "libiberty", "opcodes"):
                 c[d] = _d({})
             c["config.guess"] = _guess()
+            # line 6009 is the one LFS 6.17 edits with sed; the rest is filler
+            c["ltmain.sh"] = _f("#! /bin/sh\n# ltmain.sh (GNU libtool, simulated)\n" + "\n" * 6006
+                                + LTMAIN_LINE + "\n# end of ltmain.sh\n")
         elif name == "gcc":
             c["gcc"] = _d({"limitx.h": _f(LIMITX), "glimits.h": _f(GLIMITS),
                            "limity.h": _f(LIMITY),
@@ -101,6 +140,9 @@ def source_tree(file: str) -> Tuple[str, dict]:
             for d in ("libgcc", "libgomp", "libcpp", "contrib"):
                 c[d] = _d({})
             c["config.guess"] = _guess()
+            c["libgcc"]["c"]["Makefile.in"] = _f(f"# libgcc/Makefile.in\n{THREAD_LINE}\n")
+            c["libstdc++-v3"]["c"]["include"]["c"]["Makefile.in"] = _f(
+                f"# libstdc++-v3/include/Makefile.in\n{THREAD_LINE}\n")
         elif name == "glibc":
             c["scripts"] = _d({"config.guess": _guess()})
             for d in ("elf", "nss", "nscd", "stdio-common", "sysdeps", "sunrpc"):
@@ -108,6 +150,17 @@ def source_tree(file: str) -> Tuple[str, dict]:
             c["Makeconfig"] = _f("# Makeconfig\nvardbdir = $(localstatedir)/db\n")
         else:
             c["src"] = _d({})
+            c["build-aux"] = _d({"config.guess": _guess(), "install-sh": _f("", 0o755)})
+            c["config.guess"] = _guess()
+            if name == "bash":
+                c["support"] = _d({"config.guess": _guess()})
+            elif name == "ncurses":
+                c["configure"]["data"] += "# checking for awk: mawk gawk nawk awk\n"
+                c["misc"] = _d({"run_tic.sh": _f("#!/bin/sh\n# run_tic.sh\n", 0o755)})
+                c["include"] = _d({"curses.h.in": _f("/* curses.h.in */\n")})
+            elif name == "gawk":
+                c["Makefile.in"] = _f("# Makefile.in for gawk\n"
+                                      "SUBDIRS = support . extras doc awklib po test\n")
     tree = _d(c)
     tree["srcpkg"] = name
     return top, tree
@@ -196,6 +249,21 @@ def _target_check(lines, opts, key="--target"):
 
 
 # ---------------------------------------------------------------- configure
+def _cross_ready(m, lines: List[str], host: str, lfs: str):
+    """Cross compiling needs the cross gcc in PATH and glibc in $LFS (link tests)."""
+    gcc = find_tool(m, f"{host}-gcc")
+    checking(lines, ("for gcc", gcc and f"{host}-gcc" or "no"))
+    if gcc is None:
+        raise BuildError("no acceptable C compiler found in $PATH", lines,
+                         hint=f"{host}-gcc must be in PATH: is $LFS/tools/bin in PATH (book 4.4)?")
+    if not m.exists(f"{lfs or '/mnt/lfs'}/usr/lib/libc.so.6"):
+        checking(lines, ("whether the C compiler works", "no"))
+        raise BuildError("C compiler cannot create executables\nSee `config.log' for more details",
+                         lines, hint="the cross compiler cannot link programs yet: glibc must "
+                                     "be installed in $LFS (book 5.5)")
+    checking(lines, ("whether the C compiler works", "yes"))
+
+
 def configure(m, component: str, srcdir: str, builddir: str, args: List[str]) -> Tuple[List[str], dict]:
     """Validate a configure run. Returns (output lines, build meta) or raises BuildError."""
     opts, _ = parse_opts(args)
@@ -203,14 +271,67 @@ def configure(m, component: str, srcdir: str, builddir: str, args: List[str]) ->
     in_tree = m.resolve(srcdir).path == m.resolve(builddir).path
     checking(lines, ("build system type", HOST_TRIPLET), ("host system type",
              opts.get("--host") or HOST_TRIPLET))
-    if component not in CH5:
+    if component not in CH5 + CH6:
         raise BuildError(f"{component} is built in a later chapter of LFS", lines,
-                         hint="the simulation only builds the chapter 5 packages so far")
+                         hint="the simulation builds the chapter 5 and 6 packages so far")
+    if opts.get("--build") == "":
+        raise BuildError("missing argument to --build", lines,
+                         hint="the $(.../config.guess) part printed nothing: is the path to "
+                              "config.guess right for this package?")
     lfs = m.env.get("LFS", "")
     meta = {"component": component, "opts": opts, "srcdir": m.resolve(srcdir).path,
             "state": "configured"}
 
-    if component == "binutils":
+    if component in ("binutils", "gcc") and "--host" in opts:
+        meta["pass"] = 2
+        if component == "gcc" and in_tree:
+            raise BuildError("building GCC inside its source directory is not supported",
+                             lines, hint="mkdir -v build; cd build; ../configure ...")
+        host = _target_check(lines, opts, "--host")
+        t = _target_check(lines, opts) or host
+        checking(lines, ("target system type", t))
+        _compiler_env_check(m, lines)
+        if component == "gcc":
+            src = m.lookup(srcdir)["c"]
+            missing = [d for d in ("gmp", "mpfr", "mpc") if d not in src]
+            if missing:
+                raise BuildError("Building GCC requires GMP 4.2+, MPFR 3.1.0+ and MPC 0.8.0+.",
+                                 lines, hint=f"unpack {', '.join(missing)} into the GCC tree "
+                                             f"again: this is a fresh source tree")
+        _cross_ready(m, lines, host, lfs)
+        checking(lines, ("whether we are cross compiling", "yes"))
+    elif component in CH6:
+        if "--host" not in opts:
+            if component in ("ncurses", "file"):
+                # LFS builds a small native helper (tic / file) for the host first
+                meta["native"] = True
+                _compiler_env_check(m, lines)
+                checking(lines, ("for gcc", "gcc"), ("whether we are cross compiling", "no"))
+                if component == "ncurses":
+                    meta["subdirs"] = ["include", "progs"]
+                lines.append("configure: creating ./config.status")
+                lines.append("config.status: creating Makefile")
+                return lines, meta
+            raise BuildError("(simulation) without --host this would build the package for the "
+                             "HOST, but chapter 6 cross compiles everything", lines,
+                             hint="add --host=$LFS_TGT (and --build=$(build-aux/config.guess) "
+                                  "as in the book)")
+        host = _target_check(lines, opts, "--host")
+        _compiler_env_check(m, lines)
+        _cross_ready(m, lines, host, lfs)
+        checking(lines, ("whether we are cross compiling", "yes"),
+                 ("for suffix of executables", ""), ("for suffix of object files", "o"),
+                 ("whether the compiler supports GNU C", "yes"))
+        if component == "ncurses":
+            top, topnode = src_top(m, srcdir)
+            awk = "gawk" if "mawk" not in topnode["c"]["configure"].get("data", "") else "mawk"
+            checking(lines, ("for awk", awk))
+        if component == "bash":
+            checking(lines, ("whether to use the bash malloc",
+                             "no" if "--without-bash-malloc" in opts else "yes"))
+        if component == "findutils":
+            checking(lines, ("for localstatedir", opts.get("--localstatedir", "/usr/var")))
+    elif component == "binutils":
         t = _target_check(lines, opts)
         checking(lines, ("target system type", t or HOST_TRIPLET))
         _compiler_env_check(m, lines)
@@ -307,11 +428,33 @@ COMPILE_FILES = {
 }
 
 
+COMPILE_FILES.update({
+    "m4": ["src/m4.c", "src/builtin.c", "src/input.c", "src/macro.c", "lib/regex.c"],
+    "ncurses": ["ncurses/base/lib_addch.c", "ncurses/tinfo/lib_setup.c",
+                "ncurses/tty/lib_mvcur.c", "ncurses/widechar/lib_wacs.c", "progs/tput.c"],
+    "bash": ["shell.c", "eval.c", "parse.y", "execute_cmd.c", "variables.c", "builtins/cd.def",
+             "lib/readline/readline.c"],
+    "coreutils": ["src/ls.c", "src/cp.c", "src/chroot.c", "src/sort.c", "src/dd.c", "lib/xmalloc.c"],
+    "diffutils": ["src/diff.c", "src/analyze.c", "src/cmp.c", "src/sdiff.c"],
+    "file": ["src/file.c", "src/apprentice.c", "src/softmagic.c", "src/funcs.c"],
+    "findutils": ["find/find.c", "find/parser.c", "xargs/xargs.c", "locate/locate.c"],
+    "gawk": ["main.c", "awkgram.y", "eval.c", "builtin.c", "io.c"],
+    "grep": ["src/grep.c", "src/dfasearch.c", "src/kwsearch.c", "lib/regex.c"],
+    "gzip": ["gzip.c", "deflate.c", "inflate.c", "trees.c"],
+    "make": ["src/main.c", "src/job.c", "src/read.c", "src/remake.c", "src/expand.c"],
+    "patch": ["src/patch.c", "src/pch.c", "src/inp.c", "src/util.c"],
+    "sed": ["sed/sed.c", "sed/execute.c", "sed/compile.c", "lib/regex.c"],
+    "tar": ["src/tar.c", "src/create.c", "src/extract.c", "src/list.c", "src/buffer.c"],
+    "xz": ["src/xz/main.c", "src/liblzma/lzma/lzma_encoder.c",
+           "src/liblzma/lzma/lzma_decoder.c", "src/liblzma/check/crc64_fast.c"],
+})
+
+
 def compile_line(component: str, f: str, meta: dict, builddir: str = "") -> str:
     opts = meta["opts"]
     src = posixpath.relpath(meta["srcdir"], builddir) if builddir else meta["srcdir"]
     cc = "gcc"
-    if component in ("glibc", "libstdc++"):
+    if component in ("glibc", "libstdc++") or (opts.get("--host") and not meta.get("native")):
         cc = f"{opts.get('--host', TARGET)}-gcc"
     if f.endswith(".cc"):
         cc = cc[:-3] + "g++" if cc.endswith("gcc") else "g++"
@@ -319,9 +462,47 @@ def compile_line(component: str, f: str, meta: dict, builddir: str = "") -> str:
     return f"{cc} -DHAVE_CONFIG_H -I. -I{src} -O2 -c -o {obj} {src}/{f}"
 
 
-def build_failure(m, meta: dict) -> Optional[BuildError]:
+def _native_tool(m, path: Optional[str], tool: str) -> bool:
+    if not path:
+        return False
+    try:
+        node = m.resolve(path).node
+    except FsError:
+        return False
+    return node is not None and node.get("tool") == tool and bool(node.get("native"))
+
+
+def _file_data(m, path: str) -> str:
+    try:
+        node = m.resolve(path).node
+    except FsError:
+        return ""
+    return (node or {}).get("data", "")
+
+
+def build_failure(m, meta: dict, make_vars: Optional[Dict[str, str]] = None) -> Optional[BuildError]:
     """Problems that only show up during 'make' (like in real life)."""
     c, opts = meta["component"], meta["opts"]
+    make_vars = make_vars or {}
+    if c == "file" and not meta.get("native"):
+        if not _native_tool(m, make_vars.get("FILE_COMPILE"), "file"):
+            return BuildError("make[2]: *** [Makefile:1036: magic.mgc] Error 1",
+                              [f"Cannot use the installed version of file ({HOST_FILE_VERSION}) to",
+                               "cross-compile file 5.45",
+                               "Please install file 5.45 locally first"],
+                              hint="build the native helper in build/ first and pass it: "
+                                   "make FILE_COMPILE=$(pwd)/build/src/file")
+    if c == "gcc" and meta.get("pass") == 2:
+        src = meta["srcdir"]
+        if THREAD_LINE in _file_data(m, f"{src}/libgcc/Makefile.in") or \
+                THREAD_LINE in _file_data(m, f"{src}/libstdc++-v3/include/Makefile.in"):
+            return BuildError("make[2]: *** [Makefile:1123: c++17/floating_from_chars.lo] Error 1",
+                              ["../../../../libstdc++-v3/include/bits/std_thread.h:39:10: fatal "
+                               "error: bits/gthr.h: No such file or directory",
+                               "compilation terminated."],
+                              hint="libgcc and libstdc++ must be told to use POSIX threads: the "
+                                   "sed on thread_header in book 6.18")
+        return None
     if c == "gcc" and opts.get("--target"):
         if "--with-newlib" not in opts or "--without-headers" not in opts:
             return BuildError("make[2]: *** [Makefile:501: _gcov.o] Error 1",
@@ -347,11 +528,107 @@ def _bin(tool: str, **meta):
     return node
 
 
-def install_files(m, meta: dict, destdir: str) -> List[Tuple[str, dict]]:
-    """List of (absolute path, node) the install step creates."""
+def _lib(size: int):
+    return file_node(size=size)
+
+
+def _ch6_files(m, meta, D, P, make_vars) -> List[Tuple[str, dict]]:
+    c, o = meta["component"], meta["opts"]
+    cross = not meta.get("native")
+    out: List[Tuple[str, dict]] = []
+    skip = set()
+    if c == "coreutils":
+        skip |= set(o.get("--enable-no-install-program", "").split(","))
+        if "hostname" not in o.get("--enable-install-program", "").split(","):
+            skip.add("hostname")
+    for name in CH6_BINS[c]:
+        if "->" in name:
+            name, target = name.split("->")
+            out.append((f"{D}{P}/bin/{name}", link_node(target)))
+        elif name not in skip:
+            out.append((f"{D}{P}/bin/{name}", _bin(name, prog="binary", cross=cross,
+                                                   target=TARGET if cross else HOST_TRIPLET)))
+    lib = f"{D}{P}/lib"
+    if c == "ncurses":
+        if not _native_tool(m, make_vars.get("TIC_PATH"), "tic"):
+            raise BuildError("make[1]: *** [Makefile:115: install.data] Error 127",
+                             ["../misc/run_tic.sh: line 135: tic: error while loading shared "
+                              "libraries: libncursesw.so.6: cannot open shared object file",
+                              "? tic could not build the terminfo database"],
+                             hint="the cross-built tic cannot run on the host: build a native tic "
+                                  "in build/ and pass TIC_PATH=$(pwd)/build/progs/tic")
+        for name in ("ncursesw", "formw", "menuw", "panelw"):
+            out += [(f"{lib}/lib{name}.so.6.5", _lib(450_000)),
+                    (f"{lib}/lib{name}.so.6", link_node(f"lib{name}.so.6.5")),
+                    (f"{lib}/lib{name}.so", link_node(f"lib{name}.so.6"))]
+        curses = (f"/* curses.h for ncurses 6.5 */\n{CURSES_XOPEN}\n"
+                  "#define NCURSES_WIDECHAR 1\n#endif\n")
+        out += [(f"{D}{P}/include/curses.h", file_node(curses)),
+                (f"{D}{P}/include/ncurses.h", link_node("curses.h")),
+                (f"{D}{P}/share/terminfo/x/xterm", file_node(size=3_800)),
+                (f"{D}{P}/share/terminfo/l/linux", file_node(size=1_800))]
+    elif c == "coreutils":
+        for page in ("ls.1", "cat.1", "chroot.1"):
+            out.append((f"{D}{P}/share/man/man1/{page}",
+                        file_node(f'.TH {page[:-2].upper()} "1" "August 2024" "GNU coreutils 9.5" '
+                                  f'"User Commands"\n')))
+    elif c == "file":
+        out += [(f"{lib}/libmagic.so.1.0.0", _lib(180_000)),
+                (f"{lib}/libmagic.so.1", link_node("libmagic.so.1.0.0")),
+                (f"{lib}/libmagic.so", link_node("libmagic.so.1.0.0")),
+                (f"{lib}/libmagic.la", file_node("# libmagic.la - a libtool library file\n")),
+                (f"{D}{P}/share/misc/magic.mgc", file_node(size=7_600_000))]
+    elif c == "findutils":
+        var = o.get("--localstatedir", f"{P}/var")
+        out.append((f"{D}{var}/README", file_node("locate database directory\n")))
+    elif c == "gawk":
+        top, topnode = src_top(m, meta["srcdir"])
+        if "extras" in topnode["c"].get("Makefile.in", {}).get("data", ""):
+            out.append((f"{lib}/gawk/filefuncs.so", _lib(30_000)))
+    elif c == "xz":
+        out += [(f"{lib}/liblzma.so.5.6.2", _lib(210_000)),
+                (f"{lib}/liblzma.so.5", link_node("liblzma.so.5.6.2")),
+                (f"{lib}/liblzma.so", link_node("liblzma.so.5.6.2")),
+                (f"{lib}/liblzma.la", file_node("# liblzma.la - a libtool library file\n")),
+                (f"{D}{o.get('--docdir', P + '/share/doc/xz')}/README", file_node("XZ Utils\n"))]
+    return out
+
+
+def install_files(m, meta: dict, destdir: str,
+                  make_vars: Optional[Dict[str, str]] = None) -> List[Tuple[str, dict]]:
+    """List of (absolute path, node) the install step creates. May raise BuildError."""
     c, o = meta["component"], meta["opts"]
     out: List[Tuple[str, dict]] = []
     D = destdir.rstrip("/")
+    if c in CH6:
+        return _ch6_files(m, meta, D, o.get("--prefix", "/usr/local").rstrip("/"),
+                          make_vars or {})
+    if meta.get("pass") == 2:
+        P = o.get("--prefix", "/usr/local").rstrip("/")
+        t = o.get("--target") or o["--host"]
+        lib = f"{D}{P}/lib"
+        if c == "binutils":
+            for tool in ("addr2line", "ar", "as", "c++filt", "elfedit", "gprof", "ld", "ld.bfd",
+                         "nm", "objcopy", "objdump", "ranlib", "readelf", "size", "strings",
+                         "strip"):
+                out.append((f"{D}{P}/bin/{tool}", _bin(tool, prog="binary", cross=True,
+                                                       target=t)))
+            for name in ("bfd", "ctf", "ctf-nobfd", "opcodes", "sframe"):
+                out += [(f"{lib}/lib{name}.so", _lib(1_500_000)),
+                        (f"{lib}/lib{name}.a", _lib(2_500_000)),
+                        (f"{lib}/lib{name}.la", file_node(f"# lib{name}.la - libtool file\n"))]
+        else:
+            for tool in ("gcc", "g++", "cpp", "c++", f"{t}-gcc", f"{t}-g++", "gcc-ar", "gcov"):
+                out.append((f"{D}{P}/bin/{tool}", _bin(tool, prog="binary", cross=True,
+                                                       target=t)))
+            gl = f"{lib}/gcc/{t}/{GCC_VER}"
+            out += [(f"{gl}/libgcc.a", _lib(5_200_000)), (f"{gl}/crtbegin.o", _lib(3_000)),
+                    (f"{gl}/include/stddef.h", file_node("/* stddef.h */\n")),
+                    (f"{D}{P}/libexec/gcc/{t}/{GCC_VER}/cc1", _bin("cc1", prog="binary",
+                                                                     cross=True, target=t)),
+                    (f"{lib}/libgcc_s.so.1", _lib(150_000)),
+                    (f"{lib}/libstdc++.so.6.0.33", _lib(21_000_000))]
+        return out
     if c == "binutils":
         P = o.get("--prefix", "/usr/local").rstrip("/")
         t = o.get("--target")

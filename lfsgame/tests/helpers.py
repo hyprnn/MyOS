@@ -167,3 +167,100 @@ CH5 = [
     ("make DESTDIR=$LFS install", None),
     ("rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la", None),
 ]
+
+
+def _std6(pkg, tarball, conf, extra=()):
+    """The usual chapter 6 sequence for one package."""
+    top = tarball.rsplit(".tar", 1)[0]
+    return ([("cd $LFS/sources", None), (f"tar -xf {tarball}", None), (f"cd {top}", None),
+             (conf, None), ("make", None), ("make DESTDIR=$LFS install", None)]
+            + [(e, None) for e in extra]
+            + [("cd $LFS/sources", None), (f"rm -rf {top}", None)])
+
+
+CH6 = (
+    _std6("m4", "m4-1.4.19.tar.xz",
+          "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)")
+    + [("cd $LFS/sources", None), ("tar -xf ncurses-6.5.tar.gz", None), ("cd ncurses-6.5", None),
+       ("sed -i s/mawk// configure", None),
+       ("mkdir build\npushd build\n  ../configure\n  make -C include\n  make -C progs tic\npopd",
+        None),
+       ("./configure --prefix=/usr --host=$LFS_TGT --build=$(./config.guess) "
+        "--mandir=/usr/share/man --with-manpage-format=normal --with-shared --without-normal "
+        "--with-cxx-shared --without-debug --without-ada --disable-stripping", None),
+       ("make", None),
+       ("make DESTDIR=$LFS TIC_PATH=$(pwd)/build/progs/tic install", None),
+       ("ln -sv libncursesw.so $LFS/usr/lib/libncurses.so", None),
+       ("sed -e 's/^#if.*XOPEN.*$/#if 1/' -i $LFS/usr/include/curses.h", None),
+       ("cd $LFS/sources && rm -rf ncurses-6.5", None)]
+    + _std6("bash", "bash-5.2.32.tar.gz",
+            "./configure --prefix=/usr --build=$(sh support/config.guess) --host=$LFS_TGT "
+            "--without-bash-malloc", ["ln -sv bash $LFS/bin/sh"])
+    + _std6("coreutils", "coreutils-9.5.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess) "
+            "--enable-install-program=hostname --enable-no-install-program=kill,uptime",
+            ["mv -v $LFS/usr/bin/chroot $LFS/usr/sbin",
+             "mkdir -pv $LFS/usr/share/man/man8",
+             "mv -v $LFS/usr/share/man/man1/chroot.1 $LFS/usr/share/man/man8/chroot.8",
+             "sed -i 's/\"1\"/\"8\"/' $LFS/usr/share/man/man8/chroot.8"])
+    + _std6("diffutils", "diffutils-3.10.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(./build-aux/config.guess)")
+    + [("cd $LFS/sources", None), ("tar -xf file-5.45.tar.gz", None), ("cd file-5.45", None),
+       ("mkdir build\npushd build\n  ../configure --disable-bzlib --disable-libseccomp "
+        "--disable-xzlib --disable-zlib\n  make\npopd", None),
+       ("./configure --prefix=/usr --host=$LFS_TGT --build=$(./config.guess)", None),
+       ("make FILE_COMPILE=$(pwd)/build/src/file", None),
+       ("make DESTDIR=$LFS install", None),
+       ("rm -v $LFS/usr/lib/libmagic.la", None),
+       ("cd $LFS/sources && rm -rf file-5.45", None)]
+    + _std6("findutils", "findutils-4.10.0.tar.xz",
+            "./configure --prefix=/usr --localstatedir=/var/lib/locate --host=$LFS_TGT "
+            "--build=$(build-aux/config.guess)")
+    + [("cd $LFS/sources && tar -xf gawk-5.3.0.tar.xz && cd gawk-5.3.0", None),
+       ("sed -i 's/extras//' Makefile.in", None)]
+    + _std6("gawk", "gawk-5.3.0.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)")[3:]
+    + _std6("grep", "grep-3.11.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(./build-aux/config.guess)")
+    + _std6("gzip", "gzip-1.13.tar.xz", "./configure --prefix=/usr --host=$LFS_TGT")
+    + _std6("make", "make-4.4.1.tar.gz",
+            "./configure --prefix=/usr --without-guile --host=$LFS_TGT "
+            "--build=$(build-aux/config.guess)")
+    + _std6("patch", "patch-2.7.6.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)")
+    + _std6("sed", "sed-4.9.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(./build-aux/config.guess)")
+    + _std6("tar", "tar-1.35.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)")
+    + _std6("xz", "xz-5.6.2.tar.xz",
+            "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess) "
+            "--disable-static --docdir=/usr/share/doc/xz-5.6.2",
+            ["rm -v $LFS/usr/lib/liblzma.la"])
+    + [("cd $LFS/sources && tar -xf binutils-2.43.1.tar.xz && cd binutils-2.43.1", None),
+       ("sed '6009s/$add_dir//' -i ltmain.sh", None),
+       ("mkdir -v build && cd build", None),
+       ("../configure --prefix=/usr --build=$(../config.guess) --host=$LFS_TGT --disable-nls "
+        "--enable-shared --enable-gprofng=no --disable-werror --enable-64-bit-bfd "
+        "--enable-new-dtags --enable-default-hash-style=gnu", None),
+       ("make", None),
+       ("make DESTDIR=$LFS install", None),
+       ("rm -v $LFS/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes,sframe}.{a,la}", None),
+       ("cd $LFS/sources && rm -rf binutils-2.43.1", None),
+       ("tar -xf gcc-14.2.0.tar.xz && cd gcc-14.2.0", None),
+       ("tar -xf ../mpfr-4.2.1.tar.xz && mv -v mpfr-4.2.1 mpfr", None),
+       ("tar -xf ../gmp-6.3.0.tar.xz && mv -v gmp-6.3.0 gmp", None),
+       ("tar -xf ../mpc-1.3.1.tar.gz && mv -v mpc-1.3.1 mpc", None),
+       ("sed -e '/m64=/s/lib64/lib/' -i.orig gcc/config/i386/t-linux64", None),
+       ("sed '/thread_header =/s/@.*@/gthr-posix.h/' -i libgcc/Makefile.in "
+        "libstdc++-v3/include/Makefile.in", None),
+       ("mkdir -v build && cd build", None),
+       ("../configure --build=$(../config.guess) --host=$LFS_TGT --target=$LFS_TGT "
+        "LDFLAGS_FOR_TARGET=-L$PWD/$LFS_TGT/libgcc --prefix=/usr --with-build-sysroot=$LFS "
+        "--enable-default-pie --enable-default-ssp --disable-nls --disable-multilib "
+        "--disable-libatomic --disable-libgomp --disable-libquadmath --disable-libsanitizer "
+        "--disable-libssp --disable-libvtv --enable-languages=c,c++", None),
+       ("make", None),
+       ("make DESTDIR=$LFS install", None),
+       ("ln -sv gcc $LFS/usr/bin/cc", None),
+       ("cd $LFS/sources && rm -rf gcc-14.2.0", None)]
+)

@@ -268,12 +268,3 @@ $ rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la
 $ cd $LFS/sources
 $ rm -rf gcc-14.2.0
 
-@chapter 6. Coming Next
-@section 6.0 | To Be Continued
-
-The cross-toolchain is complete. In the real book, chapter 6 uses it to cross compile the basic tools (M4, Ncurses, Bash, Coreutils, ...) into $LFS, then builds Binutils and GCC a second time. Chapter 7 enters the chroot.
-
-That is planned for a later version of the game. Save now!
-
-$ tasks
-$ df -h $LFS

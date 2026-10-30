@@ -1,7 +1,7 @@
 =====================================================================
 LFS GAME — CONTEXT HANDOFF FOR ANOTHER AI
 Keep this file updated with every change (together with reports/NNNN-*.md).
-Last updated: 2026-10-30, after report 0004 (version 0.4.0)
+Last updated: 2026-10-30, after report 0005 (version 0.5.0)
 =====================================================================
 
 1. WHO / WHAT
@@ -20,7 +20,8 @@ Last updated: 2026-10-30, after report 0004 (version 0.4.0)
  R2. Saving + slide-out LFS side panel + this context file.
  R3. "Continue the game, add the book, more commands, disk partitioning, etc." (v0.3.0)
  R4. "Continue, make chapter 5 and 4.4" (v0.4.0)
- NOT done yet: chapter 6+ (temporary tools, chroot, final system).
+ R5. "Continue, make chapter 6" (v0.5.0)
+ NOT done yet: chapter 7+ (chroot, final system).
 
 3. WORKING RULES (must keep)
  - Every code change => new report reports/NNNN-slug.md (template in reports/README.md),
@@ -31,20 +32,22 @@ Last updated: 2026-10-30, after report 0004 (version 0.4.0)
  - Book text must be our own paraphrase, never copied from the real LFS book.
  - GUI can be tested headless: python3.12 + python3-tk + Xvfb (see report 0003).
 
-4. CURRENT STATE (v0.4.0)
+4. CURRENT STATE (v0.5.0)
  Menu: Resume / New game / Load saved game (date) / LFS Book / Quit; confirms when
    there is unsaved progress (also window X).
  Terminal: bash-like shell on a simulated host. Prompt from PS1 if set (lfs:~$ after 4.4),
-   else user@host:cwd#. ~80 commands (help lists them by group). Pipes, here-docs,
+   else user@host:cwd#. ~85 commands (help lists them by group). Pipes, here-docs,
    $(...), if/for, multi-line input with "> " prompts, typeahead while busy, Tab
    completion, history, Ctrl+C/D/L/S/U/A.
  Machine: sda (host, /, /boot/efi), sdb (empty 32G target), sdc (USB decoy). Host has
    /etc/bash.bashrc exporting CC="distcc gcc" (the 4.4 trap).
- Gameplay: 23 objectives (2 optional), chapters 2.4 -> 5.6. Chapter 5 builds are
-   simulated (sim/build.py): tar -> configure (validated options) -> make (SBU timing,
-   realistic failures) -> make install (files in $LFS/tools or DESTDIR). Sanity check
-   with the cross gcc + readelf. After 5.6: "to be continued" (book 6.0).
- Book: sections 0, 1.1, 2.2-2.7, 3.1, 3.2, 4.2-4.4, 5.1-5.6, 6.0, A. Multi-line command
+ Gameplay: 40 objectives (2 optional), chapters 2.4 -> 6.18. Builds are simulated
+   (sim/build.py): tar -> configure (validated options) -> make (SBU timing, realistic
+   failures) -> make install (files in $LFS/tools or DESTDIR). Chapter 5 = cross
+   toolchain + sanity check; chapter 6 = 15 cross-compiled packages (native tic/file
+   helpers, ltmain.sh and thread_header fixes) + Binutils/GCC pass 2.
+   After 6.18: "to be continued" (book 7.0).
+ Book: sections 0, 1.1, 2.2-2.7, 3.1, 3.2, 4.2-4.4, 5.1-5.6, 6.1-6.18, 7.0, A. Multi-line command
    blocks ("+ " lines) paste whole on click.
  Save: JSON v2 (unchanged format; Machine.upgrade() patches old machines).
 
@@ -63,15 +66,15 @@ Last updated: 2026-10-30, after report 0004 (version 0.4.0)
  lfsgame/sim/packages.py        package list, wget-list/md5sums text, fake md5
  lfsgame/sim/objectives.py      OBJECTIVES (predicates + book section + hint)
  lfsgame/sim/game.py            Game = Machine + done + book_section
- lfsgame/sim/build.py           chapter-5 build model: source trees, configure checks,
+ lfsgame/sim/build.py           build model (ch. 5+6): source trees, configure checks,
                                 build failures, installed files, SBU timing
  lfsgame/shell/parser.py        lexer + parser (AST: Simple/Pipeline/If/For, HereDoc) + expansions
  lfsgame/shell/runner.py        interpreter: REGISTRY, PROGRAMS, Sub ctx, PATH lookup, scripts
  lfsgame/shell/opts.py          getopt helper; shell/complete.py Tab completion
  lfsgame/commands/*.py          core, files, text, disk, fdisk (session), net, users, build, game
  lfsgame/book/__init__.py       markup parser + Book; book/content/*.txt the text
- tests/                         104 headless tests: python -m unittest -v
- reports/                       0001 .. 0004
+ tests/                         115 headless tests: python -m unittest -v
+ reports/                       0001 .. 0005
 
 6. KEY CONVENTIONS / APIs
  - Programs in the fs: a file node {"prog": NAME, m: 0o755} runs PROGRAMS[NAME](ctx, args,
@@ -98,9 +101,9 @@ Last updated: 2026-10-30, after report 0004 (version 0.4.0)
  - Fixed pixel sizes (panel 440 px).
 
 8. LIKELY NEXT STEPS
- - Chapter 6: more components in sim/build.py (M4, Ncurses, Bash, Coreutils, ...,
-   Binutils/GCC pass 2), cross-compiled with --host=$LFS_TGT and DESTDIR=$LFS.
- - Chapter 7: chroot (needs a second root in Machine). Maybe `case`, Russian book.
+ - Chapter 7: chown -R root:root, virtual kernel filesystems (bind mounts), chroot
+   (second root for path resolution + new shell session), then Gettext, Bison, Perl,
+   Python, Texinfo, Util-linux inside. Maybe `case`, Russian book.
 
 9. HOW TO RUN
  sudo pacman -S tk && python main.py

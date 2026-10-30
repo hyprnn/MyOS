@@ -17,7 +17,7 @@ This shell imitates bash, but only a part of it.
 - case, while, functions, subshells ( ), background jobs (&), 2> redirections.
 
 ## Useful commands
-- Files: ls -l, cat, mkdir -p, touch, rm -r, ln -s, chmod, chown, cp -r, mv, pushd/popd, find.
+- Files: ls -l, cat, mkdir -p, touch, rm -r, ln -s, chmod, chown, cp -r, mv, pushd/popd, find, du, file.
 - Text: grep, sed, wc, head, tail, echo.
 - Disks: lsblk -f, blkid, fdisk -l, fdisk DEVICE, mkfs, mkswap, swapon, mount, umount, df -h, free -h.
 - Network: wget, md5sum -c.

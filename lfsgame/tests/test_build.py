@@ -221,3 +221,123 @@ class ToolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_CH6_BASE = None
+
+
+def ready6():
+    """A fresh copy of a game where chapter 5 is complete (lfs user, clean env)."""
+    global _CH6_BASE
+    from lfsgame.sim.game import Game
+    from tests.helpers import CH4_4, CH5, FULL_WALKTHROUGH
+    if _CH6_BASE is None:
+        c = FakeCtx(seed=9)
+        for line, inputs in FULL_WALKTHROUGH + CH4_4 + CH5:
+            c.run(line, inputs)
+        _CH6_BASE = c.game.to_dict()
+    c = FakeCtx()
+    c.game = Game.from_dict(_CH6_BASE)
+    return c
+
+
+M4_CONF = "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)"
+
+
+class Ch6Tests(unittest.TestCase):
+    def unpack(self, c, tarball):
+        top = tarball.rsplit(".tar", 1)[0]
+        self.assertEqual(c.run(f"cd $LFS/sources && tar -xf {tarball} && cd {top}"), 0, c.text())
+
+    def test_m4_and_file_command(self):
+        c = ready6()
+        self.unpack(c, "m4-1.4.19.tar.xz")
+        self.assertEqual(c.run(M4_CONF), 0, c.text())
+        self.assertEqual(c.run("make && make DESTDIR=$LFS install"), 0, c.text())
+        self.assertIn("m4", c.game.done)
+        c.run("file $LFS/usr/bin/m4")
+        self.assertIn("for GNU/Linux 4.19.0", c.text())
+
+    def test_without_host_or_with_wrong_guess_path(self):
+        c = ready6()
+        self.unpack(c, "m4-1.4.19.tar.xz")
+        self.assertEqual(c.run("./configure --prefix=/usr"), 1)
+        self.assertIn("--host=$LFS_TGT", c.text())
+        self.assertEqual(c.run("./configure --prefix=/usr --host=$LFS_TGT "
+                               "--build=$(support/config.guess)"), 1)
+        self.assertIn("missing argument to --build", c.text())
+
+    def test_install_without_destdir(self):
+        c = ready6()
+        self.unpack(c, "sed-4.9.tar.xz")
+        c.run(M4_CONF)
+        self.assertEqual(c.run("make install"), 2)
+        self.assertIn("Permission denied", c.text())
+
+    def test_ncurses_needs_native_tic(self):
+        c = ready6()
+        self.unpack(c, "ncurses-6.5.tar.gz")
+        c.run("mkdir build && cd build && ../configure")
+        self.assertEqual(c.run("make -C progs tic"), 2)
+        self.assertIn("../include/curses.h", c.text())
+        c.run("cd .. && ./configure --prefix=/usr --host=$LFS_TGT --build=$(./config.guess)")
+        self.assertEqual(c.run("make DESTDIR=$LFS install"), 2)
+        self.assertIn("libncursesw.so.6", c.text())
+        c.run("make -C build/include && make -C build/progs tic")
+        self.assertEqual(c.run("make DESTDIR=$LFS TIC_PATH=$(pwd)/build/progs/tic install"), 0,
+                         c.text())
+        self.assertNotIn("ncurses", c.game.done)  # link and curses.h fix still missing
+        c.run("ln -sv libncursesw.so $LFS/usr/lib/libncurses.so")
+        c.run("sed -e 's/^#if.*XOPEN.*$/#if 1/' -i $LFS/usr/include/curses.h")
+        self.assertIn("ncurses", c.game.done)
+
+    def test_file_needs_file_compile(self):
+        c = ready6()
+        self.unpack(c, "file-5.45.tar.gz")
+        c.run("./configure --prefix=/usr --host=$LFS_TGT --build=$(./config.guess)")
+        self.assertEqual(c.run("make"), 2)
+        self.assertIn("Please install file 5.45 locally first", c.text())
+
+    def test_bash_uses_sh_config_guess(self):
+        c = ready6()
+        self.unpack(c, "bash-5.2.32.tar.gz")
+        c.run("echo $(sh support/config.guess)")
+        self.assertEqual(c.text(), "x86_64-pc-linux-gnu\n")
+
+    def test_binutils2_without_ltmain_fix(self):
+        c = ready6()
+        self.unpack(c, "binutils-2.43.1.tar.xz")
+        c.run("mkdir build && cd build && ../configure --prefix=/usr --build=$(../config.guess) "
+              "--host=$LFS_TGT --enable-shared")
+        c.run("make")
+        self.assertIn("ltmain.sh", c.text())
+        c.run("make DESTDIR=$LFS install && "
+              "rm -v $LFS/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes,sframe}.{a,la}")
+        self.assertNotIn("binutils2", c.game.done)
+
+    def test_gcc2_without_thread_sed(self):
+        c = ready6()
+        self.unpack(c, "gcc-14.2.0.tar.xz")
+        for lib, ver in (("mpfr", "4.2.1.tar.xz"), ("gmp", "6.3.0.tar.xz"), ("mpc", "1.3.1.tar.gz")):
+            c.run(f"tar -xf ../{lib}-{ver} && mv {lib}-{ver.rsplit('.tar', 1)[0]} {lib}")
+        c.run("mkdir build && cd build && ../configure --build=$(../config.guess) "
+              "--host=$LFS_TGT --target=$LFS_TGT --prefix=/usr --with-build-sysroot=$LFS")
+        self.assertEqual(c.run("make"), 2)
+        self.assertIn("gthr.h", c.text())
+
+    def test_coreutils_needs_moves(self):
+        c = ready6()
+        self.unpack(c, "coreutils-9.5.tar.xz")
+        c.run(M4_CONF + " --enable-install-program=hostname --enable-no-install-program=kill,uptime")
+        c.run("make DESTDIR=$LFS install")
+        self.assertTrue(c.machine.exists("/mnt/lfs/usr/bin/hostname"))
+        self.assertFalse(c.machine.exists("/mnt/lfs/usr/bin/kill"))
+        self.assertNotIn("coreutils", c.game.done)
+
+
+class BeforeGlibcTests(unittest.TestCase):
+    def test_ch6_package_before_glibc(self):
+        c = ready(upto_ch5=21)  # binutils + gcc pass 1 only
+        c.run("cd $LFS/sources && tar -xf m4-1.4.19.tar.xz && cd m4-1.4.19")
+        self.assertEqual(c.run(M4_CONF), 1)
+        self.assertIn("C compiler cannot create executables", c.text())

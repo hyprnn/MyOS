@@ -41,7 +41,12 @@ def _bre(pattern: str, extended: bool) -> str:
             out.append(n if n in "(){}|+?" else "\\" + n)
             i += 2
             continue
-        out.append("\\" + c if c in "(){}|+?" else c)
+        if c == "$" and i != len(pattern) - 1:
+            out.append("\\$")  # in a BRE, $ is an anchor only at the very end
+        elif c == "^" and i != 0 and pattern[i - 1] != "[":
+            out.append("\\^")
+        else:
+            out.append("\\" + c if c in "(){}|+?" else c)
         i += 1
     return "".join(out)
 
@@ -131,7 +136,11 @@ def _sed_parse(script: str):
         if i >= n:
             break
         addr = None
-        if script[i] == "/" or script[i] == "\\":
+        num = re.match(r"\d+|\$(?=[a-z])", script[i:])
+        if num:
+            addr = ("line", num.group(0))
+            i += len(num.group(0))
+        elif script[i] == "/" or script[i] == "\\":
             delim = "/"
             if script[i] == "\\":
                 delim = script[i + 1]
@@ -195,10 +204,15 @@ def _sed_repl(rep: str) -> str:
 
 def sed_apply(script_cmds, text: str, extended=False, quiet=False) -> str:
     out = []
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for lineno, line in enumerate(lines, 1):
         deleted = False
         for addr, c, a, b, flags in script_cmds:
-            if addr is not None and not re.search(_bre(addr, extended), line):
+            if isinstance(addr, tuple):
+                want = len(lines) if addr[1] == "$" else int(addr[1])
+                if lineno != want:
+                    continue
+            elif addr is not None and not re.search(_bre(addr, extended), line):
                 continue
             if c == "d":
                 deleted = True
